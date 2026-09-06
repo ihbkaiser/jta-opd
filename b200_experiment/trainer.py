@@ -40,6 +40,7 @@ from .distributed import (
     DistributedContext,
     batch_layout,
     contiguous_partition,
+    distributed_ppo_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
@@ -127,7 +128,11 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _micro_batch_size_per_gpu(training: dict[str, Any], world_size: int) -> int:
+def _micro_batch_size_per_gpu(
+    training: dict[str, Any],
+    world_size: int,
+    global_ppo_batch_size: int | None = None,
+) -> int:
     if "micro_batch_size_per_gpu" in training:
         value = int(training["micro_batch_size_per_gpu"])
     elif "micro_batch_size" in training:
@@ -142,6 +147,12 @@ def _micro_batch_size_per_gpu(training: dict[str, Any], world_size: int) -> int:
         raise ValueError("training.micro_batch_size_per_gpu is required")
     if value <= 0:
         raise ValueError("training.micro_batch_size_per_gpu must be positive")
+    if global_ppo_batch_size is not None:
+        if global_ppo_batch_size <= 0:
+            raise ValueError("global PPO mini-batch size must be positive")
+        # PPO_MINI_BATCH_SIZE is global.  A microbatch is local and should not
+        # exceed the largest rank share of one global PPO minibatch.
+        value = min(value, (int(global_ppo_batch_size) + world_size - 1) // world_size)
     return value
 
 
@@ -216,6 +227,7 @@ def _format_batch_layout(
             f"global_trajectory_batch_size  = {layout.global_trajectory_batch_size}",
             f"local_trajectory_batch_size   = {layout.local_trajectory_batch_size}",
             f"ppo_mini_batch_size           = {layout.ppo_mini_batch_size}",
+            f"local_ppo_mini_batch_size      = {layout.local_ppo_mini_batch_size}",
             "optimizer_steps/full_rollout  = "
             f"{layout.optimizer_steps_per_full_rollout}",
             f"micro_batch_size_per_gpu      = {layout.micro_batch_size_per_gpu}",
@@ -633,6 +645,8 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "selection_threshold",
         "effective_token_weight_mass",
         "effective_sample_size",
+        "ppo_minibatch_trajectory_count",
+        "local_ppo_minibatch_trajectory_count",
     )
     statistics = tuple(
         f"{score}_{statistic}"
@@ -973,7 +987,6 @@ def _opd_train_step(
     on_optimizer_step: Callable[[int, dict[str, float]], None] | None = None,
 ):
     training = config["training"]
-    micro_batch = _micro_batch_size_per_gpu(training, distributed.world_size)
     local_batch_size = rollout.input_ids.shape[0]
     if local_batch_size <= 0:
         raise ValueError("OPD train step received an empty local/global batch")
@@ -1008,11 +1021,18 @@ def _opd_train_step(
     ):
         raise ValueError("Active local trajectories must form a contiguous prefix")
     counts = tuple(int(value) for value in distributed.all_gather_objects(local_real_count))
-    local_global_start = sum(counts[: distributed.rank])
     global_trajectory_count = sum(counts)
     if global_trajectory_count <= 0:
         raise ValueError("OPD train step received no active global trajectories")
     ppo_size = _ppo_mini_batch_size(training, global_trajectory_count)
+    if ppo_size < distributed.world_size:
+        raise ValueError(
+            "training.ppo_mini_batch_size must be at least world size so every "
+            "rank can receive a real trajectory in a complete PPO minibatch"
+        )
+    micro_batch = _micro_batch_size_per_gpu(
+        training, distributed.world_size, ppo_size
+    )
     ppo_count = _ppo_minibatch_count(global_trajectory_count, ppo_size)
     offset = int(ppo_minibatch_offset)
     if not 0 <= offset < ppo_count:
@@ -1035,16 +1055,23 @@ def _opd_train_step(
     )
     minibatch_metrics: list[dict[str, float]] = []
     for ppo_index in range(offset, min(ppo_count, offset + remaining_limit)):
-        global_begin = ppo_index * ppo_size
-        global_end = min(global_begin + ppo_size, global_trajectory_count)
-        local_begin = max(global_begin, local_global_start)
-        local_end = min(global_end, local_global_start + local_real_count)
-        local_indices = list(
-            range(
-                max(0, local_begin - local_global_start),
-                max(0, local_end - local_global_start),
-            )
+        # PPO_MINI_BATCH_SIZE is global.  Rank-interleaving the locally owned
+        # rollout rows makes every complete global minibatch data-parallel;
+        # rank-major contiguous slicing would put whole minibatches on one rank.
+        local_indices, global_minibatch_count = distributed_ppo_minibatch_partition(
+            counts,
+            distributed.rank,
+            ppo_size,
+            ppo_index,
         )
+        local_minibatch_count = len(local_indices)
+        if distributed.any(local_minibatch_count == 0):
+            raise ValueError(
+                "Global PPO minibatch has no real trajectory on rank "
+                f"{distributed.rank}: minibatch={ppo_index}, counts={counts}, "
+                f"global_ppo_mini_batch_size={ppo_size}. Reduce world size or "
+                "choose a PPO batch/data tail that gives every rank a real row."
+            )
         padded_count = distributed.max_int(len(local_indices))
         filler = (
             int(response_lengths.argmin().item()) if local_batch_size else 0
@@ -1277,7 +1304,8 @@ def _opd_train_step(
             "ratio_min": global_ratio_min,
             "ratio_max": global_ratio_max,
             "ppo_minibatch_index": float(ppo_index),
-            "ppo_minibatch_trajectory_count": float(global_end - global_begin),
+            "ppo_minibatch_trajectory_count": float(global_minibatch_count),
+            "local_ppo_minibatch_trajectory_count": float(local_minibatch_count),
         }
         minibatch_metrics.append(metric)
         global_optimizer_step = optimizer_step_start + len(minibatch_metrics)
@@ -1425,11 +1453,11 @@ def run_training(
     validate_shared_tokenizer_protocol(config)
     global_prompt_batch_size = int(config["rollout"]["batch_size"])
     num_responses = int(config["rollout"].get("num_responses", 1))
-    micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
-        training, distributed.world_size
-    )
     ppo_mini_batch_size = _ppo_mini_batch_size(
         training, global_prompt_batch_size * num_responses
+    )
+    micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
+        training, distributed.world_size, ppo_mini_batch_size
     )
     layout = batch_layout(
         global_prompt_batch_size,
@@ -2562,6 +2590,10 @@ def run_training(
             * num_responses,
             "configured_batch_size": batch_size,
             "ppo_mini_batch_size": ppo_mini_batch_size,
+            "local_ppo_mini_batch_size": (
+                (ppo_mini_batch_size + distributed.world_size - 1)
+                // distributed.world_size
+            ),
             "ppo_minibatches_in_rollout": optimizer_steps_completed,
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
@@ -2797,6 +2829,9 @@ def run_training(
                     "ppo_minibatch_trajectory_count": int(
                         minibatch_metric["ppo_minibatch_trajectory_count"]
                     ),
+                    "local_ppo_minibatch_trajectory_count": int(
+                        minibatch_metric["local_ppo_minibatch_trajectory_count"]
+                    ),
                     "forward_backward_time_sec": distributed.max_float(
                         minibatch_metric["training_forward_time"]
                         + minibatch_metric["backward_time"]
@@ -2860,6 +2895,10 @@ def run_training(
         "prompt_filter": prompt_filter_summary,
         "full_dataset": True,
         "ppo_mini_batch_size": ppo_mini_batch_size,
+        "local_ppo_mini_batch_size": (
+            (ppo_mini_batch_size + distributed.world_size - 1)
+            // distributed.world_size
+        ),
         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "rollout_backend": rollout_backend,
         "resumed_from": (

@@ -123,6 +123,13 @@ RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
+`BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` là global, không đổi theo world size. Ví dụ PPO batch 16
+được chia thành 16/8/4 real trajectories mỗi GPU trên 1/2/4 GPU. Các rank dùng cùng global PPO
+minibatch theo thứ tự interleaved deterministic; `MICRO_BATCH_SIZE_PER_GPU` chỉ điều khiển chunk
+local và được cap ở local PPO share. Final partial minibatch được giữ nguyên sample count; nếu một
+rank không có real sample để tham gia collective, training dừng với validation error thay vì âm
+thầm dùng filler như một phần effective batch.
+
 Các YAML method chỉ khác `experiment.method` và `experiment.output_dir`. OPD thuần dùng uniform
 weight `1` trên mọi valid response token; mọi launcher đi qua cùng `common_b200.sh`, do đó dùng
 cùng Top-K OPD core, vLLM rollout, data order, model, seed, batch/micro-batch, LR, optimizer,

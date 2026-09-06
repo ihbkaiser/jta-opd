@@ -19,6 +19,7 @@ from b200_experiment.distributed import (
     DistributedContext,
     batch_layout,
     contiguous_partition,
+    distributed_ppo_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
@@ -158,6 +159,51 @@ def _ddp_step_worker(rank: int, rendezvous: str, output_root: str) -> None:
         dist.destroy_process_group()
 
 
+def _ddp_global_ppo_worker(rank: int, rendezvous: str, output_root: str) -> None:
+    """Two-rank synthetic run with one global PPO minibatch of four rows."""
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        torch.manual_seed(123)
+        model = _TinyCausalLM()
+        wrapped = DistributedDataParallel(model)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        global_ids = torch.tensor(
+            [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6], [4, 5, 6, 7]],
+            dtype=torch.long,
+        )
+        rows = global_ids[rank * 2 : (rank + 1) * 2]
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((2, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((2, 2)),
+            prompt_width=2,
+        )
+        reference = _tiny_reference(model, rollout)
+        context = DistributedContext(rank, rank, 2, torch.device("cpu"))
+        metrics = _opd_train_step(
+            wrapped,
+            optimizer,
+            rollout,
+            rollout.valid_mask,
+            reference,
+            _tiny_config(micro_batch_size_per_gpu=8, ppo_mini_batch_size=4),
+            torch.device("cpu"),
+            context,
+        )
+        if metrics["minibatches"][0]["local_ppo_minibatch_trajectory_count"] != 2.0:
+            raise AssertionError("Global PPO minibatch was not split 2+2")
+        torch.save(_parameters(model), Path(output_root) / f"global-rank-{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
 def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
     dist.init_process_group(
         "gloo",
@@ -287,9 +333,86 @@ class DistributedInvariantTests(unittest.TestCase):
         self.assertEqual(layout.global_trajectory_batch_size, 64)
         self.assertEqual(layout.local_trajectory_batch_size, 32)
         self.assertEqual(layout.ppo_mini_batch_size, 16)
+        self.assertEqual(layout.local_ppo_mini_batch_size, 8)
         self.assertEqual(layout.optimizer_steps_per_full_rollout, 4)
         self.assertEqual(layout.micro_batch_size_per_gpu, 8)
-        self.assertEqual(layout.micro_batches_per_gpu, 4)
+        self.assertEqual(layout.micro_batches_per_gpu, 1)
+        four_gpu = batch_layout(64, 1, 4, 8, 16)
+        self.assertEqual(four_gpu.local_ppo_mini_batch_size, 4)
+        self.assertEqual(four_gpu.micro_batch_size_per_gpu, 4)
+        self.assertEqual(four_gpu.micro_batches_per_gpu, 1)
+
+    def test_global_ppo_batch_is_split_across_all_ranks(self):
+        for world_size, expected_local in ((1, 16), (2, 8), (4, 4)):
+            counts = [32] * world_size
+            partitions = [
+                distributed_ppo_minibatch_partition(counts, rank, 16, 0)[0]
+                for rank in range(world_size)
+            ]
+            self.assertEqual([len(partition) for partition in partitions], [expected_local] * world_size)
+            self.assertEqual(
+                sum(len(partition) for partition in partitions), 16
+            )
+            self.assertEqual(partitions[0], list(range(expected_local)))
+
+    def test_global_ppo_batch_32_splits_to_16_on_two_ranks(self):
+        counts = [64, 64]
+        partitions = [
+            distributed_ppo_minibatch_partition(counts, rank, 32, 0)[0]
+            for rank in range(2)
+        ]
+        self.assertEqual([len(partition) for partition in partitions], [16, 16])
+        self.assertEqual(sum(len(partition) for partition in partitions), 32)
+
+    def test_ppo_batch_smaller_than_world_size_fails_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "at least world_size"):
+            batch_layout(64, 1, 4, 8, 2)
+
+    def test_each_global_ppo_step_has_exact_real_sample_count(self):
+        counts = [16, 16, 16, 16]
+        total = sum(counts)
+        ppo_size = 16
+        for minibatch_index in range(math.ceil(total / ppo_size)):
+            partitions = [
+                distributed_ppo_minibatch_partition(
+                    counts, rank, ppo_size, minibatch_index
+                )[0]
+                for rank in range(len(counts))
+            ]
+            expected = min(ppo_size, total - minibatch_index * ppo_size)
+            self.assertEqual(sum(len(partition) for partition in partitions), expected)
+            self.assertTrue(all(partition for partition in partitions))
+
+        # A non-divisible rollout tail is preserved explicitly rather than
+        # silently promoted to a full PPO batch.
+        tail_counts = [13, 13, 13, 13]
+        tail_partitions = [
+            distributed_ppo_minibatch_partition(tail_counts, rank, ppo_size, 3)[0]
+            for rank in range(4)
+        ]
+        self.assertEqual(sum(len(partition) for partition in tail_partitions), 4)
+
+        # The rank-interleaved order is a permutation: no real local row is
+        # dropped or repeated across the optimizer steps.
+        counts = [5, 4]
+        seen = []
+        for minibatch_index in range(math.ceil(sum(counts) / 3)):
+            for rank in range(2):
+                local, _ = distributed_ppo_minibatch_partition(
+                    counts, rank, 3, minibatch_index
+                )
+                seen.extend((rank, position) for position in local)
+        self.assertEqual(
+            sorted(seen),
+            [(rank, position) for rank, count in enumerate(counts) for position in range(count)],
+        )
+
+    def test_optimizer_step_count_is_world_size_invariant(self):
+        expected = _optimizer_steps_per_epoch(130, 64, 1, 16)
+        for world_size in (1, 2, 4):
+            layout = batch_layout(64, 1, world_size, 8, 16)
+            self.assertEqual(layout.optimizer_steps_per_full_rollout, 4)
+            self.assertEqual(expected, _optimizer_steps_per_epoch(130, 64, 1, 16))
 
     def test_tail_padding_preserves_every_real_sample_exactly_once(self):
         indices = list(range(5))
@@ -589,6 +712,52 @@ class DistributedInvariantTests(unittest.TestCase):
             )
             rank0 = torch.load(Path(temporary) / "rank-0.pt", weights_only=True)
             rank1 = torch.load(Path(temporary) / "rank-1.pt", weights_only=True)
+        self.assertTrue(torch.allclose(rank0, rank1, atol=1e-7, rtol=1e-6))
+        self.assertTrue(torch.allclose(rank0, expected, atol=1e-7, rtol=1e-6))
+
+    def test_global_ppo_minibatch_ddp_matches_single_process_update(self):
+        if not dist.is_gloo_available():
+            self.skipTest("PyTorch was built without Gloo")
+        torch.manual_seed(123)
+        reference = _TinyCausalLM()
+        optimizer = torch.optim.SGD(reference.parameters(), lr=0.05)
+        rows = torch.tensor(
+            [[1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6], [4, 5, 6, 7]],
+            dtype=torch.long,
+        )
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=torch.ones((4, 2), dtype=torch.bool),
+            rollout_log_probs=torch.zeros((4, 2)),
+            prompt_width=2,
+        )
+        _opd_train_step(
+            reference,
+            optimizer,
+            rollout,
+            rollout.valid_mask,
+            _tiny_reference(reference, rollout),
+            _tiny_config(micro_batch_size_per_gpu=16, ppo_mini_batch_size=4),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+        )
+        expected = _parameters(reference)
+        with tempfile.TemporaryDirectory() as temporary:
+            rendezvous = str(Path(temporary) / "global-ppo-rendezvous")
+            mp.spawn(
+                _ddp_global_ppo_worker,
+                args=(rendezvous, temporary),
+                nprocs=2,
+                join=True,
+            )
+            rank0 = torch.load(
+                Path(temporary) / "global-rank-0.pt", weights_only=True
+            )
+            rank1 = torch.load(
+                Path(temporary) / "global-rank-1.pt", weights_only=True
+            )
         self.assertTrue(torch.allclose(rank0, rank1, atol=1e-7, rtol=1e-6))
         self.assertTrue(torch.allclose(rank0, expected, atol=1e-7, rtol=1e-6))
 

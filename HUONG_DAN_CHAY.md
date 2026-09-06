@@ -101,6 +101,13 @@ export ROLLOUT_TOP_P=1.0
 `MAX_STEPS` là tổng số optimizer steps mục tiêu. Không đặt hoặc đặt `MAX_STEPS=-1` để chạy hết
 epoch đã cấu hình; đặt `MAX_STEPS=1` hoặc `2` cho debug.
 
+`BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` đều là global. Với `PPO_MINI_BATCH_SIZE=16`, một global
+PPO step dùng 16 trajectories: 16/GPU trên 1 GPU, 8/GPU trên 2 GPU, 4/GPU trên 4 GPU.
+`MICRO_BATCH_SIZE_PER_GPU` chỉ điều khiển chunk local; code tự cap nó ở local PPO share khi cần.
+Các PPO minibatch hoàn chỉnh được rank-interleave deterministic để mọi rank cùng tham gia một
+optimizer step; final partial minibatch được giữ nguyên sample count và sẽ báo lỗi rõ nếu một rank
+không có real trajectory để tham gia collective.
+
 ## 3. Training
 
 ### OPD thuần

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import socket
 from collections.abc import Mapping
@@ -209,6 +210,7 @@ class BatchLayout:
     global_trajectory_batch_size: int
     local_trajectory_batch_size: int
     ppo_mini_batch_size: int
+    local_ppo_mini_batch_size: int
     optimizer_steps_per_full_rollout: int
     micro_batch_size_per_gpu: int
     micro_batches_per_gpu: int
@@ -244,6 +246,13 @@ def batch_layout(
     )
     if ppo_size <= 0:
         raise ValueError("ppo_mini_batch_size must be positive")
+    if ppo_size < values["world_size"]:
+        raise ValueError(
+            "ppo_mini_batch_size must be at least world_size so every rank "
+            "can receive a real trajectory in a complete optimizer step"
+        )
+    local_ppo_size = (ppo_size + values["world_size"] - 1) // values["world_size"]
+    effective_micro = min(values["micro_batch_size_per_gpu"], local_ppo_size)
     return BatchLayout(
         global_prompt_batch_size=values["global_prompt_batch_size"],
         world_size=values["world_size"],
@@ -252,18 +261,72 @@ def batch_layout(
         global_trajectory_batch_size=global_trajectories,
         local_trajectory_batch_size=local_prompts * values["num_responses"],
         ppo_mini_batch_size=ppo_size,
+        local_ppo_mini_batch_size=local_ppo_size,
         optimizer_steps_per_full_rollout=(
             global_trajectories + ppo_size - 1
         )
         // ppo_size,
-        micro_batch_size_per_gpu=values["micro_batch_size_per_gpu"],
+        micro_batch_size_per_gpu=effective_micro,
         micro_batches_per_gpu=(
-            local_prompts * values["num_responses"]
-            + values["micro_batch_size_per_gpu"]
+            local_ppo_size
+            + effective_micro
             - 1
         )
-        // values["micro_batch_size_per_gpu"],
+        // effective_micro,
     )
+
+
+def distributed_ppo_minibatch_partition(
+    local_counts: tuple[int, ...] | list[int],
+    rank: int,
+    ppo_mini_batch_size: int,
+    minibatch_index: int,
+) -> tuple[list[int], int]:
+    """Return local rows for one global PPO minibatch.
+
+    Rollout rows are locally owned, so a rank-major contiguous global slice can
+    leave whole PPO minibatches on one rank.  We instead define a deterministic
+    rank-interleaved global order: local row ``j`` from each rank contributes in
+    rank order before local row ``j+1``.  Consequently every complete global
+    minibatch is shared by all ranks, while local row order remains stable.
+
+    The returned indices are positions in the caller's local rollout tensor and
+    ``global_count`` is the number of real trajectories in this minibatch.  A
+    final partial minibatch is supported; callers must reject it only when a
+    rank receives zero rows because collective model execution would otherwise
+    be undefined.
+    """
+    counts = tuple(int(value) for value in local_counts)
+    if not counts or any(value < 0 for value in counts):
+        raise ValueError("local_counts must be a non-empty sequence of non-negative integers")
+    world_size = len(counts)
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
+    ppo_size = int(ppo_mini_batch_size)
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    index = int(minibatch_index)
+    if index < 0:
+        raise ValueError("minibatch_index must be non-negative")
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError("local_counts must contain at least one real trajectory")
+    begin = index * ppo_size
+    if begin >= total:
+        raise ValueError(
+            f"minibatch_index={index} is outside {math.ceil(total / ppo_size)} minibatches"
+        )
+    end = min(begin + ppo_size, total)
+    order: list[tuple[int, int]] = []
+    for local_position in range(max(counts)):
+        for owner, count in enumerate(counts):
+            if local_position < count:
+                order.append((owner, local_position))
+    selected = order[begin:end]
+    local_indices = [
+        local_position for owner, local_position in selected if owner == int(rank)
+    ]
+    return local_indices, len(selected)
 
 
 def padded_local_indices(

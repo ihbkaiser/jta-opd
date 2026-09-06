@@ -302,7 +302,32 @@ build_training_args() {
   local response_count="${NUM_RESPONSES:-1}"
   local trajectory_batch=$((prompt_batch * response_count))
   local process_count="${TRAIN_NPROC_PER_NODE:-$(visible_gpu_count)}"
+  if ! [[ "${process_count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TRAIN_NPROC_PER_NODE must be a positive integer, got ${process_count}" >&2
+    return 1
+  fi
   local local_trajectory_batch=$(((trajectory_batch + process_count - 1) / process_count))
+  local global_ppo_batch="${PPO_MINI_BATCH_SIZE:-16}"
+  local configured_micro_batch="${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}"
+  if ! [[ "${global_ppo_batch}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PPO_MINI_BATCH_SIZE must be a positive integer, got ${global_ppo_batch}" >&2
+    return 1
+  fi
+  if ! [[ "${configured_micro_batch}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "MICRO_BATCH_SIZE_PER_GPU must be a positive integer, got ${configured_micro_batch}" >&2
+    return 1
+  fi
+  if (( global_ppo_batch < process_count )); then
+    echo "PPO_MINI_BATCH_SIZE=${global_ppo_batch} must be at least "\
+      "TRAIN_NPROC_PER_NODE=${process_count} so every rank can receive a real "\
+      "trajectory in each optimizer step" >&2
+    return 1
+  fi
+  local local_ppo_batch=$(((global_ppo_batch + process_count - 1) / process_count))
+  local effective_micro_batch="${configured_micro_batch}"
+  if (( effective_micro_batch > local_ppo_batch )); then
+    effective_micro_batch="${local_ppo_batch}"
+  fi
   COMMON_TRAIN_ARGS=(
     "${ASSET_CONFIG_ARGS[@]}"
     --set "experiment.output_dir=${output_dir}"
@@ -385,7 +410,7 @@ build_training_args() {
   else
     COMMON_TRAIN_ARGS+=(
       --set "rollout.batch_size=${prompt_batch}"
-      --set "training.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}"
+      --set "training.micro_batch_size_per_gpu=${effective_micro_batch}"
       --set "training.length_bucketed_micro_batches=${LENGTH_BUCKETED_MICRO_BATCHES:-true}"
     )
   fi

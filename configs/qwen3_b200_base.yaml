@@ -145,8 +145,10 @@ training:
   resume_allow_config_mismatch: false
   # Local trajectories per differentiable forward/backward on each GPU.
   micro_batch_size_per_gpu: 8
-  # Global trajectories per optimizer update. Each rollout batch is split into
-  # these PPO mini-batches, then each mini-batch is split into local micros.
+  # Global trajectories per optimizer update, independent of world size. Each
+  # rollout batch is split into these PPO mini-batches; every rank processes its
+  # real share of the same global mini-batch, then splits that share into local
+  # micros.
   ppo_mini_batch_size: 16
   # Group similar response lengths to reduce padding
   # in the differentiable forward/backward pass.
