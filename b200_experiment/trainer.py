@@ -53,7 +53,13 @@ from .evaluation import (
     evaluation_metric_name,
     load_benchmark,
 )
-from .evaluation_cache import evaluate_or_reuse_base
+from .evaluation_cache import (
+    base_evaluation_cache_key,
+    evaluate_or_reuse_base,
+    load_compatible_evaluation,
+    materialize_evaluation,
+    resolve_base_cache_root,
+)
 from .eval_schedule import (
     should_run_training_evaluation,
     training_evaluation_steps,
@@ -109,6 +115,7 @@ from .selectors import (
 from .selectors.pgt_selector import PGTOutput
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
 from .tensorboard_logging import TensorBoardLogger
+from .vllm_evaluation import merge_vllm_evaluation_shards
 from .vllm_rollout import VLLMRolloutEngine
 
 
@@ -714,6 +721,12 @@ def _evaluate_vllm_subprocess(
     resolved_config_path: Path,
     output_dir: Path,
     runtime_settings: dict[str, Any],
+    *,
+    distributed_rank: int = 0,
+    distributed_world_size: int = 1,
+    distributed_local_rank: int | None = None,
+    abort_path: Path | None = None,
+    timeout_sec: float | None = None,
 ) -> dict[str, Any]:
     if hasattr(model, "peft_config"):
         raise RuntimeError(
@@ -743,6 +756,42 @@ def _evaluate_vllm_subprocess(
     environment["PYTHONPATH"] = os.pathsep.join(
         filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
     )
+    evaluator_settings = dict(runtime_settings)
+    if distributed_world_size > 1:
+        evaluator_settings["_shard_rank"] = int(distributed_rank)
+        evaluator_settings["_shard_world_size"] = int(distributed_world_size)
+        evaluator_settings["vllm"] = {
+            **dict(runtime_settings.get("vllm", {})),
+            # One independent engine per training GPU. Never create a
+            # cross-rank tensor-parallel vLLM process for periodic evaluation.
+            "tensor_parallel_size": 1,
+        }
+        # Sharding is global-rank based, while device selection must be
+        # local-rank based on multi-node launches.  On the usual single-node
+        # run these are identical; separating them avoids mapping rank 2 to a
+        # nonexistent third device on a two-GPU node.
+        device_rank = (
+            int(distributed_local_rank)
+            if distributed_local_rank is not None
+            else int(distributed_rank)
+        )
+        visible_devices = environment.get("CUDA_VISIBLE_DEVICES")
+        if visible_devices:
+            devices = [item.strip() for item in visible_devices.split(",") if item.strip()]
+            if len(devices) == 1:
+                # Some schedulers pre-mask each worker to one physical GPU.
+                # In that case the only visible device is already the correct
+                # local target, regardless of local-rank numbering.
+                environment["CUDA_VISIBLE_DEVICES"] = devices[0]
+            elif device_rank >= len(devices):
+                raise RuntimeError(
+                    "Evaluation LOCAL_RANK is outside CUDA_VISIBLE_DEVICES: "
+                    f"local_rank={device_rank}, devices={visible_devices!r}"
+                )
+            else:
+                environment["CUDA_VISIBLE_DEVICES"] = devices[device_rank]
+        else:
+            environment["CUDA_VISIBLE_DEVICES"] = str(device_rank)
     command = [
         sys.executable,
         "-m",
@@ -756,15 +805,416 @@ def _evaluate_vllm_subprocess(
         "--output",
         str(output_dir.resolve()),
         "--settings-json",
-        json.dumps(runtime_settings),
+        json.dumps(evaluator_settings),
     ]
     torch.cuda.empty_cache()
     try:
-        subprocess.run(command, cwd=repo_root, env=environment, check=True)
+        if abort_path is None:
+            # Preserve the original single-GPU subprocess behavior exactly.
+            subprocess.run(command, cwd=repo_root, env=environment, check=True)
+        else:
+            process = subprocess.Popen(command, cwd=repo_root, env=environment)
+            started = time.monotonic()
+            while process.poll() is None:
+                if abort_path.is_file():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise RuntimeError(
+                        "Periodic evaluation aborted because another rank "
+                        f"reported failure: {abort_path.read_text(encoding='utf-8')}"
+                    )
+                if timeout_sec is not None and time.monotonic() - started >= timeout_sec:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise TimeoutError(
+                        "Periodic evaluation subprocess exceeded the configured "
+                        f"filesystem timeout of {timeout_sec:.1f}s"
+                    )
+                time.sleep(0.25)
+            if process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, command)
         return json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     finally:
         if temporary_snapshot is not None:
             temporary_snapshot.cleanup()
+
+
+def _atomic_evaluation_json(path: Path, payload: dict[str, Any]) -> None:
+    """Publish a small evaluation coordination record atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _read_evaluation_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+
+
+def _evaluation_sync_timeout(settings: dict[str, Any]) -> float:
+    timeout = float(settings.get("sync_timeout_sec", 24 * 60 * 60))
+    if timeout <= 0:
+        raise ValueError("training_evaluation.sync_timeout_sec must be positive")
+    return timeout
+
+
+def _wait_for_evaluation_signal(
+    coordination_dir: Path,
+    timeout: float,
+    *,
+    signal_names: tuple[str, ...],
+) -> tuple[str, dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while True:
+        abort = _read_evaluation_json(coordination_dir / "abort.json")
+        if abort is not None:
+            raise RuntimeError(
+                "Periodic evaluation failed on another rank: "
+                f"{abort.get('error', abort)}"
+            )
+        for name in signal_names:
+            payload = _read_evaluation_json(coordination_dir / name)
+            if payload is not None:
+                return name, payload
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for filesystem-synchronized periodic evaluation "
+                f"signal in {coordination_dir} after {timeout:.1f}s"
+            )
+        time.sleep(0.25)
+
+
+def _probe_base_evaluation_cache(
+    *,
+    config: dict[str, Any],
+    runtime_settings: dict[str, Any],
+    model_path: Path,
+    model_name: str,
+    destination: Path,
+    cache_dir: str | Path | None,
+) -> tuple[dict[str, Any], str] | None:
+    """Read-only cache probe used before deciding whether to shard evaluation."""
+    cache_key = base_evaluation_cache_key(config, runtime_settings, model_path)
+    cache_entry = resolve_base_cache_root(config, cache_dir) / cache_key
+    local = load_compatible_evaluation(
+        destination,
+        model_path,
+        runtime_settings,
+        expected_cache_key=cache_key,
+    )
+    if local is not None:
+        return local, "local"
+    cached = load_compatible_evaluation(
+        cache_entry,
+        model_path,
+        runtime_settings,
+        expected_cache_key=cache_key,
+    )
+    if cached is None:
+        return None
+    return materialize_evaluation(cache_entry, destination, model_name=model_name), "shared"
+
+
+def _run_distributed_vllm_evaluation(
+    *,
+    model,
+    tokenizer,
+    method: str,
+    step: int,
+    config: dict[str, Any],
+    output_dir: Path,
+    resolved_config_path: Path,
+    checkpoint: Path | None,
+    runtime_settings: dict[str, Any],
+    distributed: DistributedContext,
+) -> tuple[dict[str, Any], str, float]:
+    """Run one independent TP=1 evaluator per rank without long NCCL waits."""
+    settings = config.get("training_evaluation", {})
+    eval_root = output_dir / str(settings.get("output_subdir", "training_eval"))
+    step_dir = eval_root / f"step-{step:06d}"
+    coordination_dir = eval_root / f".distributed-step-{step:06d}"
+    rank_dir = step_dir / f".rank-{distributed.rank:05d}"
+    timeout = _evaluation_sync_timeout(settings)
+    method_name = METHOD_DISPLAY_NAMES[method]
+    model_name = "Base student" if step == 0 else f"{method_name} step {step}"
+    source_path = (
+        Path(config["models"]["student_path"]).resolve()
+        if step == 0
+        else checkpoint
+    )
+    if source_path is None:
+        raise RuntimeError("Distributed vLLM evaluation requires a model snapshot path")
+
+    cache_result: tuple[dict[str, Any], str] | None = None
+    if distributed.is_main:
+        try:
+            if step == 0 and bool(settings.get("reuse_base_evaluation", True)):
+                cache_result = _probe_base_evaluation_cache(
+                    config=config,
+                    runtime_settings=runtime_settings,
+                    model_path=source_path,
+                    model_name=model_name,
+                    destination=step_dir,
+                    cache_dir=settings.get("base_cache_dir"),
+                )
+            if cache_result is None:
+                if step_dir.exists():
+                    shutil.rmtree(step_dir)
+                step_dir.mkdir(parents=True, exist_ok=True)
+                if coordination_dir.exists():
+                    shutil.rmtree(coordination_dir)
+                coordination_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_evaluation_json(
+                    coordination_dir / "start.json",
+                    {"state": "start", "world_size": distributed.world_size},
+                )
+            else:
+                if step == 0:
+                    # Preserve the existing cache publisher/manifest behavior
+                    # for both local and shared hits.  A shared hit was already
+                    # materialized by the read-only probe, but routing it
+                    # through the normal helper also writes the destination
+                    # manifest used by later resume/cache probes.
+                    local_suite, _ = evaluate_or_reuse_base(
+                        config=config,
+                        runtime_settings=runtime_settings,
+                        model_path=source_path,
+                        model_name=model_name,
+                        destination=step_dir,
+                        evaluator=lambda: cache_result[0],
+                        cache_dir=settings.get("base_cache_dir"),
+                        reuse_destination=True,
+                    )
+                    cache_result = (local_suite, "local")
+                for stale_rank_dir in step_dir.glob(".rank-*"):
+                    shutil.rmtree(stale_rank_dir, ignore_errors=True)
+                if coordination_dir.exists():
+                    shutil.rmtree(coordination_dir)
+                coordination_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_evaluation_json(
+                    coordination_dir / "result.json",
+                    {
+                        "state": "success",
+                        "summary": str((step_dir / "summary.json").resolve()),
+                        "cache_status": cache_result[1],
+                        "evaluation_time": 0.0,
+                    },
+                )
+        except Exception as exc:
+            coordination_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_evaluation_json(
+                coordination_dir / "abort.json",
+                {"state": "error", "rank": distributed.rank, "error": repr(exc)},
+            )
+            raise
+    else:
+        signal_name, signal = _wait_for_evaluation_signal(
+            coordination_dir,
+            timeout,
+            signal_names=("start.json", "result.json"),
+        )
+        if signal_name == "result.json":
+            suite = json.loads(Path(signal["summary"]).read_text(encoding="utf-8"))
+            _atomic_evaluation_json(
+                coordination_dir / f"ack-{distributed.rank:05d}.json",
+                {"state": "ack", "rank": distributed.rank},
+            )
+            return suite, str(signal.get("cache_status")), float(
+                signal.get("evaluation_time", 0.0)
+            )
+
+    if distributed.is_main and cache_result is not None:
+        try:
+            _atomic_evaluation_json(
+                coordination_dir / "ack-00000.json",
+                {"state": "ack", "rank": 0},
+            )
+            deadline = time.monotonic() + timeout
+            while not all(
+                _read_evaluation_json(coordination_dir / f"ack-{rank:05d}.json")
+                is not None
+                for rank in range(distributed.world_size)
+            ):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out waiting for cached evaluation acknowledgements"
+                    )
+                time.sleep(0.25)
+            shutil.rmtree(coordination_dir, ignore_errors=True)
+            return cache_result[0], cache_result[1], 0.0
+        except Exception as exc:
+            _atomic_evaluation_json(
+                coordination_dir / "abort.json",
+                {"state": "error", "rank": 0, "error": repr(exc)},
+            )
+            raise
+
+    if cache_result is None:
+        started = time.perf_counter()
+        _atomic_evaluation_json(
+            coordination_dir / f"rank-{distributed.rank:05d}.json",
+            {"state": "running", "rank": distributed.rank},
+        )
+        try:
+            _evaluate_vllm_subprocess(
+                model,
+                tokenizer,
+                model_name,
+                source_path,
+                step,
+                config,
+                resolved_config_path,
+                rank_dir,
+                runtime_settings,
+                distributed_rank=distributed.rank,
+                distributed_world_size=distributed.world_size,
+                distributed_local_rank=getattr(distributed, "local_rank", None),
+                abort_path=coordination_dir / "abort.json",
+                timeout_sec=timeout,
+            )
+            _atomic_evaluation_json(
+                coordination_dir / f"rank-{distributed.rank:05d}.json",
+                {
+                    "state": "success",
+                    "rank": distributed.rank,
+                    "summary": str((rank_dir / "summary.json").resolve()),
+                },
+            )
+        except Exception as exc:
+            _atomic_evaluation_json(
+                coordination_dir / f"rank-{distributed.rank:05d}.json",
+                {"state": "error", "rank": distributed.rank, "error": repr(exc)},
+            )
+            _atomic_evaluation_json(
+                coordination_dir / "abort.json",
+                {"state": "error", "rank": distributed.rank, "error": repr(exc)},
+            )
+            raise
+    if not distributed.is_main:
+        signal_name, signal = _wait_for_evaluation_signal(
+            coordination_dir,
+            timeout,
+            signal_names=("result.json",),
+        )
+        del signal_name
+        suite = json.loads(Path(signal["summary"]).read_text(encoding="utf-8"))
+        _atomic_evaluation_json(
+            coordination_dir / f"ack-{distributed.rank:05d}.json",
+            {"state": "ack", "rank": distributed.rank},
+        )
+        return suite, str(signal.get("cache_status")), float(
+            signal.get("evaluation_time", 0.0)
+        )
+
+    try:
+        rank_states: list[dict[str, Any]] = []
+        deadline = time.monotonic() + timeout
+        while len(rank_states) < distributed.world_size:
+            abort = _read_evaluation_json(coordination_dir / "abort.json")
+            if abort is not None:
+                raise RuntimeError(
+                    "Periodic evaluation failed on another rank: "
+                    f"{abort.get('error', abort)}"
+                )
+            rank_states = []
+            for rank in range(distributed.world_size):
+                state = _read_evaluation_json(
+                    coordination_dir / f"rank-{rank:05d}.json"
+                )
+                if state is not None:
+                    if state.get("state") == "error":
+                        raise RuntimeError(
+                            f"Periodic evaluation rank {rank} failed: "
+                            f"{state.get('error', state)}"
+                        )
+                    if state.get("state") == "success":
+                        rank_states.append(state)
+            if len(rank_states) == distributed.world_size:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for all periodic evaluation ranks after "
+                    f"{timeout:.1f}s"
+                )
+            time.sleep(0.25)
+
+        shard_dirs = [
+            step_dir / f".rank-{rank:05d}" for rank in range(distributed.world_size)
+        ]
+        merged_suite = merge_vllm_evaluation_shards(
+            model_name,
+            source_path,
+            config,
+            step_dir,
+            shard_dirs,
+            runtime_settings,
+        )
+        cache_status = "generated"
+        if step == 0 and bool(settings.get("reuse_base_evaluation", True)):
+            # The merged destination is now a valid single-format evaluation;
+            # reuse the existing cache publisher without running a second eval.
+            merged_suite, _ = evaluate_or_reuse_base(
+                config=config,
+                runtime_settings=runtime_settings,
+                model_path=source_path,
+                model_name=model_name,
+                destination=step_dir,
+                evaluator=lambda: merged_suite,
+                cache_dir=settings.get("base_cache_dir"),
+                reuse_destination=True,
+            )
+        elapsed = time.perf_counter() - started
+        _atomic_evaluation_json(
+            coordination_dir / "result.json",
+            {
+                "state": "success",
+                "summary": str((step_dir / "summary.json").resolve()),
+                "cache_status": cache_status,
+                "evaluation_time": elapsed,
+            },
+        )
+        _atomic_evaluation_json(
+            coordination_dir / "ack-00000.json",
+            {"state": "ack", "rank": 0},
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            if all(
+                _read_evaluation_json(
+                    coordination_dir / f"ack-{rank:05d}.json"
+                )
+                is not None
+                for rank in range(distributed.world_size)
+            ):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for evaluation shard acknowledgements")
+            time.sleep(0.25)
+        for shard_dir in shard_dirs:
+            shutil.rmtree(shard_dir, ignore_errors=True)
+        shutil.rmtree(coordination_dir, ignore_errors=True)
+        return merged_suite, cache_status, elapsed
+    except Exception as exc:
+        _atomic_evaluation_json(
+            coordination_dir / "abort.json",
+            {"state": "error", "rank": 0, "error": repr(exc)},
+        )
+        raise
 
 
 def _run_training_evaluation(
@@ -777,6 +1227,7 @@ def _run_training_evaluation(
     output_dir: Path,
     resolved_config_path: Path,
     checkpoint: Path | None = None,
+    distributed: DistributedContext | None = None,
 ) -> dict[str, Any]:
     settings = config.get("training_evaluation", {})
     eval_root = output_dir / str(settings.get("output_subdir", "training_eval"))
@@ -808,7 +1259,13 @@ def _run_training_evaluation(
     method_name = METHOD_DISPLAY_NAMES[method]
     model_name = "Base student" if step == 0 else f"{method_name} step {step}"
     backend = runtime_settings["backend"]
+    if distributed is not None and distributed.world_size > 1 and backend != "vllm":
+        raise RuntimeError(
+            "Multi-GPU training-time evaluation requires backend=vllm; "
+            "HF evaluation remains available on a single GPU."
+        )
     cache_status = "disabled"
+    distributed_elapsed: float | None = None
     if backend == "vllm":
         source_path = (
             Path(config["models"]["student_path"]).resolve()
@@ -829,7 +1286,27 @@ def _run_training_evaluation(
                 runtime_settings,
             )
 
-        if step == 0 and bool(settings.get("reuse_base_evaluation", True)):
+        if distributed is not None and distributed.world_size > 1:
+            distributed_runtime_settings = {
+                **runtime_settings,
+                "vllm": {
+                    **dict(runtime_settings.get("vllm", {})),
+                    "tensor_parallel_size": 1,
+                },
+            }
+            suite, cache_status, distributed_elapsed = _run_distributed_vllm_evaluation(
+                model=model,
+                tokenizer=tokenizer,
+                method=method,
+                step=step,
+                config=config,
+                output_dir=output_dir,
+                resolved_config_path=resolved_config_path,
+                checkpoint=checkpoint,
+                runtime_settings=distributed_runtime_settings,
+                distributed=distributed,
+            )
+        elif step == 0 and bool(settings.get("reuse_base_evaluation", True)):
             suite, cache_status = evaluate_or_reuse_base(
                 config=config,
                 runtime_settings=runtime_settings,
@@ -862,7 +1339,11 @@ def _run_training_evaluation(
     else:
         raise ValueError("training_evaluation.backend must be 'vllm' or 'hf'")
     torch.cuda.empty_cache()
-    elapsed = time.perf_counter() - started
+    elapsed = (
+        distributed_elapsed
+        if distributed_elapsed is not None
+        else time.perf_counter() - started
+    )
     samples_per_problem = int(runtime_settings["num_responses"])
     metric_name = str(
         suite.get("parameters", {}).get(
@@ -895,9 +1376,10 @@ def _run_training_evaluation(
         "parameters": suite["parameters"],
         "details": str((step_dir / "summary.json").resolve()),
     }
-    _upsert_jsonl_row(
-        output_dir / "eval_history.jsonl", history_entry, ("step", "method")
-    )
+    if distributed is None or distributed.is_main:
+        _upsert_jsonl_row(
+            output_dir / "eval_history.jsonl", history_entry, ("step", "method")
+        )
     eval_metric_fields = (
         "step",
         "method",
@@ -913,20 +1395,21 @@ def _run_training_evaluation(
         "metric",
         "evaluation_time_sec",
     )
-    for benchmark, result in history_entry["benchmarks"].items():
-        _upsert_csv_row(
-            output_dir / "eval_metrics.csv",
-            {
-                "step": step,
-                "method": method,
-                "backend": backend,
-                "benchmark": benchmark,
-                **result,
-                "evaluation_time_sec": elapsed,
-            },
-            eval_metric_fields,
-            ("step", "method", "benchmark"),
-        )
+    if distributed is None or distributed.is_main:
+        for benchmark, result in history_entry["benchmarks"].items():
+            _upsert_csv_row(
+                output_dir / "eval_metrics.csv",
+                {
+                    "step": step,
+                    "method": method,
+                    "backend": backend,
+                    "benchmark": benchmark,
+                    **result,
+                    "evaluation_time_sec": elapsed,
+                },
+                eval_metric_fields,
+                ("step", "method", "benchmark"),
+            )
     return history_entry
 
 
@@ -1564,6 +2047,16 @@ def run_training(
             "FSDP periodic evaluation must use backend=vllm so rank 0 evaluates "
             "a collectively exported HF snapshot."
         )
+    if (
+        distributed.world_size > 1
+        and bool(config.get("training_evaluation", {}).get("enabled", False))
+        and str(config["training_evaluation"].get("backend", "vllm")).lower()
+        != "vllm"
+    ):
+        raise RuntimeError(
+            "Multi-GPU periodic evaluation requires backend=vllm so each rank "
+            "can run an independent tensor_parallel_size=1 evaluator."
+        )
     rollout_engine: VLLMRolloutEngine | None = None
 
     setup_progress = tqdm(
@@ -1855,8 +2348,8 @@ def run_training(
     if resume_step == 0 and should_run_training_evaluation(
         0, max_steps, training_eval_settings
     ):
-        distributed.barrier()
-        if distributed.is_main:
+        if distributed.world_size == 1:
+            distributed.barrier()
             tqdm.write("Evaluating the untouched base student at optimizer step 0...")
             initial_evaluation = _run_training_evaluation(
                 training_student,
@@ -1868,7 +2361,27 @@ def run_training(
                 output_dir,
                 resolved_config_path,
             )
-        distributed.barrier()
+            distributed.barrier()
+        else:
+            if distributed.is_main:
+                tqdm.write("Evaluating the untouched base student at optimizer step 0...")
+            initial_evaluation = _run_training_evaluation(
+                training_student,
+                tokenizer,
+                method,
+                0,
+                max_steps,
+                config,
+                output_dir,
+                resolved_config_path,
+                distributed=distributed,
+            )
+            # The filesystem coordinator only returns after all ranks have
+            # finished and rank 0 has merged the artifacts. This is a short
+            # post-evaluation collective, never a long wait during generation.
+            distributed.barrier()
+            if not distributed.is_main:
+                initial_evaluation = None
     final_metrics: dict[str, Any] = {}
     progress = tqdm(
         total=max_steps,
@@ -2770,8 +3283,8 @@ def run_training(
         for evaluation_step, (evaluation_checkpoint, temporary) in sorted(
             evaluation_sources.items()
         ):
-            distributed.barrier()
-            if distributed.is_main:
+            if distributed.world_size == 1:
+                distributed.barrier()
                 progress.set_postfix_str("stage=evaluation", refresh=True)
                 periodic_evaluations[evaluation_step] = _run_training_evaluation(
                     training_student,
@@ -2784,10 +3297,32 @@ def run_training(
                     resolved_config_path,
                     checkpoint=evaluation_checkpoint,
                 )
-            distributed.barrier()
-            if distributed.is_main and temporary:
-                shutil.rmtree(evaluation_checkpoint)
-            distributed.barrier()
+                distributed.barrier()
+                if temporary:
+                    shutil.rmtree(evaluation_checkpoint)
+                distributed.barrier()
+            else:
+                if distributed.is_main:
+                    progress.set_postfix_str("stage=evaluation", refresh=True)
+                evaluation_result = _run_training_evaluation(
+                    training_student,
+                    tokenizer,
+                    method,
+                    evaluation_step,
+                    max_steps,
+                    config,
+                    output_dir,
+                    resolved_config_path,
+                    checkpoint=evaluation_checkpoint,
+                    distributed=distributed,
+                )
+                if distributed.is_main:
+                    periodic_evaluations[evaluation_step] = evaluation_result
+                # Only short collectives after filesystem-synchronized local
+                # evaluation/merge have completed on every rank.
+                distributed.barrier()
+                if distributed.is_main and temporary:
+                    shutil.rmtree(evaluation_checkpoint)
 
         training_events: list[dict[str, Any]] = []
         for event_offset, minibatch_metric in enumerate(train_metrics["minibatches"]):

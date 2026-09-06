@@ -137,6 +137,13 @@ checkpoint và lịch
 eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
 tài nguyên giữa các run.
 
+Training-time evaluation trên nhiều GPU được shard tự động: mỗi rank chạy một vLLM replica
+`tensor_parallel_size=1`, xử lý một shard benchmark, rồi rank 0 merge về cùng format
+`training_eval/step-*` như single-GPU. Trong thời gian generation không có rank nào chờ NCCL
+barrier; filesystem sentinel phát hiện completion/failure, và chỉ dùng collective ngắn sau merge.
+Vì vậy multi-GPU periodic evaluation yêu cầu `training_evaluation.backend=vllm`; HF fallback chỉ
+được dùng khi chạy một GPU.
+
 Full eval có 1.060 problem và `n=16`, vì vậy progress của vLLM hiển thị 16.960 generated responses
 (`1.060 * 16`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
 được cache theo fingerprint của model, dataset, evaluator và toàn bộ protocol. OPD sinh lần đầu;

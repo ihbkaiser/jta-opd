@@ -12,6 +12,7 @@ from unittest.mock import patch
 from b200_experiment.vllm_evaluation import (
     _resolve_gpu_memory_utilization,
     evaluate_vllm_suite,
+    merge_vllm_evaluation_shards,
 )
 
 
@@ -180,6 +181,80 @@ class VllmEvaluationTests(unittest.TestCase):
             )
             self.assertEqual(suite["benchmarks"]["MATH-500"]["total"], 16)
             self.assertEqual(suite["benchmarks"]["MATH-500"]["problems"], 1)
+
+    def test_two_rank_shards_merge_to_single_gpu_metrics_and_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            benchmark_path = root / "math.jsonl"
+            benchmark_path.write_text(
+                "".join(
+                    json.dumps({"problem": f"{index}?", "answer": "1"}) + "\n"
+                    for index in range(5)
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "models": {"dtype": "bfloat16"},
+                "data": {"chat_template_kwargs": {}},
+                "evaluation": {
+                    "benchmarks": {"MATH-500": {"path": str(benchmark_path)}}
+                },
+            }
+            settings = {
+                "max_new_tokens": 8,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "num_responses": 1,
+                "benchmark_names": ["MATH-500"],
+                "vllm": {"gpu_memory_utilization": 0.4},
+            }
+            fake_vllm = types.SimpleNamespace(LLM=_LLM, SamplingParams=_SamplingParams)
+            _LLM.instances.clear()
+            with (
+                patch.dict(sys.modules, {"vllm": fake_vllm}),
+                patch(
+                    "b200_experiment.vllm_evaluation.AutoTokenizer.from_pretrained",
+                    return_value=_Tokenizer(),
+                ),
+            ):
+                single = evaluate_vllm_suite(
+                    "student", root, config, root / "single", settings
+                )
+                for rank in range(2):
+                    evaluate_vllm_suite(
+                        "student",
+                        root,
+                        config,
+                        root / f"rank-{rank}",
+                        {
+                            **settings,
+                            "_shard_rank": rank,
+                            "_shard_world_size": 2,
+                        },
+                    )
+                merged = merge_vllm_evaluation_shards(
+                    "student",
+                    root,
+                    config,
+                    root / "merged",
+                    [root / "rank-0", root / "rank-1"],
+                    settings,
+                )
+
+            single_result = single["benchmarks"]["MATH-500"]
+            merged_result = merged["benchmarks"]["MATH-500"]
+            for key in ("correct", "total", "problems", "samples_per_problem", "accuracy"):
+                self.assertEqual(merged_result[key], single_result[key])
+            with gzip.open(
+                merged_result["predictions"], "rt", encoding="utf-8"
+            ) as handle:
+                merged_rows = [json.loads(line) for line in handle]
+            self.assertEqual([row["id"] for row in merged_rows], [str(i) for i in range(5)])
+            self.assertTrue(all(instance.kwargs["tensor_parallel_size"] == 1 for instance in _LLM.instances))
+            self.assertEqual(
+                [len(instance.generate_calls[0][0]) for instance in _LLM.instances],
+                [5, 3, 2],
+            )
 
 
 if __name__ == "__main__":

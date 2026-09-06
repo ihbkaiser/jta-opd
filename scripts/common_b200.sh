@@ -391,6 +391,7 @@ build_training_args() {
     --set "training_evaluation.num_responses=${TRAIN_EVAL_NUM_RESPONSES:-16}"
     --set "training_evaluation.target_evaluations=null"
     --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-${EVAL_INTERVAL:-50}}"
+    --set "training_evaluation.sync_timeout_sec=${TRAIN_EVAL_SYNC_TIMEOUT_SEC:-86400}"
     --set "training_evaluation.limit=null"
     --set "training_evaluation.batch_size=${TRAIN_EVAL_BATCH_SIZE:-1}"
     --set "training_evaluation.max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS:-7168}"

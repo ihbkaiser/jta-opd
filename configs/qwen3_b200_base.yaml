@@ -209,6 +209,9 @@ training_evaluation:
   # also reused after a crash before the first optimizer update.
   reuse_base_evaluation: true
   base_cache_dir: outputs/.base_eval_cache
+  # Filesystem coordination timeout for multi-GPU evaluation. This is not a
+  # NCCL timeout; ranks poll sentinels while vLLM replicas run independently.
+  sync_timeout_sec: 86400
   vllm:
     tensor_parallel_size: 1
     # Dynamically consume almost all currently-free VRAM. The training process

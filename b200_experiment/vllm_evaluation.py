@@ -75,6 +75,13 @@ def evaluate_vllm_suite(
     if samples_per_problem <= 0:
         raise ValueError("Evaluation num_responses must be positive")
     limit = runtime_settings.get("limit")
+    shard_rank = int(runtime_settings.get("_shard_rank", 0))
+    shard_world_size = int(runtime_settings.get("_shard_world_size", 1))
+    if shard_world_size <= 0 or not 0 <= shard_rank < shard_world_size:
+        raise ValueError(
+            "Evaluation shard must satisfy 0 <= rank < positive world size: "
+            f"rank={shard_rank}, world_size={shard_world_size}"
+        )
     benchmark_names = configured_benchmark_names(
         config, runtime_settings.get("benchmark_names")
     )
@@ -89,6 +96,12 @@ def evaluate_vllm_suite(
         )
         if limit is not None:
             records = records[: int(limit)]
+        if shard_world_size > 1:
+            records = [
+                row
+                for index, row in enumerate(records)
+                if index % shard_world_size == shard_rank
+            ]
         loaded[benchmark] = (records, schema)
         for row in records:
             rendered_prompt = _prompt(tokenizer, row["problem"], config)
@@ -125,8 +138,14 @@ def evaluate_vllm_suite(
     if performance_mode not in (None, ""):
         engine_kwargs["performance_mode"] = str(performance_mode)
 
+    sample_scope = (
+        "full-dataset"
+        if shard_world_size == 1
+        else f"rank {shard_rank}/{shard_world_size} shard"
+    )
     tqdm.write(
-        f"Eval {model_name}: loading vLLM engine for {len(prompts)} full-dataset samples..."
+        f"Eval {model_name}: loading vLLM engine for "
+        f"{len(prompts)} {sample_scope} samples..."
     )
     engine = LLM(**engine_kwargs)
     sampling = SamplingParams(
@@ -258,6 +277,204 @@ def evaluate_vllm_suite(
     suite["detailed_outputs"] = str(detailed_output_path.resolve())
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(suite, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return suite
+
+
+def merge_vllm_evaluation_shards(
+    model_name: str,
+    model_path: str | Path,
+    config: dict[str, Any],
+    destination: str | Path,
+    shard_dirs: list[str | Path],
+    runtime_settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge deterministic per-rank vLLM evaluation artifacts.
+
+    Each evaluator rank receives rows ``index % world_size == rank``.  Merging
+    by the inverse round-robin restores the original benchmark order, so the
+    resulting summary/prediction/detailed-output schema is identical to a
+    single evaluator run.  No distributed collective is involved here; this
+    function is intentionally filesystem-only and is called by rank 0 after
+    every rank has published a successful shard status.
+    """
+    destination = Path(destination).resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    shard_paths = [Path(path).resolve() for path in shard_dirs]
+    if not shard_paths:
+        raise ValueError("At least one evaluation shard is required")
+    benchmark_names = configured_benchmark_names(
+        config, runtime_settings.get("benchmark_names")
+    )
+    loaded: dict[str, tuple[list[dict[str, str]], dict[str, Any]]] = {}
+    for benchmark in benchmark_names:
+        records, schema = load_benchmark(
+            benchmark, config["evaluation"]["benchmarks"][benchmark]
+        )
+        if runtime_settings.get("limit") is not None:
+            records = records[: int(runtime_settings["limit"])]
+        loaded[benchmark] = (records, schema)
+
+    suites = []
+    for shard in shard_paths:
+        summary_path = shard / "summary.json"
+        if not summary_path.is_file():
+            raise RuntimeError(f"Missing evaluation shard summary: {summary_path}")
+        suite = json.loads(summary_path.read_text(encoding="utf-8"))
+        if tuple(suite.get("benchmarks", {})) != benchmark_names:
+            raise RuntimeError(
+                f"Evaluation shard has unexpected benchmark order: {summary_path}"
+            )
+        suites.append(suite)
+    expected_parameters = {
+        "backend": "vllm",
+        "max_new_tokens": int(runtime_settings["max_new_tokens"]),
+        "limit": runtime_settings.get("limit"),
+        "temperature": float(runtime_settings["temperature"]),
+        "top_p": float(runtime_settings["top_p"]),
+        "num_responses": int(runtime_settings["num_responses"]),
+        "metric": evaluation_metric_name(int(runtime_settings["num_responses"])),
+    }
+    for suite in suites:
+        parameters = suite.get("parameters", {})
+        for key, expected in expected_parameters.items():
+            actual = parameters.get(key)
+            if isinstance(expected, float):
+                try:
+                    matches = float(actual) == expected
+                except (TypeError, ValueError):
+                    matches = False
+            else:
+                matches = actual == expected
+            if not matches:
+                raise RuntimeError(
+                    f"Evaluation shard parameter mismatch for {key}: "
+                    f"expected {expected!r}, got {actual!r}"
+                )
+
+    def read_prediction_rows(path: Path) -> list[dict[str, Any]]:
+        if not path.is_file():
+            raise RuntimeError(f"Missing evaluation prediction shard: {path}")
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def interleave(rows_by_rank: list[list[Any]]) -> list[Any]:
+        rows: list[Any] = []
+        for local_index in range(max((len(rows) for rows in rows_by_rank), default=0)):
+            for rank_rows in rows_by_rank:
+                if local_index < len(rank_rows):
+                    rows.append(rank_rows[local_index])
+        return rows
+
+    merged_benchmarks: dict[str, dict[str, Any]] = {}
+    for benchmark in benchmark_names:
+        records, schema = loaded[benchmark]
+        rows_by_rank = [
+            read_prediction_rows(
+                shard
+                / Path(suite["benchmarks"][benchmark]["predictions"]).name
+            )
+            for shard, suite in zip(shard_paths, suites)
+        ]
+        merged_rows = interleave(rows_by_rank)
+        expected_rows = [(row["id"], row["problem"], row["answer"]) for row in records]
+        actual_rows = [
+            (row.get("id"), row.get("problem"), row.get("answer"))
+            for row in merged_rows
+        ]
+        if actual_rows != expected_rows:
+            raise RuntimeError(
+                f"Evaluation shard merge changed {benchmark} problem ordering or "
+                f"dropped/duplicated problems: expected {len(expected_rows)}, "
+                f"got {len(actual_rows)}"
+            )
+        samples_per_problem = int(runtime_settings["num_responses"])
+        for row in merged_rows:
+            if len(row.get("correct", [])) != samples_per_problem:
+                raise RuntimeError(
+                    f"Evaluation shard has an incomplete response set for {benchmark} "
+                    f"problem {row.get('id')!r}: expected {samples_per_problem}"
+                )
+        prediction_path = destination / (
+            f"{benchmark.lower().replace('-', '_')}_predictions.jsonl.gz"
+        )
+        correct = sum(
+            int(is_correct)
+            for row in merged_rows
+            for is_correct in row.get("correct", [])
+        )
+        total = sum(len(row.get("correct", [])) for row in merged_rows)
+        # Recompute from per-response grades instead of trusting a shard's
+        # aggregate field; this is numerically identical to the single-GPU
+        # evaluator and makes the merged metric auditable.
+        problem_score_sum = sum(
+            sum(map(int, row["correct"])) / samples_per_problem
+            for row in merged_rows
+        )
+        with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
+            for row in merged_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        result = {
+            "correct": correct,
+            "total": total,
+            "problems": len(merged_rows),
+            "samples_per_problem": samples_per_problem,
+            "avg_at_n": problem_score_sum / max(len(merged_rows), 1),
+            "accuracy": problem_score_sum / max(len(merged_rows), 1),
+            "predictions": str(prediction_path.resolve()),
+            "schema": schema,
+        }
+        if samples_per_problem == 16:
+            result["avg_at_16"] = result["avg_at_n"]
+        merged_benchmarks[benchmark] = result
+
+    detailed_rows_by_rank: list[list[dict[str, Any]]] = []
+    for shard, suite in zip(shard_paths, suites):
+        path = shard / Path(suite["detailed_outputs"]).name
+        if not path.is_file():
+            raise RuntimeError(f"Missing detailed evaluation shard: {path}")
+        with gzip.open(path, "rt", encoding="utf-8") as handle:
+            detailed_rows_by_rank.append(
+                [json.loads(line) for line in handle if line.strip()]
+            )
+    detailed_by_benchmark: dict[str, list[list[dict[str, Any]]]] = {
+        benchmark: [] for benchmark in benchmark_names
+    }
+    for rank_rows in detailed_rows_by_rank:
+        for benchmark in benchmark_names:
+            detailed_by_benchmark[benchmark].append(
+                [row for row in rank_rows if row.get("benchmark") == benchmark]
+            )
+    detailed_output_path = destination / "model_outputs_detailed.jsonl.gz"
+    with gzip.open(detailed_output_path, "wt", encoding="utf-8") as handle:
+        for benchmark in benchmark_names:
+            merged_detailed = interleave(detailed_by_benchmark[benchmark])
+            if len(merged_detailed) != merged_benchmarks[benchmark]["problems"]:
+                raise RuntimeError(
+                    f"Detailed output count mismatch for {benchmark}: "
+                    f"{len(merged_detailed)} vs {merged_benchmarks[benchmark]['problems']}"
+                )
+            expected_ids = [row["id"] for row in loaded[benchmark][0]]
+            actual_ids = [row.get("problem_id") for row in merged_detailed]
+            if actual_ids != expected_ids:
+                raise RuntimeError(
+                    f"Detailed evaluation shard merge changed {benchmark} problem "
+                    "ordering or dropped/duplicated detailed rows"
+                )
+            for row in merged_detailed:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    first_parameters = dict(suites[0]["parameters"])
+    first_parameters["tensor_parallel_size"] = 1
+    suite = {
+        "model": model_name,
+        "model_path": str(Path(model_path).resolve()),
+        "benchmarks": merged_benchmarks,
+        "parameters": first_parameters,
+        "detailed_outputs": str(detailed_output_path.resolve()),
+    }
+    with (destination / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(suite, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     return suite

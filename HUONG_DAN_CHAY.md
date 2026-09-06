@@ -94,6 +94,7 @@ export SAVE_INTERVAL=50
 export EVAL_INTERVAL=50
 export TRAIN_EVAL_ENABLED=true
 export TRAIN_EVAL_NUM_RESPONSES=16
+export TRAIN_EVAL_SYNC_TIMEOUT_SEC=86400
 export ROLLOUT_TEMPERATURE=1.0
 export ROLLOUT_TOP_P=1.0
 ```
@@ -153,6 +154,18 @@ RUN_NAME="$PGT_RUN_NAME" bash scripts/train_pgt_b200.sh
 ```
 
 Các launcher dùng chung rollout, checkpoint, TensorBoard, teacher scoring và evaluation pipeline.
+
+Training-time evaluation tự dùng toàn bộ GPU training khi `world_size>1`: mỗi rank chạy một
+vLLM replica độc lập với `tensor_parallel_size=1`, nhận shard deterministic của benchmark, rồi
+rank 0 merge lại thành đúng `summary.json`, prediction files và `model_outputs_detailed.jsonl.gz`
+trong `training_eval/step-*`. Trong lúc generation/grade kéo dài, các rank chờ bằng filesystem
+sentinel chứ không giữ NCCL barrier; chỉ có collective ngắn sau khi mọi shard đã hoàn tất.
+Nếu một rank lỗi, sentinel lỗi được phát hiện và toàn job dừng với thông báo rõ. `sync_timeout_sec`
+(mặc định 24 giờ) điều khiển timeout này. Với một GPU, pipeline cũ vẫn được giữ nguyên.
+Multi-GPU training-time evaluation yêu cầu `training_evaluation.backend=vllm`; backend `hf` vẫn
+dùng được cho single-GPU.
+Các rank phải cùng nhìn thấy `experiment.output_dir` (filesystem dùng chung) để đọc sentinel và
+merge shard.
 Output mặc định:
 
 ```text
