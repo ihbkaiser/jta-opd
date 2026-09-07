@@ -89,7 +89,7 @@ echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVA
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."
 else
-  echo "Existing training_eval/step-*, eval_history.jsonl, and eval_metrics.csv will be replaced."
+  echo "Only artifacts for metric ${REEVAL_METRIC_LABEL} will be replaced; other metric histories are preserved."
 fi
 for selected in "${SELECTED_OUTPUTS[@]}"; do
   echo "Selected output: ${selected}"

@@ -204,18 +204,67 @@ def _atomic_replace_directory(staged: Path, destination: Path) -> None:
             shutil.rmtree(backup)
 
 
+def _metric_artifact_slug(metric_name: str) -> str:
+    """Filesystem-safe, stable suffix for a re-evaluation metric."""
+    return metric_name.replace("@", "_at_").replace("-", "_")
+
+
+def _history_metric(path: Path) -> str | None:
+    """Return the single metric recorded by a history file, if unambiguous."""
+    if not path.is_file():
+        return None
+    metrics: set[str] = set()
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                parameters = row.get("parameters", {})
+                if parameters.get("metric"):
+                    metrics.add(str(parameters["metric"]))
+                for benchmark in row.get("benchmarks", {}).values():
+                    if benchmark.get("metric"):
+                        metrics.add(str(benchmark["metric"]))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return next(iter(metrics)) if len(metrics) == 1 else None
+
+
+def _reevaluation_artifact_paths(
+    run_output: Path, output_subdir: str, metric_name: str
+) -> tuple[Path, Path, Path]:
+    """Choose metric-isolated artifacts without clobbering another metric."""
+    canonical_root = run_output / output_subdir
+    canonical_history = run_output / "eval_history.jsonl"
+    if metric_name not in {"avg@8", "pass@8"}:
+        return canonical_root, canonical_history, run_output / "eval_metrics.csv"
+    slug = _metric_artifact_slug(metric_name)
+    metric_root = run_output / f"{output_subdir}_{slug}"
+    metric_history = run_output / f"eval_history_{slug}.jsonl"
+    metric_csv = run_output / f"eval_metrics_{slug}.csv"
+    if metric_history.exists() or _history_metric(canonical_history) != metric_name:
+        return metric_root, metric_history, metric_csv
+    return canonical_root, canonical_history, run_output / "eval_metrics.csv"
+
+
 def _write_history_atomically(
     run_output: Path,
     history: list[dict[str, Any]],
     metric_rows: list[dict[str, Any]],
+    *,
+    history_path: Path | None = None,
+    metrics_path: Path | None = None,
 ) -> None:
-    history_path = run_output / "eval_history.jsonl"
+    history_path = history_path or (run_output / "eval_history.jsonl")
+    metrics_path = metrics_path or (run_output / "eval_metrics.csv")
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     history_temp = run_output / f".{history_path.name}.reeval-{uuid.uuid4().hex}.tmp"
     with history_temp.open("w", encoding="utf-8") as handle:
         for row in history:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
-    metrics_path = run_output / "eval_metrics.csv"
     metrics_temp = run_output / f".{metrics_path.name}.reeval-{uuid.uuid4().hex}.tmp"
     fieldnames = (
         "step",
@@ -331,7 +380,17 @@ def _reevaluate_method(
     output_subdir = str(
         config.get("training_evaluation", {}).get("output_subdir", "training_eval")
     )
-    eval_root = run_output / output_subdir
+    requested_metric = evaluation_metric_name(
+        settings["num_responses"], settings.get("metric")
+    )
+    eval_root, history_path, metrics_path = _reevaluation_artifact_paths(
+        run_output, output_subdir, requested_metric
+    )
+    manifest_path = run_output / "checkpoint_reevaluation_manifest.json"
+    if history_path.name != "eval_history.jsonl":
+        manifest_path = run_output / (
+            f"checkpoint_reevaluation_manifest_{_metric_artifact_slug(requested_metric)}.json"
+        )
     evaluated = []
     if args.dry_run:
         return {
@@ -339,6 +398,10 @@ def _reevaluate_method(
             "display_name": display_name,
             "output": str(run_output),
             "temperature": settings["temperature"],
+            "metric": requested_metric,
+            "history": str(history_path.resolve()),
+            "metrics": str(metrics_path.resolve()),
+            "manifest": str(manifest_path.resolve()),
             "targets": [
                 {"step": target.step, "model_path": str(target.model_path)}
                 for target in targets
@@ -506,7 +569,13 @@ def _reevaluate_method(
             }
         )
 
-    _write_history_atomically(run_output, history, metric_rows)
+    _write_history_atomically(
+        run_output,
+        history,
+        metric_rows,
+        history_path=history_path,
+        metrics_path=metrics_path,
+    )
     manifest = {
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -520,11 +589,11 @@ def _reevaluate_method(
         ),
         "backend": "vllm",
         "full_benchmarks": list(settings["benchmark_names"]),
-        "history": str((run_output / "eval_history.jsonl").resolve()),
-        "metrics": str((run_output / "eval_metrics.csv").resolve()),
+        "history": str(history_path.resolve()),
+        "metrics": str(metrics_path.resolve()),
+        "artifact_root": str(eval_root.resolve()),
         "evaluated": evaluated,
     }
-    manifest_path = run_output / "checkpoint_reevaluation_manifest.json"
     manifest_temp = run_output / f".{manifest_path.name}.{uuid.uuid4().hex}.tmp"
     manifest_temp.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

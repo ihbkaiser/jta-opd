@@ -366,6 +366,11 @@ REEVAL_WORLD_SIZE=2 CUDA_VISIBLE_DEVICES=0,1 \
   bash scripts/reeval_pass8_b200.sh cmt "$CMT_RUN_NAME"
 ```
 
+Pass@8 được lưu riêng trong `eval_history_pass_at_8.jsonl`,
+`eval_metrics_pass_at_8.csv`, `checkpoint_reevaluation_manifest_pass_at_8.json` và
+`training_eval_pass_at_8/`; history metric khác không bị ghi đè. Chạy lại đúng pass@8 sẽ replace
+bộ artifact pass@8 hiện có.
+
 Re-evaluate nhiều method cùng protocol:
 
 ```bash

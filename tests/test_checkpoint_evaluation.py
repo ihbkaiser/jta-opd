@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from b200_experiment.checkpoint_evaluation import (
+    _reevaluation_artifact_paths,
     _write_history_atomically,
     discover_evaluation_targets,
     main,
@@ -17,6 +18,43 @@ from b200_experiment.evaluation import BENCHMARK_ORDER
 
 
 class CheckpointEvaluationTests(unittest.TestCase):
+    def test_pass8_gets_metric_specific_files_without_clobbering_avg8(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            history = output / "eval_history.jsonl"
+            history.write_text(
+                json.dumps(
+                    {"step": 1, "benchmarks": {"MATH-500": {"metric": "avg@8"}}}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            root, history_path, metrics_path = _reevaluation_artifact_paths(
+                output, "training_eval", "pass@8"
+            )
+            self.assertEqual(root, output / "training_eval_pass_at_8")
+            self.assertEqual(history_path, output / "eval_history_pass_at_8.jsonl")
+            self.assertEqual(metrics_path, output / "eval_metrics_pass_at_8.csv")
+            self.assertEqual(history.read_text(encoding="utf-8").count("avg@8"), 1)
+
+    def test_same_metric_reuses_legacy_file_and_replaces_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            history = output / "eval_history.jsonl"
+            history.write_text(
+                json.dumps(
+                    {"step": 1, "benchmarks": {"MATH-500": {"metric": "avg@8"}}}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            root, history_path, metrics_path = _reevaluation_artifact_paths(
+                output, "training_eval", "avg@8"
+            )
+            self.assertEqual(root, output / "training_eval")
+            self.assertEqual(history_path, history)
+            self.assertEqual(metrics_path, output / "eval_metrics.csv")
+
     @staticmethod
     def _make_run(root: Path, method: str) -> Path:
         base = root / "base"
