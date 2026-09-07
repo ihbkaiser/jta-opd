@@ -193,6 +193,7 @@ training_evaluation:
   temperature: 0.7
   top_p: 0.95
   num_responses: 16
+  metric: null
   target_evaluations: null
   interval_steps: 50
   eval_at_start: true

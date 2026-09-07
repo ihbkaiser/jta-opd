@@ -1250,6 +1250,7 @@ def _run_training_evaluation(
             )
         ),
         "limit": settings.get("limit", config["evaluation"].get("limit")),
+        "metric": settings.get("metric", config["evaluation"].get("metric")),
         "benchmark_names": list(
             configured_benchmark_names(config, settings.get("benchmark_names"))
         ),
@@ -1365,6 +1366,8 @@ def _run_training_evaluation(
                 "accuracy": result["accuracy"],
                 "avg_at_n": result.get("avg_at_n", result["accuracy"]),
                 **({"avg_at_16": result["avg_at_16"]} if "avg_at_16" in result else {}),
+                **({"pass_at_k": result["pass_at_k"]} if "pass_at_k" in result else {}),
+                **({"pass_at_8": result["pass_at_8"]} if "pass_at_8" in result else {}),
                 "problems": result.get("problems"),
                 "samples_per_problem": result.get(
                     "samples_per_problem", samples_per_problem
@@ -1390,6 +1393,8 @@ def _run_training_evaluation(
         "accuracy",
         "avg_at_n",
         "avg_at_16",
+        "pass_at_k",
+        "pass_at_8",
         "problems",
         "samples_per_problem",
         "metric",

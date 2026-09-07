@@ -6,8 +6,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -17,12 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_runtime_paths
-from .distributed import isolate_distributed_subprocess_environment
 from .evaluation import (
     configured_benchmark_names,
     evaluation_metric_name,
 )
 from .evaluation_cache import evaluate_or_reuse_base
+from .vllm_evaluation import evaluate_vllm_distributed
 
 
 METHODS = (
@@ -229,6 +227,8 @@ def _write_history_atomically(
         "accuracy",
         "avg_at_n",
         "avg_at_16",
+        "pass_at_k",
+        "pass_at_8",
         "problems",
         "samples_per_problem",
         "metric",
@@ -273,16 +273,6 @@ def _write_history_atomically(
     metrics_backup.unlink(missing_ok=True)
 
 
-def _subprocess_environment(repo_root: Path) -> dict[str, str]:
-    environment = isolate_distributed_subprocess_environment()
-    environment["VLLM_LOGGING_LEVEL"] = environment.get("VLLM_LOGGING_LEVEL", "WARNING")
-    environment["PYTHONUNBUFFERED"] = "1"
-    environment["PYTHONPATH"] = os.pathsep.join(
-        filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
-    )
-    return environment
-
-
 def _runtime_settings(
     config: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -309,6 +299,7 @@ def _runtime_settings(
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
         "num_responses": int(args.num_responses),
+        "metric": args.metric,
         "max_new_tokens": int(
             args.max_new_tokens
             if args.max_new_tokens is not None
@@ -356,7 +347,6 @@ def _reevaluate_method(
         }
 
     eval_root.mkdir(parents=True, exist_ok=True)
-    repo_root = Path(__file__).resolve().parents[1]
     history: list[dict[str, Any]] = []
     metric_rows: list[dict[str, Any]] = []
     for target in targets:
@@ -365,21 +355,6 @@ def _reevaluate_method(
             tempfile.mkdtemp(prefix=f".reeval-step-{target.step:06d}-", dir=eval_root)
         )
         started = time.perf_counter()
-        command = [
-            sys.executable,
-            "-m",
-            "b200_experiment.vllm_evaluation",
-            "--config",
-            str(config_path),
-            "--model",
-            str(target.model_path),
-            "--name",
-            target.model_name,
-            "--output",
-            str(staged),
-            "--settings-json",
-            json.dumps(settings),
-        ]
         print(
             f"[{display_name}] re-evaluating step {target.step} at "
             f"temperature={settings['temperature']}: {target.model_path}",
@@ -387,13 +362,15 @@ def _reevaluate_method(
         )
 
         def run_evaluator() -> dict[str, Any]:
-            subprocess.run(
-                command,
-                cwd=repo_root,
-                env=_subprocess_environment(repo_root),
-                check=True,
+            return evaluate_vllm_distributed(
+                target.model_name,
+                target.model_path,
+                config,
+                staged,
+                settings,
+                config_path,
+                world_size=args.world_size,
             )
-            return json.loads((staged / "summary.json").read_text(encoding="utf-8"))
 
         try:
             cache_status = "disabled"
@@ -489,6 +466,16 @@ def _reevaluate_method(
                         else {}
                     ),
                     "problems": result.get("problems"),
+                    **(
+                        {"pass_at_k": result["pass_at_k"]}
+                        if "pass_at_k" in result
+                        else {}
+                    ),
+                    **(
+                        {"pass_at_8": result["pass_at_8"]}
+                        if "pass_at_8" in result
+                        else {}
+                    ),
                     "samples_per_problem": result.get(
                         "samples_per_problem", samples_per_problem
                     ),
@@ -528,7 +515,9 @@ def _reevaluate_method(
         "temperature": settings["temperature"],
         "top_p": settings["top_p"],
         "num_responses": settings["num_responses"],
-        "metric": evaluation_metric_name(settings["num_responses"]),
+        "metric": evaluation_metric_name(
+            settings["num_responses"], settings.get("metric")
+        ),
         "backend": "vllm",
         "full_benchmarks": list(settings["benchmark_names"]),
         "history": str((run_output / "eval_history.jsonl").resolve()),
@@ -566,6 +555,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--num-responses", type=int, default=16)
+    parser.add_argument(
+        "--metric",
+        default=None,
+        help="Evaluation metric, e.g. avg@16 or pass@8 (pass@8 uses 8 samples).",
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        help="Number of independent TP=1 vLLM evaluators; defaults to visible GPU count.",
+    )
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--tensor-parallel-size", type=int)
     parser.add_argument("--gpu-memory-utilization")
@@ -589,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("Checkpoint re-evaluation top_p must be in (0, 1]")
     if args.num_responses <= 0:
         raise ValueError("Checkpoint re-evaluation num_responses must be positive")
+    evaluation_metric_name(args.num_responses, args.metric)
     selected_methods = tuple(dict.fromkeys(args.methods))
     requested = {
         "opd": args.opd_output,

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from b200_experiment.evaluation import metric_problem_score
 from b200_experiment.vllm_evaluation import (
     _resolve_gpu_memory_utilization,
     evaluate_vllm_suite,
@@ -48,6 +49,95 @@ class _LLM:
 
 
 class VllmEvaluationTests(unittest.TestCase):
+    def test_pass_at_k_uses_unbiased_without_replacement_estimator(self):
+        self.assertAlmostEqual(
+            metric_problem_score([True] + [False] * 15, "pass@8"), 0.5
+        )
+
+    def test_pass_at_8_is_reported_and_uses_problem_level_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            benchmark_path = root / "math.jsonl"
+            benchmark_path.write_text(
+                json.dumps({"problem": "1?", "answer": "1"}) + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "models": {"dtype": "bfloat16"},
+                "data": {"chat_template_kwargs": {}},
+                "evaluation": {
+                    "benchmarks": {"MATH-500": {"path": str(benchmark_path)}}
+                },
+            }
+            settings = {
+                "max_new_tokens": 8,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "num_responses": 8,
+                "metric": "pass@8",
+                "benchmark_names": ["MATH-500"],
+                "vllm": {"gpu_memory_utilization": 0.4},
+            }
+            fake_vllm = types.SimpleNamespace(LLM=_LLM, SamplingParams=_SamplingParams)
+            with (
+                patch.dict(sys.modules, {"vllm": fake_vllm}),
+                patch(
+                    "b200_experiment.vllm_evaluation.AutoTokenizer.from_pretrained",
+                    return_value=_Tokenizer(),
+                ),
+            ):
+                suite = evaluate_vllm_suite(
+                    "student", root, config, root / "results", settings
+                )
+            result = suite["benchmarks"]["MATH-500"]
+            self.assertEqual(suite["parameters"]["metric"], "pass@8")
+            self.assertEqual(result["pass_at_k"], 1.0)
+            self.assertEqual(result["pass_at_8"], 1.0)
+            self.assertEqual(result["accuracy"], 1.0)
+
+    def test_distributed_shard_only_generates_its_round_robin_problems(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            benchmark_path = root / "math.jsonl"
+            benchmark_path.write_text(
+                "".join(
+                    json.dumps({"problem": f"{i}?", "answer": str(i)}) + "\n"
+                    for i in range(4)
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "models": {"dtype": "bfloat16"},
+                "data": {"chat_template_kwargs": {}},
+                "evaluation": {
+                    "benchmarks": {"MATH-500": {"path": str(benchmark_path)}}
+                },
+            }
+            settings = {
+                "max_new_tokens": 8,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "num_responses": 1,
+                "benchmark_names": ["MATH-500"],
+                "_shard_rank": 1,
+                "_shard_world_size": 2,
+                "vllm": {"gpu_memory_utilization": 0.4},
+            }
+            fake_vllm = types.SimpleNamespace(LLM=_LLM, SamplingParams=_SamplingParams)
+            _LLM.instances.clear()
+            with (
+                patch.dict(sys.modules, {"vllm": fake_vllm}),
+                patch(
+                    "b200_experiment.vllm_evaluation.AutoTokenizer.from_pretrained",
+                    return_value=_Tokenizer(),
+                ),
+            ):
+                suite = evaluate_vllm_suite(
+                    "student", root, config, root / "results", settings
+                )
+            self.assertEqual(len(_LLM.instances[-1].generate_calls[0][0]), 2)
+            self.assertEqual(suite["benchmarks"]["MATH-500"]["problems"], 2)
+
     def test_one_response_reports_accuracy_without_avg16_label(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

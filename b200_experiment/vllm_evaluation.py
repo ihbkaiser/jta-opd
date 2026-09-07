@@ -4,6 +4,11 @@ import argparse
 import gzip
 import json
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +17,14 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from .config import load_config
+from .distributed import isolate_distributed_subprocess_environment
 from .evaluation import (
     _grade,
     configured_benchmark_names,
     detailed_model_output_record,
     evaluation_metric_name,
     load_benchmark,
+    metric_problem_score,
 )
 from .math_prompts import render_math_prompt
 
@@ -67,7 +74,9 @@ def evaluate_vllm_suite(
     temperature = float(runtime_settings.get("temperature", 0.7))
     top_p = float(runtime_settings.get("top_p", 0.95))
     samples_per_problem = int(runtime_settings.get("num_responses", 16))
-    metric_name = evaluation_metric_name(samples_per_problem)
+    metric_name = evaluation_metric_name(
+        samples_per_problem, runtime_settings.get("metric")
+    )
     if temperature <= 0:
         raise ValueError("Sampled evaluation requires positive temperature")
     if not 0.0 < top_p <= 1.0:
@@ -218,7 +227,11 @@ def evaluate_vllm_suite(
                         correct += sum(map(int, correctness))
                         graded += samples_per_problem
                         problems += 1
-                        problem_score_sum += sum(correctness) / samples_per_problem
+                        raw_problem_score = sum(correctness) / samples_per_problem
+                        selected_problem_score = metric_problem_score(
+                            correctness, metric_name
+                        )
+                        problem_score_sum += selected_problem_score
                         detailed.write(
                             json.dumps(
                                 detailed_model_output_record(
@@ -245,31 +258,35 @@ def evaluate_vllm_suite(
                                     **row,
                                     "responses": responses,
                                     "correct": correctness,
-                                    "problem_score": sum(correctness)
-                                    / samples_per_problem,
+                                    "problem_score": raw_problem_score,
+                                    "metric_score": selected_problem_score,
                                 },
                                 ensure_ascii=False,
                             )
                             + "\n"
                         )
                         grade_progress.set_postfix_str(
-                            f"{benchmark} {metric_name}={correct / max(graded, 1):.3f}",
+                            f"{benchmark} {metric_name}={problem_score_sum / max(problems, 1):.3f}",
                             refresh=False,
                         )
                         grade_progress.update(1)
-                avg_at_n = problem_score_sum / max(problems, 1)
+                selected_score = problem_score_sum / max(problems, 1)
                 benchmark_result = {
                     "correct": correct,
                     "total": graded,
                     "problems": len(records),
                     "samples_per_problem": samples_per_problem,
-                    "avg_at_n": avg_at_n,
-                    "accuracy": avg_at_n,
+                    "avg_at_n": selected_score,
+                    "accuracy": selected_score,
                     "predictions": str(prediction_path),
                     "schema": schema,
                 }
-                if samples_per_problem == 16:
-                    benchmark_result["avg_at_16"] = avg_at_n
+                if metric_name.startswith("pass@"):
+                    benchmark_result["pass_at_k"] = selected_score
+                    if metric_name == "pass@8":
+                        benchmark_result["pass_at_8"] = selected_score
+                elif samples_per_problem == 16:
+                    benchmark_result["avg_at_16"] = selected_score
                 suite["benchmarks"][benchmark] = benchmark_result
     finally:
         grade_progress.close()
@@ -334,7 +351,9 @@ def merge_vllm_evaluation_shards(
         "temperature": float(runtime_settings["temperature"]),
         "top_p": float(runtime_settings["top_p"]),
         "num_responses": int(runtime_settings["num_responses"]),
-        "metric": evaluation_metric_name(int(runtime_settings["num_responses"])),
+        "metric": evaluation_metric_name(
+            int(runtime_settings["num_responses"]), runtime_settings.get("metric")
+        ),
     }
     for suite in suites:
         parameters = suite.get("parameters", {})
@@ -409,7 +428,12 @@ def merge_vllm_evaluation_shards(
         # aggregate field; this is numerically identical to the single-GPU
         # evaluator and makes the merged metric auditable.
         problem_score_sum = sum(
-            sum(map(int, row["correct"])) / samples_per_problem
+            metric_problem_score(
+                list(map(bool, row["correct"])),
+                evaluation_metric_name(
+                    samples_per_problem, runtime_settings.get("metric")
+                ),
+            )
             for row in merged_rows
         )
         with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
@@ -425,7 +449,11 @@ def merge_vllm_evaluation_shards(
             "predictions": str(prediction_path.resolve()),
             "schema": schema,
         }
-        if samples_per_problem == 16:
+        if expected_parameters["metric"].startswith("pass@"):
+            result["pass_at_k"] = result["accuracy"]
+            if expected_parameters["metric"] == "pass@8":
+                result["pass_at_8"] = result["accuracy"]
+        elif samples_per_problem == 16:
             result["avg_at_16"] = result["avg_at_n"]
         merged_benchmarks[benchmark] = result
 
@@ -478,6 +506,120 @@ def merge_vllm_evaluation_shards(
         json.dump(suite, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     return suite
+
+
+def evaluate_vllm_distributed(
+    model_name: str,
+    model_path: str | Path,
+    config: dict[str, Any],
+    output_dir: str | Path,
+    runtime_settings: dict[str, Any],
+    resolved_config_path: str | Path,
+    *,
+    world_size: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate with one TP=1 vLLM child per visible GPU and merge the shards."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    devices = [item.strip() for item in visible.split(",") if item.strip()]
+    if not devices:
+        devices = [str(index) for index in range(torch.cuda.device_count())]
+    requested_world = int((len(devices) or 1) if world_size is None else world_size)
+    if requested_world <= 0:
+        raise ValueError("world_size must be a positive integer")
+    if requested_world <= 1:
+        return evaluate_vllm_suite(
+            model_name, model_path, config, output_dir, runtime_settings
+        )
+    if requested_world > len(devices):
+        raise ValueError(
+            f"Requested {requested_world} evaluation workers but only "
+            f"{len(devices)} GPUs are visible ({visible!r})"
+        )
+
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    coordination = Path(
+        tempfile.mkdtemp(prefix=".distributed-eval-", dir=output_dir.parent)
+    )
+    shard_dirs = [coordination / f"rank-{rank:05d}" for rank in range(requested_world)]
+    processes: list[subprocess.Popen] = []
+    commands: list[list[str]] = []
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        for rank, shard_dir in enumerate(shard_dirs):
+            environment = isolate_distributed_subprocess_environment()
+            environment["VLLM_LOGGING_LEVEL"] = environment.get(
+                "VLLM_LOGGING_LEVEL", "WARNING"
+            )
+            environment["PYTHONUNBUFFERED"] = "1"
+            environment["PYTHONPATH"] = os.pathsep.join(
+                filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
+            )
+            environment["CUDA_VISIBLE_DEVICES"] = devices[rank]
+            child_settings = {
+                **runtime_settings,
+                "_shard_rank": rank,
+                "_shard_world_size": requested_world,
+                "vllm": {
+                    **dict(runtime_settings.get("vllm", {})),
+                    "tensor_parallel_size": 1,
+                },
+            }
+            command = [
+                sys.executable,
+                "-m",
+                "b200_experiment.vllm_evaluation",
+                "--config",
+                str(Path(resolved_config_path).resolve()),
+                "--model",
+                str(Path(model_path).resolve()),
+                "--name",
+                model_name,
+                "--output",
+                str(shard_dir.resolve()),
+                "--settings-json",
+                json.dumps(child_settings),
+            ]
+            commands.append(command)
+            processes.append(subprocess.Popen(command, cwd=repo_root, env=environment))
+        timeout = float(runtime_settings.get("sync_timeout_sec", 24 * 60 * 60))
+        if timeout <= 0:
+            raise ValueError("sync_timeout_sec must be positive")
+        deadline = time.monotonic() + timeout
+        while processes:
+            for index, process in enumerate(processes):
+                if process.poll() is not None and process.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        process.returncode, commands[index]
+                    )
+            if all(process.poll() is not None for process in processes):
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Distributed vLLM evaluation exceeded {timeout:.1f}s"
+                )
+            time.sleep(0.25)
+        return merge_vllm_evaluation_shards(
+            model_name,
+            model_path,
+            config,
+            output_dir,
+            shard_dirs,
+            runtime_settings,
+        )
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+    finally:
+        shutil.rmtree(coordination, ignore_errors=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

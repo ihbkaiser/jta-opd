@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from pathlib import Path
 
 from .autotune import run_batch_autotune
-from .config import apply_overrides, load_with_overlays, resolve_runtime_paths
-from .evaluation import aggregate_evaluations, evaluate_suite
+from .config import apply_overrides, load_with_overlays, resolve_runtime_paths, save_config
+from .evaluation import aggregate_evaluations, configured_benchmark_names, evaluate_suite
 from .plotting import plot_results, plot_training_progress
 from .preflight import run_preflight
 from .trainer import run_training
@@ -19,6 +21,57 @@ def _configured(args):
             getattr(args, "overrides", []),
         )
     )
+
+
+def _visible_gpu_count() -> int:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible.strip():
+        return len([item for item in visible.split(",") if item.strip()])
+    try:
+        import torch
+
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 1
+
+
+def _evaluate_checkpoint(args) -> dict:
+    config = _configured(args)
+    if str(config.get("evaluation", {}).get("backend", "hf")).lower() != "vllm":
+        return evaluate_suite(args.name, args.model, config, args.output)
+    requested_world = int(os.environ.get("EVAL_WORLD_SIZE", _visible_gpu_count()))
+    if requested_world <= 1:
+        return evaluate_suite(args.name, args.model, config, args.output)
+    from .vllm_evaluation import evaluate_vllm_distributed
+
+    output = Path(args.output).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    resolved = output / ".resolved_eval_config.yaml"
+    save_config(config, resolved)
+    evaluation = config["evaluation"]
+    settings = {
+        "backend": "vllm",
+        "temperature": evaluation.get("temperature", 0.7),
+        "top_p": evaluation.get("top_p", 0.95),
+        "num_responses": evaluation.get("num_responses", 16),
+        "metric": evaluation.get("metric"),
+        "max_new_tokens": evaluation.get("max_new_tokens", 2048),
+        "limit": evaluation.get("limit"),
+        "benchmark_names": list(configured_benchmark_names(config)),
+        "vllm": evaluation.get("vllm", {}),
+    }
+    try:
+        return evaluate_vllm_distributed(
+            args.name,
+            args.model,
+            config,
+            output,
+            settings,
+            resolved,
+            world_size=requested_world,
+        )
+    finally:
+        resolved.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -141,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             overrides=args.overrides,
         )
     elif args.command == "evaluate":
-        result = evaluate_suite(args.name, args.model, _configured(args), args.output)
+        result = _evaluate_checkpoint(args)
     elif args.command == "aggregate-eval":
         model_dirs = {"Base": args.base_dir}
         if args.opd_dir:

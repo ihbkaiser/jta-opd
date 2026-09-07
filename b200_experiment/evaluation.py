@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -50,11 +51,65 @@ def configured_benchmark_names(
     return names
 
 
-def evaluation_metric_name(samples_per_problem: int) -> str:
+def evaluation_metric_name(
+    samples_per_problem: int, requested: str | None = None
+) -> str:
     samples = int(samples_per_problem)
     if samples <= 0:
         raise ValueError("Evaluation samples per problem must be positive")
-    return "accuracy" if samples == 1 else f"avg@{samples}"
+    if requested is None or str(requested).strip().lower() in {"", "auto"}:
+        return "accuracy" if samples == 1 else f"avg@{samples}"
+    normalized = str(requested).strip().lower()
+    if normalized in {"avg", "average", "avg@k"}:
+        return "accuracy" if samples == 1 else f"avg@{samples}"
+    if normalized in {"pass", "pass@k", "pass_at_k"}:
+        return f"pass@{samples}"
+    if normalized.startswith("avg@"):
+        try:
+            k = int(normalized.split("@", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"Invalid evaluation metric: {requested!r}") from error
+        if k != samples:
+            raise ValueError(
+                f"avg@{k} requires num_responses={k}, got {samples}"
+            )
+        return f"avg@{samples}"
+    if normalized.startswith("pass@"):
+        try:
+            k = int(normalized.split("@", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"Invalid evaluation metric: {requested!r}") from error
+        if k <= 0 or k > samples:
+            raise ValueError(
+                f"pass@{k} requires 1 <= k <= num_responses={samples}"
+            )
+        return f"pass@{k}"
+    if normalized == "accuracy" and samples == 1:
+        return "accuracy"
+    raise ValueError(
+        f"Unsupported evaluation metric {requested!r}; use avg@k or pass@k"
+    )
+
+
+def metric_problem_score(correctness: list[bool], metric_name: str) -> float:
+    """Return one problem's contribution to the selected evaluation metric.
+
+    For pass@k, use the standard unbiased estimator from ``n`` sampled
+    completions.  The requested re-evaluation protocol uses n=k=8, where this
+    reduces exactly to ``1`` iff at least one completion is correct.
+    """
+    if not correctness:
+        return 0.0
+    if not metric_name.startswith("pass@"):
+        return sum(map(int, correctness)) / len(correctness)
+    k = int(metric_name.split("@", 1)[1])
+    n = len(correctness)
+    correct = sum(map(int, correctness))
+    if correct <= 0:
+        return 0.0
+    if k == n:
+        return 1.0
+    return 1.0 - math.comb(n - correct, k) / math.comb(n, k)
 
 
 def detailed_model_output_record(
@@ -331,7 +386,9 @@ def evaluate_loaded_suite(
     temperature = float(evaluation.get("temperature", 0.7))
     top_p = float(evaluation.get("top_p", 0.95))
     samples_per_problem = int(evaluation.get("num_responses", 16))
-    metric_name = evaluation_metric_name(samples_per_problem)
+    metric_name = evaluation_metric_name(
+        samples_per_problem, evaluation.get("metric")
+    )
     seed = int(evaluation.get("seed", 1234))
     if temperature <= 0:
         raise ValueError("Sampled evaluation requires positive temperature")
@@ -404,7 +461,7 @@ def evaluate_loaded_suite(
                 for begin in range(0, len(records), batch_size):
                     progress.set_postfix_str(
                         f"{benchmark} {metric_name}="
-                        f"{correct_generations / max(graded_generations, 1):.3f}"
+                        f"{problem_score_sum / max(problems, 1):.3f}"
                     )
                     batch = records[begin : begin + batch_size]
                     prompts = [
@@ -455,7 +512,11 @@ def evaluate_loaded_suite(
                         correct_generations += sum(map(int, correctness))
                         graded_generations += samples_per_problem
                         problems += 1
-                        problem_score_sum += sum(correctness) / samples_per_problem
+                        raw_problem_score = sum(correctness) / samples_per_problem
+                        selected_problem_score = metric_problem_score(
+                            correctness, metric_name
+                        )
+                        problem_score_sum += selected_problem_score
                         detailed_handle.write(
                             json.dumps(
                                 detailed_model_output_record(
@@ -486,8 +547,8 @@ def evaluate_loaded_suite(
                                     **row,
                                     "responses": responses,
                                     "correct": correctness,
-                                    "problem_score": sum(correctness)
-                                    / samples_per_problem,
+                                    "problem_score": raw_problem_score,
+                                    "metric_score": selected_problem_score,
                                 },
                                 ensure_ascii=False,
                             )
@@ -495,22 +556,26 @@ def evaluate_loaded_suite(
                         )
                     progress.set_postfix_str(
                         f"{benchmark} {metric_name}="
-                        f"{correct_generations / max(graded_generations, 1):.3f}"
+                        f"{problem_score_sum / max(problems, 1):.3f}"
                     )
                     progress.update(len(batch))
-            avg_at_n = problem_score_sum / max(problems, 1)
+            selected_score = problem_score_sum / max(problems, 1)
             benchmark_result = {
                 "correct": correct_generations,
                 "total": graded_generations,
                 "problems": problems,
                 "samples_per_problem": samples_per_problem,
-                "avg_at_n": avg_at_n,
-                "accuracy": avg_at_n,
+                "avg_at_n": selected_score,
+                "accuracy": selected_score,
                 "predictions": str(prediction_path),
                 "schema": schema,
             }
-            if samples_per_problem == 16:
-                benchmark_result["avg_at_16"] = avg_at_n
+            if metric_name.startswith("pass@"):
+                benchmark_result["pass_at_k"] = selected_score
+                if metric_name == "pass@8":
+                    benchmark_result["pass_at_8"] = selected_score
+            elif samples_per_problem == 16:
+                benchmark_result["avg_at_16"] = selected_score
             suite["benchmarks"][benchmark] = benchmark_result
     finally:
         detailed_handle.close()
@@ -553,6 +618,7 @@ def evaluate_suite(
                 "temperature": evaluation.get("temperature", 0.7),
                 "top_p": evaluation.get("top_p", 0.95),
                 "num_responses": evaluation.get("num_responses", 16),
+                "metric": evaluation.get("metric"),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),
                 "benchmark_names": list(configured_benchmark_names(config)),

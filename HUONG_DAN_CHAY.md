@@ -164,6 +164,8 @@ Nếu một rank lỗi, sentinel lỗi được phát hiện và toàn job dừn
 (mặc định 24 giờ) điều khiển timeout này. Với một GPU, pipeline cũ vẫn được giữ nguyên.
 Multi-GPU training-time evaluation yêu cầu `training_evaluation.backend=vllm`; backend `hf` vẫn
 dùng được cho single-GPU.
+Có thể ghi pass@8 ngay trong periodic evaluation bằng
+`TRAIN_EVAL_NUM_RESPONSES=8 TRAIN_EVAL_METRIC=pass@8`.
 Các rank phải cùng nhìn thấy `experiment.output_dir` (filesystem dùng chung) để đọc sentinel và
 merge shard.
 Output mặc định:
@@ -322,6 +324,20 @@ EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
 
 Thay `cmt` bằng `opd`, `ta`, `rac` hoặc `pgt`.
 
+Pass@8 cho một checkpoint bất kỳ:
+
+```bash
+EVAL_NUM_RESPONSES=8 EVAL_METRIC=pass@8 EVAL_TEMPERATURE=0.7 \
+  CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/eval_checkpoint_b200.sh cmt \
+  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100" \
+  results/checkpoint_eval/cmt_pass8_step100
+```
+
+Với `CUDA_VISIBLE_DEVICES` có nhiều GPU, evaluator tự chia benchmark deterministic thành các
+shard, chạy một vLLM `TP=1` trên mỗi GPU rồi merge lại; với một GPU behavior không đổi. Có thể
+chọn số worker bằng `EVAL_WORLD_SIZE`.
+
 ## 7. Re-evaluate toàn bộ checkpoint
 
 Dry-run trước để chỉ kiểm tra danh sách checkpoint, không ghi file:
@@ -339,6 +355,15 @@ REEVAL_METHODS=cmt \
 REEVAL_NUM_RESPONSES=16 REEVAL_TEMPERATURE=0.7 REEVAL_TOP_P=0.95 \
   CMT_RUN_NAME="$CMT_RUN_NAME" \
   bash scripts/reeval_method_checkpoints_b200.sh cmt
+```
+
+Shortcut re-eval pass@8 (hoạt động cho `opd`, `ta`, `rac`, `pgt`, `cmt`):
+
+```bash
+REEVAL_DRY_RUN=true CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/reeval_pass8_b200.sh cmt "$CMT_RUN_NAME"
+REEVAL_WORLD_SIZE=2 CUDA_VISIBLE_DEVICES=0,1 \
+  bash scripts/reeval_pass8_b200.sh cmt "$CMT_RUN_NAME"
 ```
 
 Re-evaluate nhiều method cùng protocol:

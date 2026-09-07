@@ -34,6 +34,7 @@ ARGS=(
   --temperature "${REEVAL_TEMPERATURE:-0.7}"
   --top-p "${REEVAL_TOP_P:-0.95}"
   --num-responses "${REEVAL_NUM_RESPONSES:-16}"
+  --metric "${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-16}}"
   --max-new-tokens "${REEVAL_MAX_NEW_TOKENS:-7168}"
   --tensor-parallel-size "${REEVAL_VLLM_TENSOR_PARALLEL_SIZE:-${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}}"
   --gpu-memory-utilization "${REEVAL_VLLM_GPU_MEMORY_UTILIZATION:-${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-auto}}"
@@ -43,6 +44,9 @@ ARGS=(
   --seed "${REEVAL_SEED:-1234}"
   --base-cache-dir "${REEVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 )
+if [[ -n "${REEVAL_WORLD_SIZE:-}" ]]; then
+  ARGS+=(--world-size "${REEVAL_WORLD_SIZE}")
+fi
 
 SELECTED_OUTPUTS=()
 for method in "${SELECTED_METHODS[@]}"; do
@@ -80,11 +84,7 @@ case "${REEVAL_DRY_RUN:-false}" in
 esac
 
 echo "Re-evaluating every saved checkpoint for: ${SELECTED_METHODS[*]}."
-if [[ "${REEVAL_NUM_RESPONSES:-16}" == "1" ]]; then
-  REEVAL_METRIC_LABEL="accuracy"
-else
-  REEVAL_METRIC_LABEL="avg@${REEVAL_NUM_RESPONSES:-16}"
-fi
+REEVAL_METRIC_LABEL="${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-16}}"
 echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."

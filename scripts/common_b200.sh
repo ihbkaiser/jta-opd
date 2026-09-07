@@ -389,6 +389,7 @@ build_training_args() {
     --set "training_evaluation.temperature=${TRAIN_EVAL_TEMPERATURE:-0.7}"
     --set "training_evaluation.top_p=${TRAIN_EVAL_TOP_P:-0.95}"
     --set "training_evaluation.num_responses=${TRAIN_EVAL_NUM_RESPONSES:-16}"
+    --set "training_evaluation.metric=${TRAIN_EVAL_METRIC:-null}"
     --set "training_evaluation.target_evaluations=null"
     --set "training_evaluation.interval_steps=${TRAIN_EVAL_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "training_evaluation.sync_timeout_sec=${TRAIN_EVAL_SYNC_TIMEOUT_SEC:-86400}"
