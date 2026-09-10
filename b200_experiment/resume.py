@@ -124,6 +124,291 @@ def _restore_rng_states(payload: dict[str, Any], device: torch.device) -> None:
     torch.cuda.set_rng_state(state, device=device)
 
 
+def _canonical_parameter_name(name: str) -> str:
+    """Normalize wrapper prefixes used by DDP/FSDP to the HF name."""
+    normalized = str(name)
+    while normalized.startswith("module."):
+        normalized = normalized[len("module.") :]
+    return normalized.replace("_fsdp_wrapped_module.", "")
+
+
+def _model_parameter_name_by_identity(model) -> dict[int, str]:
+    if model is None:
+        raise ValueError(
+            "Optimizer format conversion requires the current model so parameter "
+            "IDs can be matched to HF parameter names"
+        )
+    names: dict[int, str] = {}
+    canonical_names: dict[str, int] = {}
+    for name, parameter in model.named_parameters():
+        canonical = _canonical_parameter_name(name)
+        identity = id(parameter)
+        # Tied/shared parameters may be exposed by more than one name. Keep
+        # the first FQN, matching FSDP's canonical FQN selection, while still
+        # rejecting two distinct parameters that collide after unwrapping.
+        if identity in names:
+            continue
+        previous_identity = canonical_names.get(canonical)
+        if previous_identity is not None and previous_identity != identity:
+            raise ValueError(
+                "Current model exposes duplicate canonical parameter name: "
+                f"{canonical!r}"
+            )
+        names[identity] = canonical
+        canonical_names[canonical] = identity
+    return names
+
+
+def _optimizer_parameter_id_to_name(optimizer, model) -> dict[Any, str]:
+    """Map PyTorch optimizer IDs to current HF parameter names.
+
+    Integer IDs have no persistent meaning by themselves. PyTorch assigns them
+    in param-group order, so we use the current optimizer's group topology and
+    validate it rather than silently pairing incompatible parameters.
+    """
+    current_state = optimizer.state_dict()
+    current_groups = current_state.get("param_groups")
+    actual_groups = getattr(optimizer, "param_groups", None)
+    if not isinstance(current_groups, list) or not isinstance(actual_groups, list):
+        raise ValueError("Current optimizer has no usable param_groups")
+    if len(current_groups) != len(actual_groups):
+        raise ValueError(
+            "Optimizer param-group count changed since the checkpoint was saved: "
+            f"current={len(current_groups)}, actual={len(actual_groups)}"
+        )
+    names_by_identity = _model_parameter_name_by_identity(model)
+    result: dict[Any, str] = {}
+    for group_index, (saved_group, actual_group) in enumerate(
+        zip(current_groups, actual_groups)
+    ):
+        saved_ids = saved_group.get("params")
+        actual_parameters = actual_group.get("params")
+        if not isinstance(saved_ids, list) or not isinstance(actual_parameters, list):
+            raise ValueError(
+                f"Optimizer param_group[{group_index}] has invalid params list"
+            )
+        if len(saved_ids) != len(actual_parameters):
+            raise ValueError(
+                "Optimizer parameter count changed in param group "
+                f"{group_index}: current={len(saved_ids)}, "
+                f"actual={len(actual_parameters)}"
+            )
+        for parameter_id, parameter in zip(saved_ids, actual_parameters):
+            name = names_by_identity.get(id(parameter))
+            if name is None:
+                raise ValueError(
+                    "Current optimizer contains a parameter absent from the model; "
+                    f"cannot map optimizer ID {parameter_id!r}"
+                )
+            previous = result.get(parameter_id)
+            if previous is not None and previous != name:
+                raise ValueError(
+                    f"Optimizer ID {parameter_id!r} maps to both {previous!r} and "
+                    f"{name!r}"
+                )
+            result[parameter_id] = name
+    return result
+
+
+def _optimizer_checkpoint_format(payload: dict[str, Any]) -> str:
+    """Return and validate the on-disk optimizer format.
+
+    Older checkpoints did not carry ``optimizer_format``. Infer those files
+    from state/group key types so they remain resumable.
+    """
+    optimizer_state = payload.get("optimizer")
+    if not isinstance(optimizer_state, dict):
+        raise ValueError("Optimizer checkpoint has no dictionary optimizer state")
+    state = optimizer_state.get("state")
+    groups = optimizer_state.get("param_groups")
+    if not isinstance(state, dict) or not isinstance(groups, list):
+        raise ValueError(
+            "Optimizer checkpoint state must contain dict 'state' and list "
+            "'param_groups'"
+        )
+    keys = list(state)
+    group_params = [
+        parameter_id
+        for group in groups
+        if isinstance(group, dict) and isinstance(group.get("params"), list)
+        for parameter_id in group["params"]
+    ]
+    observed = keys + group_params
+    inferred = None
+    if observed and all(isinstance(item, str) for item in observed):
+        inferred = "fsdp_full_v1"
+    elif observed and all(isinstance(item, int) for item in observed):
+        inferred = "standard"
+    elif observed:
+        raise ValueError(
+            "Optimizer checkpoint mixes string parameter names and integer "
+            "parameter IDs"
+        )
+    requested = payload.get("optimizer_format")
+    if requested is None:
+        return inferred or "standard"
+    requested = str(requested)
+    if requested not in {"standard", "fsdp_full_v1"}:
+        raise ValueError(f"Unsupported optimizer checkpoint format: {requested!r}")
+    if inferred is not None and requested != inferred:
+        raise ValueError(
+            "Optimizer checkpoint format metadata disagrees with its parameter "
+            f"keys: metadata={requested!r}, observed={inferred!r}"
+        )
+    return requested
+
+
+def _validate_source_group_structure(
+    source_groups: Any, optimizer, format_name: str
+) -> None:
+    actual_groups = getattr(optimizer, "param_groups", None)
+    if not isinstance(source_groups, list) or not isinstance(actual_groups, list):
+        raise ValueError(f"Invalid {format_name} optimizer param_groups")
+    if len(source_groups) != len(actual_groups):
+        raise ValueError(
+            "Optimizer param-group count changed since the checkpoint was saved: "
+            f"checkpoint={len(source_groups)}, current={len(actual_groups)}"
+        )
+    for group_index, (source_group, actual_group) in enumerate(
+        zip(source_groups, actual_groups)
+    ):
+        source_params = (
+            source_group.get("params") if isinstance(source_group, dict) else None
+        )
+        actual_params = (
+            actual_group.get("params") if isinstance(actual_group, dict) else None
+        )
+        if not isinstance(source_params, list) or not isinstance(actual_params, list):
+            raise ValueError(
+                f"Invalid {format_name} optimizer param_group[{group_index}]"
+            )
+        if len(source_params) != len(actual_params):
+            raise ValueError(
+                "Optimizer parameter count changed in param group "
+                f"{group_index}: checkpoint={len(source_params)}, "
+                f"current={len(actual_params)}"
+            )
+
+
+def _standard_optimizer_to_full(
+    optimizer_state: dict[str, Any], optimizer, model
+) -> dict[str, Any]:
+    """Convert PyTorch integer-ID state to FSDP full name-keyed state."""
+    id_to_name = _optimizer_parameter_id_to_name(optimizer, model)
+    source_state = optimizer_state.get("state")
+    source_groups = optimizer_state.get("param_groups")
+    if not isinstance(source_state, dict) or not isinstance(source_groups, list):
+        raise ValueError("Invalid standard optimizer state")
+    _validate_source_group_structure(source_groups, optimizer, "standard")
+
+    full_state: dict[str, Any] = {}
+    for parameter_id, value in source_state.items():
+        name = id_to_name.get(parameter_id)
+        if name is None:
+            raise ValueError(
+                "Standard optimizer state contains an unknown parameter ID: "
+                f"{parameter_id!r}"
+            )
+        full_state[name] = value
+
+    full_groups: list[dict[str, Any]] = []
+    for group_index, source_group in enumerate(source_groups):
+        if not isinstance(source_group, dict) or not isinstance(
+            source_group.get("params"), list
+        ):
+            raise ValueError(f"Invalid standard optimizer param_group[{group_index}]")
+        converted = dict(source_group)
+        converted["params"] = []
+        for parameter_id in source_group["params"]:
+            name = id_to_name.get(parameter_id)
+            if name is None:
+                raise ValueError(
+                    "Standard optimizer param_group contains an unknown "
+                    f"parameter ID: {parameter_id!r}"
+                )
+            converted["params"].append(name)
+        full_groups.append(converted)
+    return {"state": full_state, "param_groups": full_groups}
+
+
+def _full_optimizer_to_standard(
+    optimizer_state: dict[str, Any], optimizer, model
+) -> dict[str, Any]:
+    """Convert FSDP full name-keyed state to integer-ID state."""
+    id_to_name = _optimizer_parameter_id_to_name(optimizer, model)
+    name_to_id = {name: parameter_id for parameter_id, name in id_to_name.items()}
+    source_state = optimizer_state.get("state")
+    source_groups = optimizer_state.get("param_groups")
+    if not isinstance(source_state, dict) or not isinstance(source_groups, list):
+        raise ValueError("Invalid FSDP full optimizer state")
+    _validate_source_group_structure(source_groups, optimizer, "FSDP full")
+
+    standard_state: dict[Any, Any] = {}
+    for raw_name, value in source_state.items():
+        if not isinstance(raw_name, str):
+            raise ValueError(
+                "FSDP full optimizer state must use string parameter names; "
+                f"got {raw_name!r}"
+            )
+        name = _canonical_parameter_name(raw_name)
+        parameter_id = name_to_id.get(name)
+        if parameter_id is None:
+            raise ValueError(
+                "FSDP optimizer state contains a parameter absent from the current "
+                f"model: {raw_name!r}"
+            )
+        standard_state[parameter_id] = value
+
+    standard_groups: list[dict[str, Any]] = []
+    target_groups = optimizer.state_dict().get("param_groups")
+    if not isinstance(target_groups, list):
+        raise ValueError("Current optimizer has no usable param_groups")
+    for group_index, source_group in enumerate(source_groups):
+        if not isinstance(source_group, dict) or not isinstance(
+            source_group.get("params"), list
+        ):
+            raise ValueError(f"Invalid FSDP optimizer param_group[{group_index}]")
+        target_group = target_groups[group_index]
+        target_ids = target_group["params"]
+        source_names = []
+        for raw_name in source_group["params"]:
+            if not isinstance(raw_name, str):
+                raise ValueError(
+                    "FSDP full optimizer param_groups must use string parameter "
+                    f"names; got {raw_name!r}"
+                )
+            name = _canonical_parameter_name(raw_name)
+            if name not in name_to_id:
+                raise ValueError(
+                    "FSDP optimizer param_group contains a parameter absent from "
+                    f"the current model: {raw_name!r}"
+                )
+            source_names.append(name)
+        target_names = []
+        for parameter_id in target_ids:
+            name = id_to_name.get(parameter_id)
+            if name is None:
+                raise ValueError(
+                    "Current optimizer contains an unknown parameter ID: "
+                    f"{parameter_id!r}"
+                )
+            target_names.append(name)
+        if sorted(source_names) != sorted(target_names):
+            raise ValueError(
+                "FSDP optimizer parameter names do not match current optimizer "
+                f"group {group_index}: checkpoint={sorted(source_names)}, "
+                f"current={sorted(target_names)}"
+            )
+        converted = dict(source_group)
+        # Optimizer.load_state_dict() zips each loaded group's ``params`` with
+        # the current group's Parameter objects by position. Use the current
+        # order here; preserving FSDP's name-sorted order would attach moments
+        # to the wrong parameters even though the IDs look valid.
+        converted["params"] = list(target_ids)
+        standard_groups.append(converted)
+    return {"state": standard_state, "param_groups": standard_groups}
+
+
 def restore_optimizer(
     optimizer,
     checkpoint: str | Path,
@@ -137,27 +422,69 @@ def restore_optimizer(
     if model is not None and is_fsdp_model(model):
         if distributed is None:
             raise ValueError("FSDP optimizer restore requires distributed context")
-        payload = (
-            _torch_load(optimizer_path, torch.device("cpu"))
-            if distributed.is_main
-            else None
-        )
-        metadata = (
-            {key: value for key, value in payload.items() if key != "optimizer"}
-            if payload is not None
-            else None
-        )
+        payload = None
+        load_error = None
+        if distributed.is_main:
+            try:
+                payload = _torch_load(optimizer_path, torch.device("cpu"))
+            except Exception as error:
+                load_error = f"{type(error).__name__}: {error}"
+        if load_error is not None:
+            metadata = {
+                "optimizer_format": None,
+                "optimizer_format_error": (
+                    f"could not load optimizer.pt: {load_error}"
+                ),
+            }
+        elif payload is not None and not isinstance(payload, dict):
+            metadata = {
+                "optimizer_format": None,
+                "optimizer_format_error": (
+                    "checkpoint payload must be a dictionary, got "
+                    f"{type(payload).__name__}"
+                ),
+            }
+        else:
+            metadata = (
+                {key: value for key, value in payload.items() if key != "optimizer"}
+                if payload is not None
+                else None
+            )
+        if metadata is not None and isinstance(payload, dict):
+            try:
+                metadata["optimizer_format"] = _optimizer_checkpoint_format(payload)
+            except Exception as error:
+                # Do not raise before the metadata broadcast: non-main FSDP
+                # ranks would otherwise wait forever at that collective.
+                metadata["optimizer_format"] = None
+                metadata["optimizer_format_error"] = str(error)
         metadata = distributed.broadcast_object(metadata)
-        if not isinstance(metadata, dict) or "step" not in metadata:
+        if not isinstance(metadata, dict):
             raise ValueError(f"Invalid FSDP optimizer checkpoint {optimizer_path}")
-        if metadata.get("optimizer_format") != "fsdp_full_v1":
+        if metadata.get("optimizer_format_error"):
             raise ValueError(
-                "This optimizer checkpoint was not saved in FSDP full-state "
-                "format. Its HF model weights remain usable as initialization, "
-                "but true FSDP optimizer resume is unavailable."
+                f"Invalid optimizer checkpoint {optimizer_path}: "
+                f"{metadata['optimizer_format_error']}"
+            )
+        if "step" not in metadata:
+            raise ValueError(f"Invalid FSDP optimizer checkpoint {optimizer_path}")
+        source_optimizer = payload["optimizer"] if payload is not None else None
+        conversion_error = None
+        if metadata["optimizer_format"] == "standard" and payload is not None:
+            try:
+                source_optimizer = _standard_optimizer_to_full(
+                    source_optimizer, optimizer, model
+                )
+            except Exception as error:
+                conversion_error = str(error)
+        conversion_error = distributed.broadcast_object(conversion_error)
+        if conversion_error:
+            raise ValueError(
+                f"Cannot convert optimizer checkpoint {optimizer_path} for FSDP: "
+                f"{conversion_error}"
             )
         sharded_state = scatter_full_optimizer_state_dict(
-            payload["optimizer"] if payload is not None else None,
+            source_optimizer,
             model,
             optimizer,
         )
@@ -203,7 +530,10 @@ def restore_optimizer(
             f"Checkpoint directory says step {int(match.group(1))}, but "
             f"optimizer.pt says step {step}"
         )
-    optimizer.load_state_dict(payload["optimizer"])
+    optimizer_state = payload["optimizer"]
+    if _optimizer_checkpoint_format(payload) == "fsdp_full_v1":
+        optimizer_state = _full_optimizer_to_standard(optimizer_state, optimizer, model)
+    optimizer.load_state_dict(optimizer_state)
     # map_location normally handles this. The explicit walk also supports
     # optimizer states saved by older PyTorch versions on cuda:0.
     for state in optimizer.state.values():

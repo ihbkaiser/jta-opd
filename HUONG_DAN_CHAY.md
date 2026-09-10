@@ -234,6 +234,17 @@ RESUME_ALLOW_CONFIG_MISMATCH=true \
 Không nên đổi model, tokenizer, dataset, seed, rollout protocol hoặc shared optimizer settings
 giữa các lần resume nếu mục tiêu là tiếp tục cùng một experiment.
 
+Số GPU khi resume có thể khác lúc tạo checkpoint. Checkpoint FSDP (`fsdp_full_v1`) được chuyển
+về state integer-ID khi chạy single-GPU/non-FSDP; checkpoint standard được chuyển sang full
+name-keyed state trước khi FSDP scatter. Mapping được kiểm tra theo tên, thứ tự và số lượng
+parameter của optimizer; nếu model/param-group topology khác, chương trình sẽ báo lỗi thay vì
+khôi phục nhầm state. Ví dụ chuyển từ 1 GPU sang 2 GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 RUN_NAME="$CMT_RUN_NAME" RESUME=auto MAX_STEPS=200 \
+  bash scripts/train_cmt_b200.sh
+```
+
 ## 5. TensorBoard và artifact chính
 
 ```bash
@@ -471,6 +482,28 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
 - **Missing preflight**: chạy lại `bash scripts/smoke_test_b200.sh` với đúng model/data và đúng số GPU.
 - **OOM**: giảm `MICRO_BATCH_SIZE_PER_GPU`, sau đó `SCORE_MICRO_BATCH_SIZE`; giữ `BATCH_SIZE` và
   các knob này giống nhau giữa các baseline khi so sánh.
+- **`Only ... GiB VRAM is free, below ... headroom` khi re-eval**: đây là thiếu VRAM trên
+  GPU đang được chọn, không phải thiếu RAM hệ thống và cũng không phải lỗi pass@8/checkpoint.
+  `gpu_memory_utilization=auto` cố ý dừng trước khi khởi tạo vLLM nếu không còn tối thiểu
+  `EVAL_VLLM_GPU_HEADROOM_GIB` (mặc định 4 GiB). Kiểm tra process đang giữ GPU:
+
+  ```bash
+  nvidia-smi
+  nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+  ```
+
+  Dừng các process cũ do chính bạn sở hữu hoặc chọn GPU còn trống. Khi chạy nhiều GPU, phải
+  khai báo rõ danh sách GPU; script tự tạo một replica vLLM `TP=1` trên mỗi GPU:
+
+  ```bash
+  CUDA_VISIBLE_DEVICES=0,1 REEVAL_WORLD_SIZE=2 \
+    bash scripts/reeval_pass8_b200.sh cmt "$CMT_RUN_NAME"
+  ```
+
+  Không bọc script re-eval này trong `torchrun`; nó tự quản lý các worker vLLM. Có thể truyền
+  `EVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90` (hoặc `REEVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90`) chỉ
+  sau khi đã xác nhận GPU đủ chỗ; tùy chọn số sẽ bỏ qua kiểm tra headroom và không làm mô hình
+  vừa vào GPU chỉ còn 0.7 GiB.
 - **Resume báo config mismatch**: kiểm tra `resolved_config.yaml`; chỉ dùng
   `RESUME_ALLOW_CONFIG_MISMATCH=true` khi thay đổi là có chủ ý.
 - **Plot thiếu method**: kiểm tra `PLOT_METHODS`, `*_RUN_NAME`, `eval_history.jsonl` và

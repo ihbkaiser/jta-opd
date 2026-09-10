@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import gzip
+import copy
 import csv
+import gzip
 import json
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ import torch
 import yaml
 
 from b200_experiment.resume import (
+    _full_optimizer_to_standard,
+    _standard_optimizer_to_full,
     resolve_resume_checkpoint,
     restore_optimizer,
     validate_append_history,
@@ -50,6 +53,140 @@ def _controlled_config(method: str = "ta") -> dict:
 
 
 class ResumeTests(unittest.TestCase):
+    @staticmethod
+    def _stepped_optimizer():
+        model = torch.nn.Sequential(
+            torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+        model(torch.ones(1, 3)).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        return model, optimizer
+
+    def test_standard_optimizer_converts_to_name_keyed_full_state(self):
+        model, optimizer = self._stepped_optimizer()
+        full = _standard_optimizer_to_full(optimizer.state_dict(), optimizer, model)
+        self.assertTrue(full["state"])
+        self.assertTrue(all(isinstance(name, str) for name in full["state"]))
+        self.assertTrue(
+            all(
+                isinstance(name, str)
+                for group in full["param_groups"]
+                for name in group["params"]
+            )
+        )
+        self.assertEqual(
+            set(full["state"]), {name for name, _ in model.named_parameters()}
+        )
+
+    def test_name_keyed_full_optimizer_converts_back_to_standard_state(self):
+        source_model, source_optimizer = self._stepped_optimizer()
+        full = _standard_optimizer_to_full(
+            source_optimizer.state_dict(), source_optimizer, source_model
+        )
+        # FSDP's official full-state rekeying may sort names in a group. The
+        # reverse conversion must restore the target optimizer's order before
+        # calling Optimizer.load_state_dict().
+        full = copy.deepcopy(full)
+        full["param_groups"][0]["params"] = sorted(
+            full["param_groups"][0]["params"]
+        )
+        target_model = torch.nn.Sequential(
+            torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)
+        )
+        target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=9e-4)
+        standard = _full_optimizer_to_standard(full, target_optimizer, target_model)
+        target_optimizer.load_state_dict(standard)
+        self.assertEqual(
+            [group["lr"] for group in target_optimizer.param_groups], [1e-5]
+        )
+        self.assertEqual(
+            len(target_optimizer.state), len(source_optimizer.state)
+        )
+
+    def test_fsdp_full_checkpoint_restores_into_non_fsdp_optimizer(self):
+        source_model, source_optimizer = self._stepped_optimizer()
+        full = _standard_optimizer_to_full(
+            source_optimizer.state_dict(), source_optimizer, source_model
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint-000009"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text("{}\n", encoding="utf-8")
+            torch.save(
+                {
+                    "step": 9,
+                    "optimizer": full,
+                    "optimizer_format": "fsdp_full_v1",
+                },
+                checkpoint / "optimizer.pt",
+            )
+            target_model = torch.nn.Sequential(
+                torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)
+            )
+            target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=9e-4)
+            state = restore_optimizer(
+                target_optimizer,
+                checkpoint,
+                torch.device("cpu"),
+                model=target_model,
+            )
+            self.assertEqual(state.step, 9)
+            self.assertEqual(target_optimizer.param_groups[0]["lr"], 1e-5)
+            self.assertEqual(
+                len(target_optimizer.state), len(source_optimizer.state)
+            )
+
+    def test_standard_checkpoint_can_resume_into_fsdp_via_scatter(self):
+        model, optimizer = self._stepped_optimizer()
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "checkpoint-000007"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text("{}\n", encoding="utf-8")
+            torch.save(
+                {
+                    "step": 7,
+                    "optimizer": optimizer.state_dict(),
+                    "optimizer_format": "standard",
+                },
+                checkpoint / "optimizer.pt",
+            )
+            captured = {}
+
+            class _Distributed:
+                is_main = True
+                rank = 0
+
+                @staticmethod
+                def broadcast_object(value):
+                    return value
+
+            def fake_scatter(full_state, current_model, current_optimizer):
+                captured["state"] = full_state
+                return _full_optimizer_to_standard(
+                    full_state, current_optimizer, current_model
+                )
+
+            with mock.patch(
+                "b200_experiment.resume.is_fsdp_model", return_value=True
+            ), mock.patch(
+                "b200_experiment.resume.scatter_full_optimizer_state_dict",
+                side_effect=fake_scatter,
+            ):
+                state = restore_optimizer(
+                    optimizer,
+                    checkpoint,
+                    torch.device("cpu"),
+                    model=model,
+                    distributed=_Distributed(),
+                )
+            self.assertEqual(state.step, 7)
+            self.assertTrue(captured["state"]["state"])
+            self.assertTrue(
+                all(isinstance(name, str) for name in captured["state"]["state"])
+            )
+
     def test_legacy_single_gpu_optimizer_checkpoint_restores_at_step_100(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "checkpoint-000100"

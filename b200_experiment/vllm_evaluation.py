@@ -44,9 +44,27 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
     free_bytes, total_bytes = torch.cuda.mem_get_info()
     usable_bytes = free_bytes - int(headroom_gib * 2**30)
     if usable_bytes <= 0:
+        # This check runs before constructing ``vllm.LLM``.  Failing here is
+        # intentional: overriding the utilization fraction cannot make a
+        # model fit when the device has less free VRAM than the safety
+        # headroom.  Include the logical device and visibility mask so that a
+        # standalone re-evaluation launched from a busy training node is
+        # diagnosable instead of looking like a generic RAM failure.
+        try:
+            device_index = torch.cuda.current_device()
+        except Exception:  # pragma: no cover - defensive for unusual CUDA setups
+            device_index = "unknown"
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<all>")
         raise RuntimeError(
-            f"Only {free_bytes / 2**30:.1f} GiB VRAM is free, below the "
-            f"configured {headroom_gib:.1f} GiB headroom"
+            f"Only {free_bytes / 2**30:.1f} GiB VRAM is free of "
+            f"{total_bytes / 2**30:.1f} GiB total, below the "
+            f"configured {headroom_gib:.1f} GiB headroom "
+            f"(CUDA device {device_index}, CUDA_VISIBLE_DEVICES={visible!r}). "
+            "This is usually an existing training/vLLM process or the wrong "
+            "GPU. Run `nvidia-smi`, stop only stale processes you own, or "
+            "select a free GPU. Setting a numeric gpu_memory_utilization "
+            "bypasses this safety check but will still OOM if the model does "
+            "not fit in the available VRAM."
         )
     # Keep a tiny driver/workspace margin even when this is the only process.
     return min(0.98, usable_bytes / total_bytes)

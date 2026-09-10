@@ -86,6 +86,7 @@ esac
 echo "Re-evaluating every saved checkpoint for: ${SELECTED_METHODS[*]}."
 REEVAL_METRIC_LABEL="${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-16}}"
 echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
+echo "vLLM devices: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}; workers=${REEVAL_WORLD_SIZE:-auto (one per visible GPU)}; TP=1 per worker"
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."
 else

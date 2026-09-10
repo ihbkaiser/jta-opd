@@ -207,6 +207,22 @@ class VllmEvaluationTests(unittest.TestCase):
             )
         self.assertAlmostEqual(utilization, 156 / 180)
 
+    def test_auto_memory_error_identifies_vram_device_and_visibility(self):
+        gib = 2**30
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.mem_get_info", return_value=(int(0.7 * gib), 24 * gib)),
+            patch("torch.cuda.current_device", return_value=2),
+            patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "2"}, clear=False),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"Only 0\.7 GiB VRAM is free.*CUDA device 2.*CUDA_VISIBLE_DEVICES='2'.*nvidia-smi",
+            ):
+                _resolve_gpu_memory_utilization(
+                    {"gpu_memory_utilization": "auto", "gpu_headroom_gib": 4}
+                )
+
     def test_all_benchmarks_share_one_generate_progress_bar(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
