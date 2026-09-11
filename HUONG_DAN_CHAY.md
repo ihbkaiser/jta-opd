@@ -506,6 +506,11 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
   vừa vào GPU chỉ còn 0.7 GiB.
 - **Resume báo config mismatch**: kiểm tra `resolved_config.yaml`; chỉ dùng
   `RESUME_ALLOW_CONFIG_MISMATCH=true` khi thay đổi là có chủ ý.
+- **`FileExistsError: Refusing to overwrite checkpoint path`**: checkpoint hoàn chỉnh là bất
+  biến; dùng `RESUME=auto` hoặc `RESUME_FROM_CHECKPOINT` để tiếp tục từ checkpoint gần nhất,
+  không chạy lại đúng cùng step. Nếu lần chạy trước bị ngắt khi đang ghi, rank 0 sẽ tự dọn đúng
+  thư mục staging `.checkpoint-*.incomplete` rồi ghi lại an toàn. Các rank phụ không còn kiểm tra
+  filesystem trước barrier nên không phát sinh race với thư mục staging của rank 0.
 - **Plot thiếu method**: kiểm tra `PLOT_METHODS`, `*_RUN_NAME`, `eval_history.jsonl` và
   `metrics.jsonl` trong output tương ứng.
 - **CMT cảnh báo top-p**: đây là cảnh báo đúng; `top_p<1` vẫn bounded nhưng estimator không còn

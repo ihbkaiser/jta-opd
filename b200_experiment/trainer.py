@@ -1836,11 +1836,64 @@ def _save_checkpoint(
 ):
     checkpoint = output_dir / ("final" if final else f"checkpoint-{step:06d}")
     temporary = output_dir / f".{checkpoint.name}.incomplete"
-    if checkpoint.exists() or temporary.exists():
-        raise FileExistsError(f"Refusing to overwrite checkpoint path: {checkpoint}")
+
+    def _error_payload(error: BaseException) -> dict[str, str]:
+        """Return a small, pickle-safe error for rank-0 -> rank-N broadcast."""
+
+        return {"type": type(error).__name__, "message": str(error)}
+
+    def _raise_broadcast_error(payload: dict[str, str], phase: str) -> None:
+        message = payload.get("message", "unknown checkpoint error")
+        if payload.get("type") == "FileExistsError":
+            # Preserve the historical exception type for callers which use it
+            # to distinguish an already-completed checkpoint from an I/O error.
+            raise FileExistsError(message)
+        raise RuntimeError(f"Checkpoint {phase} failed: {message}")
+
+    def _remove_path(path: Path) -> None:
+        """Remove exactly one stale checkpoint path, including a symlink/file."""
+
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+
+    # Only rank 0 is allowed to inspect or mutate checkpoint paths.  In the old
+    # implementation every rank performed this check before the first barrier;
+    # rank 0 could create ``temporary`` in the meantime and a slower rank then
+    # incorrectly treated that expected in-progress directory as a collision.
+    setup_error = None
+    if distributed.is_main:
+        try:
+            # A complete checkpoint is immutable: never silently overwrite it.
+            # ``is_symlink`` also catches a broken symlink, which ``exists``
+            # intentionally reports as false.
+            if checkpoint.exists() or checkpoint.is_symlink():
+                raise FileExistsError(
+                    f"Refusing to overwrite checkpoint path: {checkpoint}"
+                )
+
+            # A previous process may have died after creating the staging
+            # directory.  It is not a usable checkpoint, so remove this exact
+            # stale path and retry.  This is deliberately rank-0-only and never
+            # touches a completed checkpoint.
+            if temporary.exists() or temporary.is_symlink():
+                print(
+                    f"[checkpoint] removing stale temporary checkpoint: {temporary}",
+                    flush=True,
+                )
+                _remove_path(temporary)
+            temporary.mkdir(parents=True, exist_ok=False)
+        except BaseException as error:
+            setup_error = _error_payload(error)
+
+    setup_error = distributed.broadcast_object(setup_error)
+    if setup_error is not None:
+        _raise_broadcast_error(setup_error, "preparation")
+
     try:
-        if distributed.is_main:
-            temporary.mkdir(parents=True)
+        # All ranks enter the snapshot/optimizer collectives only after rank 0
+        # has successfully prepared the staging directory.
         distributed.barrier()
         _save_inference_snapshot(model, tokenizer, temporary, distributed)
         if save_optimizer:
@@ -1873,25 +1926,51 @@ def _save_checkpoint(
                     temporary / "optimizer.pt",
                 )
         distributed.barrier()
+
+        # Commit is another rank-0-only filesystem operation.  Broadcast its
+        # result before the post-commit barrier so an I/O failure cannot leave
+        # the other ranks waiting in NCCL forever.
+        commit_error = None
         if distributed.is_main:
-            os.replace(temporary, checkpoint)
+            try:
+                os.replace(temporary, checkpoint)
+            except BaseException as error:
+                commit_error = _error_payload(error)
+        commit_error = distributed.broadcast_object(commit_error)
+        if commit_error is not None:
+            _raise_broadcast_error(commit_error, "commit")
     except BaseException:
-        if distributed.is_main and temporary.exists():
-            shutil.rmtree(temporary)
+        if distributed.is_main and (temporary.exists() or temporary.is_symlink()):
+            _remove_path(temporary)
         raise
+
     distributed.barrier()
+
+    # Keep latest.json atomic as before, but propagate a rank-0 write failure
+    # before the final synchronization for the same no-hang guarantee.
+    latest_error = None
     if distributed.is_main:
-        latest = output_dir / "latest.json"
-        latest_temporary = output_dir / ".latest.json.tmp"
-        latest_temporary.write_text(
-            json.dumps(
-                {"step": step, "checkpoint": checkpoint.name, "final": bool(final)},
-                ensure_ascii=False,
+        try:
+            latest = output_dir / "latest.json"
+            latest_temporary = output_dir / ".latest.json.tmp"
+            latest_temporary.write_text(
+                json.dumps(
+                    {
+                        "step": step,
+                        "checkpoint": checkpoint.name,
+                        "final": bool(final),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        os.replace(latest_temporary, latest)
+            os.replace(latest_temporary, latest)
+        except BaseException as error:
+            latest_error = _error_payload(error)
+    latest_error = distributed.broadcast_object(latest_error)
+    if latest_error is not None:
+        _raise_broadcast_error(latest_error, "latest-pointer update")
     distributed.barrier()
     return checkpoint
 
