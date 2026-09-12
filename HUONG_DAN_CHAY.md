@@ -329,11 +329,14 @@ EVAL_LIMIT=20 EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
 ```bash
 EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
   bash scripts/eval_checkpoint_b200.sh cmt \
-  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100" \
-  results/checkpoint_eval/cmt_step100
+  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100"
 ```
 
-Thay `cmt` bằng `opd`, `ta`, `rac` hoặc `pgt`.
+Khi checkpoint nằm dưới `outputs/<run>/<method>/` và bỏ qua `OUTPUT_DIR`, script ghi artifact
+chi tiết vào `<method-output>/checkpoint_eval/<checkpoint-name>/` và tự upsert kết quả vào
+`<method-output>/eval_history.jsonl` (đồng thời cập nhật `eval_metrics.csv`). Thay `cmt` bằng
+`opd`, `ta`, `rac` hoặc `pgt`. Có thể truyền `OUTPUT_DIR` thứ ba nếu muốn giữ artifact chi tiết
+ở một thư mục khác; history của run vẫn được cập nhật nếu đường dẫn checkpoint có layout chuẩn.
 
 Pass@8 cho một checkpoint bất kỳ:
 
@@ -341,9 +344,11 @@ Pass@8 cho một checkpoint bất kỳ:
 EVAL_NUM_RESPONSES=8 EVAL_METRIC=pass@8 EVAL_TEMPERATURE=0.7 \
   CUDA_VISIBLE_DEVICES=0,1 \
   bash scripts/eval_checkpoint_b200.sh cmt \
-  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100" \
-  results/checkpoint_eval/cmt_pass8_step100
+  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100"
 ```
+
+Chạy lại cùng lệnh cho cùng checkpoint sẽ thay đúng row `(step, method)` trong
+`eval_history.jsonl`, không tạo bản ghi trùng.
 
 Với `CUDA_VISIBLE_DEVICES` có nhiều GPU, evaluator tự chia benchmark deterministic thành các
 shard, chạy một vLLM `TP=1` trên mỗi GPU rồi merge lại; với một GPU behavior không đổi. Có thể

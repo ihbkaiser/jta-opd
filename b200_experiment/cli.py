@@ -4,11 +4,13 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from .autotune import run_batch_autotune
 from .config import apply_overrides, load_with_overlays, resolve_runtime_paths, save_config
 from .evaluation import aggregate_evaluations, configured_benchmark_names, evaluate_suite
+from .evaluation_history import record_checkpoint_evaluation
 from .plotting import plot_results, plot_training_progress
 from .preflight import run_preflight
 from .trainer import run_training
@@ -35,43 +37,144 @@ def _visible_gpu_count() -> int:
         return 1
 
 
+def _infer_checkpoint_step(model_path: str | Path, run_output: Path) -> int:
+    """Infer the optimizer step represented by a saved checkpoint directory."""
+    model_path = Path(model_path).expanduser().resolve()
+    name = model_path.name
+    if name.startswith("checkpoint-"):
+        suffix = name.removeprefix("checkpoint-")
+        if suffix.isdigit():
+            return int(suffix)
+    if name != "final":
+        raise ValueError(
+            "Cannot record standalone evaluation history for checkpoint path "
+            f"{model_path}: expected a final/ checkpoint-N directory or pass "
+            "--history-step explicitly"
+        )
+
+    latest_path = run_output / "latest.json"
+    if latest_path.is_file():
+        latest = json.loads(latest_path.read_text(encoding="utf-8"))
+        if str(latest.get("checkpoint", "")).rstrip("/") == "final":
+            if latest.get("step") is not None:
+                return int(latest["step"])
+    summary_path = run_output / "summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("steps") is not None:
+            return int(summary["steps"])
+    metrics_path = run_output / "metrics.jsonl"
+    if metrics_path.is_file():
+        last_step = None
+        with metrics_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    last_step = json.loads(line).get("step")
+        if last_step is not None:
+            return int(last_step)
+    raise ValueError(
+        f"Cannot infer the optimizer step represented by {model_path}; "
+        "run output needs latest.json, summary.json, or metrics.jsonl"
+    )
+
+
+def _infer_max_steps(run_output: Path, step: int) -> int:
+    summary_path = run_output / "summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("steps") is not None:
+            return max(int(summary["steps"]), step)
+    return step
+
+
+def _default_history_method(name: str, config: dict) -> str:
+    configured = str(config.get("experiment", {}).get("method", "")).strip().lower()
+    if configured and configured != "base":
+        return configured
+    return {
+        "OPD": "opd",
+        "TA-OPD": "ta",
+        "RAC": "rac",
+        "PGT": "pgt",
+        "CMT-OPD": "cmt",
+    }.get(name, name.lower().replace("-", "_"))
+
+
+def _record_standalone_history(
+    args,
+    config: dict,
+    suite: dict,
+    elapsed: float,
+) -> dict:
+    run_output = getattr(args, "history_run_output", None)
+    if not run_output:
+        return suite
+    run_output = Path(run_output).expanduser().resolve()
+    step = (
+        int(args.history_step)
+        if getattr(args, "history_step", None) is not None
+        else _infer_checkpoint_step(args.model, run_output)
+    )
+    max_steps = (
+        int(args.history_max_steps)
+        if getattr(args, "history_max_steps", None) is not None
+        else _infer_max_steps(run_output, step)
+    )
+    artifacts = record_checkpoint_evaluation(
+        run_output,
+        suite,
+        method=getattr(args, "history_method", None)
+        or _default_history_method(args.name, config),
+        step=step,
+        max_steps=max_steps,
+        details_path=Path(args.output).expanduser().resolve() / "summary.json",
+        evaluation_time=elapsed,
+    )
+    suite["recorded_history"] = artifacts
+    return suite
+
+
 def _evaluate_checkpoint(args) -> dict:
     config = _configured(args)
+    started = time.perf_counter()
     if str(config.get("evaluation", {}).get("backend", "hf")).lower() != "vllm":
-        return evaluate_suite(args.name, args.model, config, args.output)
-    requested_world = int(os.environ.get("EVAL_WORLD_SIZE", _visible_gpu_count()))
-    if requested_world <= 1:
-        return evaluate_suite(args.name, args.model, config, args.output)
-    from .vllm_evaluation import evaluate_vllm_distributed
+        suite = evaluate_suite(args.name, args.model, config, args.output)
+    else:
+        requested_world = int(os.environ.get("EVAL_WORLD_SIZE", _visible_gpu_count()))
+        if requested_world <= 1:
+            suite = evaluate_suite(args.name, args.model, config, args.output)
+        else:
+            from .vllm_evaluation import evaluate_vllm_distributed
 
-    output = Path(args.output).expanduser().resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    resolved = output / ".resolved_eval_config.yaml"
-    save_config(config, resolved)
-    evaluation = config["evaluation"]
-    settings = {
-        "backend": "vllm",
-        "temperature": evaluation.get("temperature", 0.7),
-        "top_p": evaluation.get("top_p", 0.95),
-        "num_responses": evaluation.get("num_responses", 16),
-        "metric": evaluation.get("metric"),
-        "max_new_tokens": evaluation.get("max_new_tokens", 2048),
-        "limit": evaluation.get("limit"),
-        "benchmark_names": list(configured_benchmark_names(config)),
-        "vllm": evaluation.get("vllm", {}),
-    }
-    try:
-        return evaluate_vllm_distributed(
-            args.name,
-            args.model,
-            config,
-            output,
-            settings,
-            resolved,
-            world_size=requested_world,
-        )
-    finally:
-        resolved.unlink(missing_ok=True)
+            output = Path(args.output).expanduser().resolve()
+            output.mkdir(parents=True, exist_ok=True)
+            resolved = output / ".resolved_eval_config.yaml"
+            save_config(config, resolved)
+            evaluation = config["evaluation"]
+            settings = {
+                "backend": "vllm",
+                "temperature": evaluation.get("temperature", 0.7),
+                "top_p": evaluation.get("top_p", 0.95),
+                "num_responses": evaluation.get("num_responses", 16),
+                "metric": evaluation.get("metric"),
+                "max_new_tokens": evaluation.get("max_new_tokens", 2048),
+                "limit": evaluation.get("limit"),
+                "benchmark_names": list(configured_benchmark_names(config)),
+                "vllm": evaluation.get("vllm", {}),
+            }
+            try:
+                suite = evaluate_vllm_distributed(
+                    args.name,
+                    args.model,
+                    config,
+                    output,
+                    settings,
+                    resolved,
+                    world_size=requested_world,
+                )
+            finally:
+                resolved.unlink(missing_ok=True)
+    return _record_standalone_history(args, config, suite, time.perf_counter() - started)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +222,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--model", required=True)
     evaluate.add_argument("--output", required=True)
+    evaluate.add_argument(
+        "--history-run-output",
+        help=(
+            "Method run output directory whose eval_history.jsonl should receive "
+            "this standalone checkpoint result"
+        ),
+    )
+    evaluate.add_argument(
+        "--history-method",
+        help="Method slug for the history row (for example opd, ta, rac, or cmt)",
+    )
+    evaluate.add_argument(
+        "--history-step",
+        type=int,
+        help="Optimizer step to record; inferred from checkpoint name when omitted",
+    )
+    evaluate.add_argument(
+        "--history-max-steps",
+        type=int,
+        help="Total training steps stored in the history row; inferred when omitted",
+    )
 
     aggregate = commands.add_parser("aggregate-eval")
     aggregate.add_argument("--base-dir", required=True)

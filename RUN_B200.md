@@ -325,14 +325,15 @@ resume sẽ tự rewind output về đúng step đó rồi ghi lại các step t
 
 ## Manual evaluation
 
-Một launcher chung có thể eval checkpoint bất kỳ của các method. Đối số thứ ba là thư mục
-output và có thể bỏ qua (script sẽ tự tạo thư mục có timestamp):
+Một launcher chung có thể eval checkpoint bất kỳ của các method. Khi checkpoint nằm trong
+`outputs/<run>/<method>/`, nên bỏ qua đối số thứ ba: script sẽ ghi artifact chi tiết vào
+`<method-output>/checkpoint_eval/<checkpoint-name>/` và upsert kết quả vào
+`<method-output>/eval_history.jsonl` (cùng `eval_metrics.csv`).
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
   bash scripts/eval_checkpoint_b200.sh opd \
-  outputs/my_opd_run/opd/checkpoint-000050 \
-  results/checkpoint_eval/opd_step50
+  outputs/my_opd_run/opd/checkpoint-000050
 
 CUDA_VISIBLE_DEVICES=1 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=16 \
   bash scripts/eval_checkpoint_b200.sh ta-opd \
@@ -347,12 +348,16 @@ CUDA_VISIBLE_DEVICES=2 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
 `EVAL_BACKEND=hf`. Mặc định riêng của launcher chung là `temperature=1`, `n=16`; đặt
 `EVAL_NUM_RESPONSES=1` để lấy accuracy một response thay vì avg@n.
 
+Nếu truyền `OUTPUT_DIR` thứ ba, artifact vẫn được ghi vào thư mục đó; với layout checkpoint
+chuẩn, history của run vẫn được cập nhật. Chạy lại cùng checkpoint sẽ thay row `(step, method)`
+hiện có, không tạo duplicate.
+
 Mỗi thư mục eval chứa `summary.json`, bốn file `*_predictions.jsonl.gz`, và file gộp
 `model_outputs_detailed.jsonl.gz`. File gộp lưu dataset, ID, đề bài, đáp án chuẩn, prompt thực tế,
 toàn bộ response, đúng/sai từng response và generation parameters. Đọc nhanh bằng:
 
 ```bash
-gzip -cd results/checkpoint_eval/opd_step50/model_outputs_detailed.jsonl.gz | less
+gzip -cd outputs/my_opd_run/opd/checkpoint_eval/checkpoint-000050/model_outputs_detailed.jsonl.gz | less
 ```
 
 Eval một RAC checkpoint trên full Competition-MATH/MATH-500/AIME24/AIME25:

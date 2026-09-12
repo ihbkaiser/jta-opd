@@ -245,9 +245,12 @@ Dùng checkpoint cụ thể hoặc `RESUME=auto` cùng tên run cũ.
 
 Eval thủ công một checkpoint bất kỳ dùng
 `scripts/eval_checkpoint_b200.sh METHOD CHECKPOINT [OUTPUT_DIR]`, trong đó `METHOD` là `opd`,
-`ta-opd`, `rac`, `pgt` hoặc `cmt`. Ngoài summary và prediction theo từng dataset, evaluator HF/vLLM đều ghi
-`model_outputs_detailed.jsonl.gz` gồm prompt đã render, reference answer, mọi model response và
-kết quả chấm từng response. Ví dụ lệnh đầy đủ nằm trong `RUN_B200.md`.
+`ta-opd`, `rac`, `pgt` hoặc `cmt`. Với checkpoint nằm dưới `outputs/<run>/<method>/` và bỏ qua
+`OUTPUT_DIR`, artifact chi tiết được ghi dưới `<method-output>/checkpoint_eval/` và kết quả được
+upsert vào `<method-output>/eval_history.jsonl` (cập nhật cùng row `(step, method)` khi chạy lại),
+đồng thời cập nhật `eval_metrics.csv`. Ngoài summary và prediction theo từng dataset, evaluator
+HF/vLLM đều ghi `model_outputs_detailed.jsonl.gz` gồm prompt đã render, reference answer, mọi
+model response và kết quả chấm từng response. Ví dụ lệnh đầy đủ nằm trong `RUN_B200.md`.
 
 Detailed TA selected-token JSONL được tắt mặc định để tránh tăng disk không giới hạn; compact global
 histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có thể chủ động bật bằng
