@@ -2360,6 +2360,7 @@ def run_training(
     cmt_selector = CMTSelector(
         gamma=float(selector_cfg.get("cmt_gamma", 1.0)),
         successor_lambda=float(selector_cfg.get("cmt_successor_lambda", 1.0)),
+        ablation_arm=str(selector_cfg.get("cmt_ablation_arm", "canonical")),
     )
     batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:

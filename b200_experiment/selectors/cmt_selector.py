@@ -100,13 +100,34 @@ class CMTSelector:
     shared-neural-network claim is made.
     """
 
-    def __init__(self, gamma: float = 1.0, successor_lambda: float = 1.0):
+    def __init__(
+        self,
+        gamma: float = 1.0,
+        successor_lambda: float = 1.0,
+        ablation_arm: str = "canonical",
+    ):
         if not 0.0 <= gamma <= 1.0:
             raise ValueError("CMT gamma must be in [0, 1]")
         if successor_lambda < 0.0:
             raise ValueError("CMT successor lambda must be non-negative")
+        arm = str(ablation_arm).strip().lower()
+        aliases = {
+            "canonical": "canonical",
+            "cmt": "canonical",
+            "g": "g",
+            "g_x": "g_x",
+            "gx": "g_x",
+            "g_d": "g_d",
+            "gd": "g_d",
+        }
+        if arm not in aliases:
+            raise ValueError(
+                "CMT ablation_arm must be one of canonical, g, g_x, or g_d; "
+                f"got {ablation_arm!r}"
+            )
         self.gamma = float(gamma)
         self.successor_lambda = float(successor_lambda)
+        self.ablation_arm = aliases[arm]
 
     @torch.no_grad()
     def compute_scores(
@@ -244,9 +265,29 @@ class CMTSelector:
             * marginal_flux
             * successor_excess
         )
-        learning_value = torch.where(
+        canonical_learning_value = torch.where(
             valid, g + sequential_gain, torch.zeros_like(g)
         )
+        # Ablation arms deliberately reuse the exact CMT intermediates and the
+        # same downstream KL/Gibbs allocator and weighted OPD objective.  The
+        # default is byte-for-byte equivalent to the canonical score.  X is
+        # the semantic successor excess (not R/M/V/H); D is the canonical
+        # sequential marginal gain.
+        if self.ablation_arm == "g":
+            learning_value = g
+            score_definition = "ablation_local_gain_g"
+        elif self.ablation_arm == "g_x":
+            learning_value = torch.where(
+                valid, g + successor_excess, torch.zeros_like(g)
+            )
+            score_definition = "ablation_local_gain_plus_successor_excess_g_x"
+        else:
+            learning_value = canonical_learning_value
+            score_definition = (
+                "canonical_cmt_g_plus_sequential_gain"
+                if self.ablation_arm == "g_d"
+                else "support_matched_pgt_plus_local_baseline_excess_successor_derivative"
+            )
         diagnostics = dict(pgt_support.diagnostics)
         diagnostics.update(
             gain=g,
@@ -290,9 +331,9 @@ class CMTSelector:
             sequential_gain=sequential_gain,
             learning_value=learning_value,
             s_CMT=learning_value,
-            score_definition=(
-                "support_matched_pgt_plus_local_baseline_excess_successor_derivative"
-            ),
+            score_definition=score_definition,
+            ablation_arm=self.ablation_arm,
+            ablation_score=learning_value,
             transition_definition=(
                 "truncated_original_union_common_mass_without_inverse_coverage"
             ),
