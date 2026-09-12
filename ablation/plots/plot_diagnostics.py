@@ -12,6 +12,7 @@ def main() -> int:
     parser.add_argument("--input-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--step", type=int, default=None)
+    parser.add_argument("--run-name", action="append", dest="run_names")
     args = parser.parse_args()
     import matplotlib
     matplotlib.use("Agg")
@@ -19,6 +20,8 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     samples = {"gain": [], "successor_excess": [], "sequential_gain": [], "learning_value": [], "w": []}
     for path in args.input_root.rglob("token_score_stats/step-*.json"):
+        if args.run_names and path.parent.parent.name not in set(args.run_names):
+            continue
         payload = json.loads(path.read_text(encoding="utf-8"))
         if args.step is not None and int(payload.get("step", -1)) != args.step:
             continue

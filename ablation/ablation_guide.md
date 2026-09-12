@@ -1,45 +1,63 @@
-# CMT ablation and hyperparameter runs
+# Hướng dẫn CMT ablation và phân tích hyperparameter
 
-This directory adds an experiment layer around the production BellmanOPD
-implementation.  It does not replace the OPD loss, optimizer, rollout,
-Gibbs/KL allocator, or evaluator.  At each token CMT computes its existing
-detached diagnostics and only changes the score passed to the same allocator:
+Thư mục này là lớp thí nghiệm bao quanh implementation CMT chính của
+BellmanOPD. Ablation không copy lại công thức và không thay distillation loss,
+optimizer, rollout, Gibbs/KL allocator hay evaluator.
 
-* `g`: `S_t = gain_t` (local PGT/CMT gain);
-* `g_x`: `S_t = gain_t + successor_excess_t`;
-* `g_d`: `S_t = learning_value_t`, the canonical CMT score
-  `gain_t + sequential_gain_t`.
+## 1. Ba arm và pipeline
 
-`g_d` is therefore numerically identical to an ordinary CMT run when all
-configuration values are equal.  `successor_excess` is the CMT semantic
-future-excess diagnostic; it is not `R`, `M`, `V`, or `H`.  Scores are detached
-before the global KL-constrained Gibbs allocation and weighted OPD loss.
+CMT production đã tính các tensor detached `gain`, `successor_excess`,
+`sequential_gain` và `learning_value`. Ablation chỉ chọn score đưa vào cùng
+allocator:
 
-## Configure and run
+```text
+g       : S_t = g_t
+g_x     : S_t = g_t + successor_excess_t
+g_d     : S_t = learning_value_t = g_t + sequential_gain_t
+```
 
-All launchers resolve paths from their own location, so they can be called from
-any working directory.  The most commonly edited exports are at the top of
-`scripts/train.sh`:
+`g_d` dùng trực tiếp canonical `learning_value`, vì vậy phải trùng số với CMT
+canonical khi cấu hình giống nhau. `X=successor_excess` không phải `R`, `M`,
+`V` hoặc `H`. Pipeline không đổi:
+
+```text
+logits -> CMT diagnostics -> S_t -> global KL/Gibbs -> w_t
+       -> weighted OPD loss -> optimizer update
+```
+
+## 2. Cấu hình chung
+
+Script dùng `SCRIPT_DIR`, nên gọi được từ mọi current working directory. Chỉnh
+các export ở đầu `ablation/scripts/train.sh`, hoặc truyền chúng trước lệnh:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+cd /mnt/hdd/nhatminh/OPD/BellmanOPD
+export CUDA_VISIBLE_DEVICES=0
 export STORAGE_ROOT=/workspace/storage-shared
-export STUDENT_MODEL='nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base'
-export TEACHER_MODEL='models/Qwen3-8B'
-export TRAIN_DATASET=competition_math       # or dapo_math/custom
+export STUDENT_MODEL="nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base"
+export TEACHER_MODEL="models/Qwen3-8B"
+export TRAIN_DATASET=competition_math
 export GLOBAL_BATCH_SIZE=64
 export PPO_MINI_BATCH_SIZE=16
 export MICRO_BATCH_SIZE_PER_GPU=8
 export SEED=42
+export ROLLOUT_SEED=42
+export TRAIN_MAX_NEW_TOKENS=4096
+export EVAL_MAX_NEW_TOKENS=7168
 ```
 
-Training generation and evaluation generation are intentionally independent:
-`MAX_RESPONSE_LEN` is set from `TRAIN_MAX_NEW_TOKENS` (default **4096**), while
-`TRAIN_EVAL_MAX_NEW_TOKENS` is set from `EVAL_MAX_NEW_TOKENS` (default **7168**).
-Training rollouts use `temperature=1.0, top_p=1.0`, as required by the exact
-on-policy CMT estimator.  Periodic evaluation is enabled by default.
+Giá trị canonical của ablation là:
 
-Run one arm:
+```text
+top_k=16, cmt_allocation_kl=0.5, cmt_gamma=1.0,
+cmt_successor_lambda=1.0, learning_rate=1e-6,
+rollout temperature=1.0, rollout top_p=1.0
+```
+
+Training và evaluation có budget token độc lập: 4096 và 7168. `top_p=1.0`
+là protocol chính để estimator CMT có diễn giải on-policy chính xác.
+
+## 3. Chạy một arm
 
 ```bash
 bash ablation/scripts/train.sh g
@@ -47,131 +65,179 @@ bash ablation/scripts/train.sh g_x
 bash ablation/scripts/train.sh g_d
 ```
 
-Run all three arms (separate output directories, same seed and protocol):
+Nếu không đặt `RUN_NAME`, launcher tự tạo tên khoa học dạng:
 
-```bash
-bash ablation/scripts/run_ablation.sh
+```text
+cmt_<arm>_epsilon<eps>_topk<k>_lr<lr>_seed<seed>_<timestamp>
 ```
 
-Override any export without editing files, for example a four-GPU run with a
-short smoke budget:
+Ví dụ `cmt_g_d_epsilon0p5_topk16_lr1em6_seed42_20260912_200100`.
+Output nằm trong `ablation/outputs/<run-name>/` và không bị ghi đè. Smoke run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 MAX_STEPS=2 \
+MAX_STEPS=2 bash ablation/scripts/train.sh g_d
+```
+
+Liệt kê các run để lấy tên tự động cho bước plotting:
+
+```bash
+find ablation/outputs -mindepth 1 -maxdepth 1 -type d | sort
+```
+
+## 4. Một giá trị hyperparameter ở mỗi thời điểm
+
+Các file `sweep_*` sau đây chạy **một full CMT (`g_d`) run**. GPU và giá trị có
+thể sửa ngay ở đầu file hoặc truyền inline.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 EPSILON=0.25 \
+  bash ablation/scripts/sweep_epsilon.sh
+
+CUDA_VISIBLE_DEVICES=0 TOP_K=8 \
+  bash ablation/scripts/sweep_topk.sh
+
+CUDA_VISIBLE_DEVICES=0 LR=5e-7 \
+  bash ablation/scripts/sweep_lr.sh
+```
+
+Các run hoàn toàn độc lập. Ví dụ hôm nay chạy epsilon 0.25, hôm khác chạy
+epsilon 0.5:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 EPSILON=0.25 \
+  RUN_NAME=analysis_epsilon_0.25_seed42 \
+  bash ablation/scripts/sweep_epsilon.sh
+
+CUDA_VISIBLE_DEVICES=1 EPSILON=0.5 \
+  RUN_NAME=analysis_epsilon_0.5_seed42 \
+  bash ablation/scripts/sweep_epsilon.sh
+```
+
+Nếu scheduler map GPU mới thành device 0 thì dùng `CUDA_VISIBLE_DEVICES=0` ở
+job mới; output vẫn độc lập nhờ `RUN_NAME` khác.
+
+## 5. Nhiều giá trị song song
+
+Để mỗi giá trị là một process độc lập trên một GPU:
+
+```bash
+GPU_LIST=0,1,2,3 \
+EPSILON_VALUES="0.25 0.5 0.75 1.0" \
+  bash ablation/scripts/sweep_parallel_epsilon.sh
+```
+
+Script này gán GPU 0/1/2/3 lần lượt cho bốn giá trị, lưu log riêng dưới
+`ablation/outputs/_sweep_logs/`, và đợi tất cả job kết thúc. Wrapper tương tự:
+
+```bash
+GPU_LIST=0,1,2 TOP_K_VALUES="8 16 32" \
+  bash ablation/scripts/sweep_topk_parallel.sh
+
+GPU_LIST=0,1,2 LR_VALUES="5e-7 1e-6 2e-6" \
+  bash ablation/scripts/sweep_lr_parallel.sh
+```
+
+Không để hai job dùng chung GPU. Nếu mỗi run cần nhiều GPU FSDP, chia GPU thành
+các nhóm không chồng lấn và chạy thủ công. `sweep.sh` là generic sequential
+sweep cũ; dùng `sweep_parallel.sh` khi muốn chạy đồng thời.
+
+## 6. Resume và evaluation
+
+```bash
+RESUME_FROM_CHECKPOINT=/abs/path/ablation/outputs/eps025/checkpoint-000100 \
+RUN_NAME=eps025 OUTPUT_DIR=/abs/path/ablation/outputs/eps025 \
+CMT_ALLOCATION_KL=0.25 MAX_STEPS=500 \
   bash ablation/scripts/train.sh g_d
 ```
 
-Every run is written to `ablation/outputs/<run-name>/` and refuses to append to
-an existing run.  The trainer stores `resolved_config.yaml`, checkpoints,
-`metrics.jsonl`, `eval_history.jsonl`, TensorBoard logs, and detached
-`token_score_stats/`.  `ablation_spec.json` records arm, seed, hyperparameters,
-token budgets, and git commit.
+Không đổi controlled hyperparameter khi resume nếu không chủ động bật
+`RESUME_ALLOW_CONFIG_MISMATCH=true`.
 
-## Hyperparameter sweeps
-
-The main search is on full CMT (`g_d`) only.  Keep the canonical
-`successor_lambda=1.0`, `gamma=1.0`, and `rollout_top_p=1.0`; after selecting a
-configuration, reuse it unchanged for all three arms.
-
-```bash
-bash ablation/scripts/sweep_epsilon.sh       # 0.1 0.25 0.5 1.0
-bash ablation/scripts/sweep_topk.sh          # 8 16 32
-bash ablation/scripts/sweep_lr.sh            # 5e-7 1e-6 2e-6
-```
-
-Values can be replaced without changing code:
-
-```bash
-EPSILON_VALUES='0.25 0.5' SEED=7 bash ablation/scripts/sweep.sh epsilon
-TOP_K_VALUES='8 32' bash ablation/scripts/sweep.sh top_k
-LR_VALUES='5e-7 2e-6' bash ablation/scripts/sweep.sh lr
-```
-
-`sweep.sh` is deliberately sequential.  To train independent values
-concurrently, assign one physical GPU to each job:
-
-```bash
-GPU_LIST=0,1,2 \
-EPSILON_VALUES='0.25 0.5 0.75' \
-bash ablation/scripts/sweep_parallel.sh epsilon
-```
-
-This starts three separate `g_d` runs at the same time, with one GPU per run,
-and waits for all of them.  Logs are saved under
-`ablation/outputs/_sweep_logs/`.  The same interface works for `top_k` and
-`lr`:
-
-```bash
-GPU_LIST=0,1,2 TOP_K_VALUES='8 16 32' \
-  bash ablation/scripts/sweep_parallel.sh top_k
-GPU_LIST=0,1,2 LR_VALUES='5e-7 1e-6 2e-6' \
-  bash ablation/scripts/sweep_parallel.sh lr
-```
-
-Do not run two jobs on overlapping GPUs.  If one run itself needs multiple
-GPUs, keep `sweep.sh` sequential or provide disjoint multi-GPU groups and
-launch separate commands manually.
-
-Each sweep run has a name such as
-`analysis_epsilon_0.5_seed42`; an existing name is never overwritten.
-
-## Resume and standalone evaluation
-
-Resume uses the production launcher and preserves optimizer/checkpoint state:
-
-```bash
-RESUME_FROM_CHECKPOINT=/abs/path/ablation/outputs/ablation_g_d_seed42/checkpoint-000100 \
-  RUN_NAME=ablation_g_d_seed42 \
-  OUTPUT_DIR=/abs/path/ablation/outputs/ablation_g_d_seed42 \
-  MAX_STEPS=200 bash ablation/scripts/train.sh g_d
-```
-
-Evaluate a final checkpoint or any numbered checkpoint.  The evaluator writes
-details under `checkpoint_eval/` and upserts the corresponding row in the
-run's `eval_history.jsonl` (repeating the same checkpoint/metric replaces only
-that row):
+Evaluate hoặc lấy pass@8:
 
 ```bash
 EVAL_NUM_RESPONSES=8 EVAL_METRIC=pass@8 \
   bash scripts/eval_checkpoint_b200.sh cmt \
-  ablation/outputs/ablation_g_d_seed42/final
+  ablation/outputs/eps025/final
 ```
 
-For multi-GPU evaluation set `EVAL_WORLD_SIZE` and expose the same number of
-GPUs; the existing evaluator launches one TP=1 vLLM replica per GPU and merges
-rank shards.  `EVAL_VLLM_GPU_MEMORY_UTILIZATION=auto` is useful when training
-processes still occupy device memory.
-
-## Plotting
-
-After evaluations have produced history rows:
+Kết quả chi tiết ở `checkpoint_eval/` và được upsert vào
+`ablation/outputs/eps025/eval_history.jsonl`. Multi-GPU evaluation:
 
 ```bash
-python ablation/plots/plot_ablation.py \
-  --input-root ablation/outputs --output-dir ablation/figures \
-  --benchmark MATH-500 --metric accuracy
-
-python ablation/plots/plot_hparam.py \
-  --parameter epsilon --input-root ablation/outputs \
-  --output-dir ablation/figures --benchmark MATH-500
-
-python ablation/plots/plot_hparam.py \
-  --parameter top_k --input-root ablation/outputs \
-  --output-dir ablation/figures --aggregate auc
-
-python ablation/plots/plot_diagnostics.py \
-  --input-root ablation/outputs --output-dir ablation/figures
+CUDA_VISIBLE_DEVICES=0,1,2,3 EVAL_WORLD_SIZE=4 \
+EVAL_NUM_RESPONSES=8 EVAL_METRIC=pass@8 \
+  bash scripts/eval_checkpoint_b200.sh cmt ablation/outputs/eps025/final
 ```
 
-Each plot command writes both PNG and PDF.  The standard BellmanOPD progress
-plotter can still be used directly on a particular run output with
-`bash scripts/plot_training_progress.sh`.
+## 7. Vẽ hình bằng bash và chọn run name
 
-## Scope of the core edit
+File `ablation/scripts/plot_ablation.sh` có các biến:
 
-Only two production files are touched.  `CMTSelector` accepts an optional
-`ablation_arm` (default `canonical`) and selects one of its already-computed
-`gain`, `successor_excess`, or canonical `learning_value` tensors; `trainer.py`
-passes `selector.cmt_ablation_arm`.  With the default config, no numerical or
-training behavior changes.  All ablation scripts, configuration, plots, and
-tests live under this directory.
+```bash
+export PLOT_MODE=epsilon       # arms, epsilon, top_k, lr, diagnostics
+export INPUT_ROOT=ablation/outputs
+export OUTPUT_DIR=ablation/figures
+export BENCHMARK=MATH-500
+export METRIC=accuracy
+export AGGREGATE=final          # final hoặc auc
+```
+
+Chọn run giống cách chọn `OPD_RUN_NAME`, `TA_RUN_NAME`:
+
+```bash
+RUN_NAME_1=analysis_epsilon_0.25_seed42 \
+RUN_NAME_2=analysis_epsilon_0.5_seed42 \
+RUN_NAME_3=analysis_epsilon_0.75_seed42 \
+PLOT_MODE=epsilon \
+  bash ablation/scripts/plot_ablation.sh
+```
+
+Hoặc dùng danh sách:
+
+```bash
+RUN_NAMES="analysis_epsilon_0.25_seed42 analysis_epsilon_0.5_seed42" \
+PLOT_MODE=epsilon bash ablation/scripts/plot_ablation.sh
+```
+
+Các mode khác:
+
+```bash
+PLOT_MODE=arms bash ablation/scripts/plot_ablation.sh
+PLOT_MODE=top_k bash ablation/scripts/plot_ablation.sh
+PLOT_MODE=lr AGGREGATE=auc bash ablation/scripts/plot_ablation.sh
+PLOT_MODE=diagnostics bash ablation/scripts/plot_ablation.sh
+```
+
+Mỗi lệnh lưu cả PNG và PDF trong `ablation/figures/`.
+
+## 8. Cấu trúc và reproducibility
+
+```text
+ablation/
+├── configs/common.yaml
+├── selectors/ablation_selector.py
+├── scripts/train.sh, sweep_*.sh, plot_ablation.sh
+├── plots/                 # curve, hyperparameter, diagnostics
+├── tests/
+├── outputs/               # checkpoint/metrics, không commit
+└── figures/               # PNG/PDF, không commit
+```
+
+Mỗi run lưu `resolved_config.yaml`, checkpoint, `metrics.jsonl`,
+`eval_history.jsonl`, TensorBoard, `token_score_stats/` và `ablation_spec.json`
+(arm, seed, epsilon, Top-K, learning rate, token budgets, git commit).
+
+Production chỉ sửa tối thiểu `CMTSelector` (thêm `ablation_arm`, mặc định
+`canonical`) và `trainer.py` (truyền config). Default CMT không đổi; toàn bộ
+launcher/config/plot/test dành riêng cho ablation nằm trong thư mục này.
+
+## 9. Test
+
+```bash
+python3 -m pytest -q ablation/tests
+bash -n ablation/scripts/*.sh
+```
+
+Các numeric tests cần Python environment có `torch`; launcher/config/CWD tests
+chạy được không cần GPU.

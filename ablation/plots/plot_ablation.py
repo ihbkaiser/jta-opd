@@ -8,8 +8,10 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def _runs(root: Path):
+def _runs(root: Path, selected: set[str] | None = None):
     for spec_path in sorted(root.rglob("ablation_spec.json")):
+        if selected and spec_path.parent.name not in selected:
+            continue
         try:
             spec = json.loads(spec_path.read_text(encoding="utf-8"))
             history_path = spec_path.parent / "eval_history.jsonl"
@@ -37,6 +39,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--benchmark", default="MATH-500")
     parser.add_argument("--metric", choices=("accuracy", "avg_at_n", "pass_at_8"), default="accuracy")
+    parser.add_argument("--run-name", action="append", dest="run_names", help="Restrict the plot to these output directory names (repeatable)")
     args = parser.parse_args()
 
     import matplotlib
@@ -45,7 +48,7 @@ def main() -> int:
     import numpy as np
 
     grouped = defaultdict(list)
-    for path, spec, rows in _runs(args.input_root):
+    for path, spec, rows in _runs(args.input_root, set(args.run_names or [])):
         arm = spec.get("arm", path.name)
         for row in rows:
             result = _benchmark(row, args.benchmark)

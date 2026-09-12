@@ -49,7 +49,21 @@ export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 export DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-fsdp}"
 export GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 export TENSORBOARD_ENABLED="${TENSORBOARD_ENABLED:-true}"
-export RUN_NAME="${RUN_NAME:-ablation_${ARM}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
+_ablation_slug() {
+  local value="$1"
+  value="${value//-/m}"
+  value="${value//+/}"
+  value="${value//./p}"
+  value="${value// /}"
+  printf '%s' "${value}"
+}
+if [[ -z "${RUN_NAME:-}" ]]; then
+  _eps_tag="$(_ablation_slug "${CMT_ALLOCATION_KL}")"
+  _topk_tag="$(_ablation_slug "${TOP_K}")"
+  _lr_tag="$(_ablation_slug "${LR}")"
+  RUN_NAME="cmt_${ARM}_epsilon${_eps_tag}_topk${_topk_tag}_lr${_lr_tag}_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+fi
+export RUN_NAME
 export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/../outputs/${RUN_NAME}}"
 export ABLATION_COMMAND="${BASH_SOURCE[0]} ${ARM} $*"
 # ============================================================

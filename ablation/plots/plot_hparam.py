@@ -26,6 +26,7 @@ def main() -> int:
     parser.add_argument("--benchmark", default="MATH-500")
     parser.add_argument("--metric", default="accuracy")
     parser.add_argument("--aggregate", choices=("final", "auc"), default="final")
+    parser.add_argument("--run-name", action="append", dest="run_names", help="Restrict the plot to these output directory names (repeatable)")
     args = parser.parse_args()
     import matplotlib
     matplotlib.use("Agg")
@@ -35,6 +36,8 @@ def main() -> int:
     key = {"epsilon": "cmt_allocation_kl", "top_k": "top_k", "lr": "learning_rate", "learning_rate": "learning_rate"}[args.parameter]
     points = []
     for spec_path in sorted(args.input_root.rglob("ablation_spec.json")):
+        if args.run_names and spec_path.parent.name not in set(args.run_names):
+            continue
         try:
             spec = json.loads(spec_path.read_text(encoding="utf-8"))
             value = spec.get(key)
