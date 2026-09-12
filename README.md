@@ -218,8 +218,9 @@ method, dùng `scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]`. L�
 nằm trong `RUN_B200.md`.
 1.060 problem trên Competition-MATH test, MATH-500, AIME24 và AIME25 tạo đúng 16.960 responses.
 Step-0 base thường được generate một lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng.
-Khi các run được đánh giá độc lập, biểu đồ cho phép Step-0 lệch tối đa một điểm phần trăm
-và vẽ đường Base theo trung bình các phép đo đó. Evaluator bật vLLM
+Khi các run được đánh giá độc lập, biểu đồ kiểm tra Step-0 của Competition-MATH và MATH-500
+với dung sai tối đa một điểm phần trăm; AIME không là điều kiện kiểm tra. Đường Base dùng
+trung bình các phép đo Step-0. Evaluator bật vLLM
 `performance_mode=throughput`, chunked prefill và async scheduling mặc định.
 
 <!-- B200_AUTOTUNE_RESULT_START -->

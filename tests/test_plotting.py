@@ -94,6 +94,31 @@ class PlottingTests(unittest.TestCase):
                     methods=["ta", "rac"],
                 )
 
+    def test_step_zero_aime_difference_is_not_a_validation_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ta_output = root / "ta"
+            rac_output = root / "rac"
+            self._write_training_output(ta_output, 0.2, base_accuracy=0.10)
+            self._write_training_output(rac_output, 0.3, base_accuracy=0.10)
+
+            history_path = rac_output / "eval_history.jsonl"
+            rows = [json.loads(line) for line in history_path.read_text().splitlines()]
+            rows[0]["benchmarks"]["AIME24"]["accuracy"] = 0.50
+            history_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+            paths = plot_training_progress(
+                root / "results",
+                ta_output=ta_output,
+                rac_output=rac_output,
+                methods=["ta", "rac"],
+            )
+
+            history = json.loads(Path(paths["history_json"]).read_text())
+            self.assertAlmostEqual(history["base_accuracy"]["AIME24"], 0.30)
+
     def test_accuracy_limits_zoom_to_observed_range(self):
         self.assertEqual(_accuracy_ylim([0.58, 0.65]), (0.55, 0.7))
         self.assertEqual(_accuracy_ylim([0.0, 1.0]), (0.0, 1.05))

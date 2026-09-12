@@ -63,9 +63,10 @@ _PROGRESS_METHODS = {
 
 # Accuracy is stored as a fraction in [0, 1].  Evaluation at step 0 can differ
 # slightly between method runs because of sampling/evaluation nondeterminism;
-# one percentage point is small enough to treat those measurements as the same
-# initial student while still catching accidentally mixed runs.
+# one percentage point is small enough to treat the supervised math benchmarks
+# as the same initial student while still catching accidentally mixed runs.
 _STEP_ZERO_ACCURACY_TOLERANCE = 0.01
+_STEP_ZERO_BASE_CHECK_BENCHMARKS = frozenset({"Competition-MATH", "MATH-500"})
 
 
 def _accuracy_ylim(values: list[float] | tuple[float, ...]) -> tuple[float, float]:
@@ -528,7 +529,15 @@ def plot_training_progress(
         ]
         if candidates:
             spread = max(candidates) - min(candidates)
-            if len(candidates) > 1 and spread > _STEP_ZERO_ACCURACY_TOLERANCE:
+            # Competition-MATH and MATH-500 are the comparable base checks.
+            # AIME evaluations are intentionally not used as a gate because
+            # their small/problem-specific sample counts make Step-0 noise
+            # substantially less informative for this consistency check.
+            if (
+                benchmark in _STEP_ZERO_BASE_CHECK_BENCHMARKS
+                and len(candidates) > 1
+                and spread > _STEP_ZERO_ACCURACY_TOLERANCE
+            ):
                 raise ValueError(
                     f"Step-0 base accuracy differs between methods for "
                     f"{benchmark} by {spread:.3%}, exceeding the "

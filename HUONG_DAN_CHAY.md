@@ -437,8 +437,9 @@ SMOOTHING_WINDOW=1 PLOT_METHODS="opd cmt" \
 
 Các biểu đồ accuracy tự động zoom trục Y theo miền giá trị quan sát (làm tròn theo
 5 điểm phần trăm và chừa 2 điểm phần trăm đệm), thay vì luôn hiển thị 0--100%.
-Step-0 giữa các method được phép lệch tối đa 1 điểm phần trăm; đường `Base student`
-trong biểu đồ nhiều method dùng trung bình các giá trị Step-0 đó.
+Step-0 của `Competition-MATH` và `MATH-500` được phép lệch tối đa 1 điểm phần trăm;
+đường `Base student` trong biểu đồ nhiều method dùng trung bình các giá trị Step-0.
+Chênh lệch Step-0 của AIME không được dùng làm điều kiện từ chối biểu đồ.
 
 ### Vẽ final evaluation bar chart
 
