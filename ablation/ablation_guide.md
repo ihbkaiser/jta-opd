@@ -87,6 +87,31 @@ TOP_K_VALUES='8 32' bash ablation/scripts/sweep.sh top_k
 LR_VALUES='5e-7 2e-6' bash ablation/scripts/sweep.sh lr
 ```
 
+`sweep.sh` is deliberately sequential.  To train independent values
+concurrently, assign one physical GPU to each job:
+
+```bash
+GPU_LIST=0,1,2 \
+EPSILON_VALUES='0.25 0.5 0.75' \
+bash ablation/scripts/sweep_parallel.sh epsilon
+```
+
+This starts three separate `g_d` runs at the same time, with one GPU per run,
+and waits for all of them.  Logs are saved under
+`ablation/outputs/_sweep_logs/`.  The same interface works for `top_k` and
+`lr`:
+
+```bash
+GPU_LIST=0,1,2 TOP_K_VALUES='8 16 32' \
+  bash ablation/scripts/sweep_parallel.sh top_k
+GPU_LIST=0,1,2 LR_VALUES='5e-7 1e-6 2e-6' \
+  bash ablation/scripts/sweep_parallel.sh lr
+```
+
+Do not run two jobs on overlapping GPUs.  If one run itself needs multiple
+GPUs, keep `sweep.sh` sequential or provide disjoint multi-GPU groups and
+launch separate commands manually.
+
 Each sweep run has a name such as
 `analysis_epsilon_0.5_seed42`; an existing name is never overwritten.
 
