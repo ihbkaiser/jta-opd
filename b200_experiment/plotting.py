@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,41 @@ _PROGRESS_METHODS = {
         "output_argument": "--cmt-output",
     },
 }
+
+# Accuracy is stored as a fraction in [0, 1].  Evaluation at step 0 can differ
+# slightly between method runs because of sampling/evaluation nondeterminism;
+# one percentage point is small enough to treat those measurements as the same
+# initial student while still catching accidentally mixed runs.
+_STEP_ZERO_ACCURACY_TOLERANCE = 0.01
+
+
+def _accuracy_ylim(values: list[float] | tuple[float, ...]) -> tuple[float, float]:
+    """Return readable, data-dependent limits for accuracy plots.
+
+    The old plots always used ``[0, 1.05]``, which compresses the differences
+    when all methods occupy a narrow band (for example, 0.58--0.65).  We keep
+    a small two-point (percentage-point) visual margin and round the limits to
+    five-point ticks, yielding 0.55--0.70 for that example.  Limits are never
+    allowed to clip an observed value; the lower limit is clamped at zero
+    because accuracy itself is non-negative.
+    """
+
+    finite = [float(value) for value in values if np.isfinite(float(value))]
+    if not finite:
+        return 0.0, 1.05
+
+    tick = 0.05
+    padding = 0.02
+    lower = max(0.0, tick * math.floor((min(finite) - padding) / tick))
+    upper = tick * math.ceil((max(finite) + padding) / tick)
+    # Floating-point round-off can produce e.g. 0.7000000000000001.  This is
+    # only a presentation helper, so rounding keeps serialized/tested limits
+    # stable without changing any metric values.
+    lower = round(lower, 10)
+    upper = round(upper, 10)
+    if upper <= lower:
+        upper = round(lower + tick, 10)
+    return lower, upper
 
 
 def _plot_directory(results_dir: Path, plot_name: str | None) -> Path:
@@ -375,8 +411,10 @@ def _plot_single_method_accuracy(
     }
     steps = [int(row["step"]) for row in rows]
     fig, axis = plt.subplots(figsize=(9, 5.5))
+    accuracy_values: list[float] = []
     for benchmark in benchmark_names:
         values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
+        accuracy_values.extend(values)
         axis.plot(
             steps,
             values,
@@ -389,7 +427,7 @@ def _plot_single_method_accuracy(
         )
     axis.set_xlabel("Optimizer step")
     axis.set_ylabel(metric_name)
-    axis.set_ylim(0.0, 1.05)
+    axis.set_ylim(*_accuracy_ylim(accuracy_values))
     axis.set_title(f"{spec['label']} evaluation {metric_name} during training")
     axis.grid(alpha=0.25)
     axis.legend(title="Dataset")
@@ -489,12 +527,19 @@ def plot_training_progress(
             if int(rows[0]["step"]) == 0
         ]
         if candidates:
-            if len(candidates) > 1 and max(candidates) - min(candidates) > 1e-12:
+            spread = max(candidates) - min(candidates)
+            if len(candidates) > 1 and spread > _STEP_ZERO_ACCURACY_TOLERANCE:
                 raise ValueError(
                     f"Step-0 base accuracy differs between methods for "
-                    f"{benchmark}: {candidates}"
+                    f"{benchmark} by {spread:.3%}, exceeding the "
+                    f"{_STEP_ZERO_ACCURACY_TOLERANCE:.1%} tolerance: {candidates}"
                 )
-            base_accuracy[benchmark] = candidates[0]
+            # A small discrepancy is expected when each run evaluates its
+            # initial checkpoint independently.  Use the mean as the shared
+            # reference line rather than privileging whichever method happens
+            # to appear first; each method's own step-0 point remains visible
+            # in its plotted series and in the exported history.
+            base_accuracy[benchmark] = float(np.mean(candidates))
 
     if len(selected_methods) == 1:
         selected_method = selected_methods[0]
@@ -522,7 +567,10 @@ def plot_training_progress(
         1,
         len(benchmark_names),
         figsize=(5 * len(benchmark_names), 4.8),
-        sharey=True,
+        # Each benchmark gets its own readable accuracy range.  Sharing a
+        # 0--100% axis across, for example, MATH and AIME would let the lower
+        # scoring benchmark flatten the curves of the other one.
+        sharey=False,
     )
     axes = np.atleast_1d(axes)
     colors = {
@@ -532,9 +580,11 @@ def plot_training_progress(
     }
     for axis, benchmark in zip(axes, benchmark_names):
         maximum_step = 0
+        benchmark_accuracy_values: list[float] = []
         for method, rows in histories.items():
             steps = [int(row["step"]) for row in rows]
             values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
+            benchmark_accuracy_values.extend(values)
             maximum_step = max(maximum_step, max(steps))
             axis.plot(
                 steps,
@@ -557,6 +607,7 @@ def plot_training_progress(
                     color=colors[method],
                 )
         if benchmark in base_accuracy:
+            benchmark_accuracy_values.append(base_accuracy[benchmark])
             axis.hlines(
                 base_accuracy[benchmark],
                 0,
@@ -568,7 +619,7 @@ def plot_training_progress(
             )
         axis.set_title(benchmark)
         axis.set_xlabel("Optimizer step")
-        axis.set_ylim(0.0, 1.05)
+        axis.set_ylim(*_accuracy_ylim(benchmark_accuracy_values))
         axis.grid(alpha=0.25)
     axes[0].set_ylabel(metric_name)
     handles, labels = axes[-1].get_legend_handles_labels()
@@ -671,14 +722,16 @@ def plot_results(
     width = min(0.8 / len(plotted_models), 0.24)
     fig, axis = plt.subplots(figsize=(max(9, 2.4 * len(benchmark_names)), 5.5))
     center = (len(plotted_models) - 1) / 2
+    all_accuracy_values: list[float] = []
     for offset, method in enumerate(plotted_models):
         values = [float(by_method[method][benchmark]) for benchmark in benchmark_names]
+        all_accuracy_values.extend(values)
         bars = axis.bar(x + (offset - center) * width, values, width, label=method)
         axis.bar_label(
             bars, labels=[f"{value:.3f}" for value in values], padding=3, fontsize=9
         )
     axis.set_xticks(x, benchmark_names)
-    axis.set_ylim(0.0, 1.08)
+    axis.set_ylim(*_accuracy_ylim(all_accuracy_values))
     axis.set_ylabel(metric_name)
     axis.set_title("Final evaluation: " + " vs ".join(plotted_models))
     axis.grid(axis="y", alpha=0.25)

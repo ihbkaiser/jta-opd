@@ -217,8 +217,9 @@ lưu và thay thế lịch sử/file eval cũ, dùng `scripts/reeval_all_checkpo
 method, dùng `scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]`. Lệnh dry-run/chạy thật
 nằm trong `RUN_B200.md`.
 1.060 problem trên Competition-MATH test, MATH-500, AIME24 và AIME25 tạo đúng 16.960 responses.
-Step-0 base giống hệt giữa các method nên được generate một
-lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng. Evaluator bật vLLM
+Step-0 base thường được generate một lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng.
+Khi các run được đánh giá độc lập, biểu đồ cho phép Step-0 lệch tối đa một điểm phần trăm
+và vẽ đường Base theo trung bình các phép đo đó. Evaluator bật vLLM
 `performance_mode=throughput`, chunked prefill và async scheduling mặc định.
 
 <!-- B200_AUTOTUNE_RESULT_START -->

@@ -435,6 +435,11 @@ SMOOTHING_WINDOW=1 PLOT_METHODS="opd cmt" \
   bash scripts/plot_training_progress.sh --plot-name raw_opd_cmt
 ```
 
+Các biểu đồ accuracy tự động zoom trục Y theo miền giá trị quan sát (làm tròn theo
+5 điểm phần trăm và chừa 2 điểm phần trăm đệm), thay vì luôn hiển thị 0--100%.
+Step-0 giữa các method được phép lệch tối đa 1 điểm phần trăm; đường `Base student`
+trong biểu đồ nhiều method dùng trung bình các giá trị Step-0 đó.
+
 ### Vẽ final evaluation bar chart
 
 Sau `eval_all_b200.sh`, dùng:

@@ -6,7 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from b200_experiment.plotting import plot_results, plot_training_progress
+from b200_experiment.plotting import (
+    _accuracy_ylim,
+    plot_results,
+    plot_training_progress,
+)
 
 
 class PlottingTests(unittest.TestCase):
@@ -33,14 +37,16 @@ class PlottingTests(unittest.TestCase):
             self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
 
     @staticmethod
-    def _write_training_output(output: Path, accuracy: float) -> None:
+    def _write_training_output(
+        output: Path, accuracy: float, *, base_accuracy: float = 0.1
+    ) -> None:
         output.mkdir()
         with (output / "metrics.jsonl").open("w", encoding="utf-8") as handle:
             for step in range(1, 4):
                 handle.write(json.dumps({"step": step, "loss": 1.0 / step}) + "\n")
         with (output / "eval_history.jsonl").open("w", encoding="utf-8") as handle:
             for step in (0, 100):
-                value = 0.1 if step == 0 else accuracy
+                value = base_accuracy if step == 0 else accuracy
                 handle.write(
                     json.dumps(
                         {
@@ -53,6 +59,44 @@ class PlottingTests(unittest.TestCase):
                     )
                     + "\n"
                 )
+
+    def test_step_zero_accuracy_tolerance_uses_shared_mean_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ta_output = root / "ta"
+            rac_output = root / "rac"
+            self._write_training_output(ta_output, 0.2, base_accuracy=0.100)
+            self._write_training_output(rac_output, 0.3, base_accuracy=0.105)
+
+            paths = plot_training_progress(
+                root / "results",
+                ta_output=ta_output,
+                rac_output=rac_output,
+                methods=["ta", "rac"],
+            )
+
+            history = json.loads(Path(paths["history_json"]).read_text())
+            self.assertAlmostEqual(history["base_accuracy"]["MATH-500"], 0.1025)
+
+    def test_step_zero_difference_over_one_percentage_point_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ta_output = root / "ta"
+            rac_output = root / "rac"
+            self._write_training_output(ta_output, 0.2, base_accuracy=0.10)
+            self._write_training_output(rac_output, 0.3, base_accuracy=0.111)
+
+            with self.assertRaisesRegex(ValueError, "exceeding the 1.0% tolerance"):
+                plot_training_progress(
+                    root / "results",
+                    ta_output=ta_output,
+                    rac_output=rac_output,
+                    methods=["ta", "rac"],
+                )
+
+    def test_accuracy_limits_zoom_to_observed_range(self):
+        self.assertEqual(_accuracy_ylim([0.58, 0.65]), (0.55, 0.7))
+        self.assertEqual(_accuracy_ylim([0.0, 1.0]), (0.0, 1.05))
 
     def test_accuracy_and_loss_plots_are_created(self):
         with tempfile.TemporaryDirectory() as temporary:
