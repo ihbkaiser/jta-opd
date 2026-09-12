@@ -219,6 +219,9 @@ training_evaluation:
     # remains resident, so using a hard-coded 1.0 would incorrectly claim it.
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
+    # Reserve transient CUDA-graph/attention workspace in addition to the
+    # device headroom while training and periodic evaluation share each GPU.
+    gpu_workspace_headroom_gib: 2
     max_num_seqs: 256
     max_model_len: 9216
     enable_prefix_caching: true
@@ -248,6 +251,7 @@ evaluation:
     tensor_parallel_size: 1
     gpu_memory_utilization: auto
     gpu_headroom_gib: 4
+    gpu_workspace_headroom_gib: 2
     max_num_seqs: 256
     max_model_len: 9216
     enable_prefix_caching: true

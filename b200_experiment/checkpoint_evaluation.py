@@ -331,6 +331,7 @@ def _runtime_settings(
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "gpu_headroom_gib": args.gpu_headroom_gib,
+        "gpu_workspace_headroom_gib": args.gpu_workspace_headroom_gib,
         "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "seed": args.seed,
@@ -638,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor-parallel-size", type=int)
     parser.add_argument("--gpu-memory-utilization")
     parser.add_argument("--gpu-headroom-gib", type=float)
+    parser.add_argument("--gpu-workspace-headroom-gib", type=float)
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--seed", type=int)

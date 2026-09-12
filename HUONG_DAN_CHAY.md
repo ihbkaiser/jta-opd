@@ -485,7 +485,8 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
 - **`Only ... GiB VRAM is free, below ... headroom` khi re-eval**: đây là thiếu VRAM trên
   GPU đang được chọn, không phải thiếu RAM hệ thống và cũng không phải lỗi pass@8/checkpoint.
   `gpu_memory_utilization=auto` cố ý dừng trước khi khởi tạo vLLM nếu không còn tối thiểu
-  `EVAL_VLLM_GPU_HEADROOM_GIB` (mặc định 4 GiB). Kiểm tra process đang giữ GPU:
+  `EVAL_VLLM_GPU_HEADROOM_GIB` (mặc định 4 GiB) cộng thêm 2 GiB workspace reserve cho
+  CUDA graph/attention transient allocations. Kiểm tra process đang giữ GPU:
 
   ```bash
   nvidia-smi
@@ -504,6 +505,9 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
   `EVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90` (hoặc `REEVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90`) chỉ
   sau khi đã xác nhận GPU đủ chỗ; tùy chọn số sẽ bỏ qua kiểm tra headroom và không làm mô hình
   vừa vào GPU chỉ còn 0.7 GiB.
+  Nếu GPU vẫn chịu tải khác, tăng phần đệm bằng `VLLM_GPU_WORKSPACE_HEADROOM_GIB=4` khi train,
+  `EVAL_VLLM_GPU_WORKSPACE_HEADROOM_GIB=4` khi eval một checkpoint, hoặc
+  `REEVAL_VLLM_GPU_WORKSPACE_HEADROOM_GIB=4` khi re-eval.
 - **Resume báo config mismatch**: kiểm tra `resolved_config.yaml`; chỉ dùng
   `RESUME_ALLOW_CONFIG_MISMATCH=true` khi thay đổi là có chủ ý.
 - **`FileExistsError: Refusing to overwrite checkpoint path`**: checkpoint hoàn chỉnh là bất

@@ -205,6 +205,23 @@ class VllmEvaluationTests(unittest.TestCase):
             utilization = _resolve_gpu_memory_utilization(
                 {"gpu_memory_utilization": "auto", "gpu_headroom_gib": 4}
             )
+        # Auto sizing reserves 4 GiB device headroom plus the default 2 GiB
+        # transient vLLM workspace reserve.
+        self.assertAlmostEqual(utilization, 154 / 180)
+
+    def test_auto_memory_workspace_headroom_can_be_disabled_explicitly(self):
+        gib = 2**30
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.mem_get_info", return_value=(160 * gib, 180 * gib)),
+        ):
+            utilization = _resolve_gpu_memory_utilization(
+                {
+                    "gpu_memory_utilization": "auto",
+                    "gpu_headroom_gib": 4,
+                    "gpu_workspace_headroom_gib": 0,
+                }
+            )
         self.assertAlmostEqual(utilization, 156 / 180)
 
     def test_auto_memory_error_identifies_vram_device_and_visibility(self):
@@ -217,7 +234,7 @@ class VllmEvaluationTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
-                r"Only 0\.7 GiB VRAM is free.*CUDA device 2.*CUDA_VISIBLE_DEVICES='2'.*nvidia-smi",
+                r"Only 0\.7 GiB VRAM is free.*effective 6\.0 GiB headroom.*CUDA device 2.*CUDA_VISIBLE_DEVICES='2'.*nvidia-smi",
             ):
                 _resolve_gpu_memory_utilization(
                     {"gpu_memory_utilization": "auto", "gpu_headroom_gib": 4}

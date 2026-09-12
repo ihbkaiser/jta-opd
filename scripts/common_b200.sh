@@ -401,6 +401,7 @@ build_training_args() {
     --set "training_evaluation.vllm.tensor_parallel_size=${VLLM_TENSOR_PARALLEL_SIZE:-1}"
     --set "training_evaluation.vllm.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
     --set "training_evaluation.vllm.gpu_headroom_gib=${VLLM_GPU_HEADROOM_GIB:-4}"
+    --set "training_evaluation.vllm.gpu_workspace_headroom_gib=${VLLM_GPU_WORKSPACE_HEADROOM_GIB:-2}"
     --set "training_evaluation.vllm.max_num_seqs=${VLLM_MAX_NUM_SEQS:-256}"
     --set "training_evaluation.vllm.max_model_len=${VLLM_MAX_MODEL_LEN:-9216}"
     --set "training_evaluation.vllm.enable_chunked_prefill=${VLLM_ENABLE_CHUNKED_PREFILL:-true}"

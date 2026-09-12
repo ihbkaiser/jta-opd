@@ -103,6 +103,7 @@ exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --set "evaluation.vllm.tensor_parallel_size=${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}" \
   --set "evaluation.vllm.gpu_memory_utilization=${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-auto}" \
   --set "evaluation.vllm.gpu_headroom_gib=${EVAL_VLLM_GPU_HEADROOM_GIB:-4}" \
+  --set "evaluation.vllm.gpu_workspace_headroom_gib=${EVAL_VLLM_GPU_WORKSPACE_HEADROOM_GIB:-2}" \
   --set "evaluation.vllm.max_num_seqs=${EVAL_VLLM_MAX_NUM_SEQS:-256}" \
   --set "evaluation.vllm.max_model_len=${EVAL_VLLM_MAX_MODEL_LEN:-9216}" \
   --set "evaluation.vllm.enable_chunked_prefill=${EVAL_VLLM_ENABLE_CHUNKED_PREFILL:-true}" \

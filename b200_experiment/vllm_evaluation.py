@@ -41,8 +41,21 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
     headroom_gib = float(vllm_settings.get("gpu_headroom_gib", 4))
     if headroom_gib < 0:
         raise ValueError("vLLM gpu_headroom_gib must be non-negative")
+    # vLLM's reservation covers the engine/KV cache, but generation can still
+    # allocate CUDA-graph, attention and allocator workspace.  ``mem_get_info``
+    # cannot see that future peak, so reserve it explicitly in addition to the
+    # configured device headroom.  The default is intentional for old resolved
+    # configs that predate this setting.
+    workspace_headroom_gib = float(
+        vllm_settings.get("gpu_workspace_headroom_gib", 2)
+    )
+    if workspace_headroom_gib < 0:
+        raise ValueError(
+            "vLLM gpu_workspace_headroom_gib must be non-negative"
+        )
+    effective_headroom_gib = headroom_gib + workspace_headroom_gib
     free_bytes, total_bytes = torch.cuda.mem_get_info()
-    usable_bytes = free_bytes - int(headroom_gib * 2**30)
+    usable_bytes = free_bytes - int(effective_headroom_gib * 2**30)
     if usable_bytes <= 0:
         # This check runs before constructing ``vllm.LLM``.  Failing here is
         # intentional: overriding the utilization fraction cannot make a
@@ -58,7 +71,9 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
         raise RuntimeError(
             f"Only {free_bytes / 2**30:.1f} GiB VRAM is free of "
             f"{total_bytes / 2**30:.1f} GiB total, below the "
-            f"configured {headroom_gib:.1f} GiB headroom "
+            f"effective {effective_headroom_gib:.1f} GiB headroom "
+            f"({headroom_gib:.1f} GiB device + "
+            f"{workspace_headroom_gib:.1f} GiB vLLM workspace) "
             f"(CUDA device {device_index}, CUDA_VISIBLE_DEVICES={visible!r}). "
             "This is usually an existing training/vLLM process or the wrong "
             "GPU. Run `nvidia-smi`, stop only stale processes you own, or "
@@ -66,7 +81,7 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
             "bypasses this safety check but will still OOM if the model does "
             "not fit in the available VRAM."
         )
-    # Keep a tiny driver/workspace margin even when this is the only process.
+    # Keep the effective reserve available when this is the only process too.
     return min(0.98, usable_bytes / total_bytes)
 
 
@@ -201,6 +216,10 @@ def evaluate_vllm_suite(
             "top_p": top_p,
             "num_responses": samples_per_problem,
             "metric": metric_name,
+            "gpu_headroom_gib": float(vllm_settings.get("gpu_headroom_gib", 4)),
+            "gpu_workspace_headroom_gib": float(
+                vllm_settings.get("gpu_workspace_headroom_gib", 2)
+            ),
             **{key: value for key, value in engine_kwargs.items() if key != "model"},
         },
     }
