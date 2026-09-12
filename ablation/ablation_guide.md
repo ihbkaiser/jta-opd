@@ -137,6 +137,20 @@ GPU_LIST=0,1,2 LR_VALUES="5e-7 1e-6 2e-6" \
   bash ablation/scripts/sweep_lr_parallel.sh
 ```
 
+Mặc định stdout/stderr của từng job được `tee` ra cả terminal lẫn file log,
+nên có thể theo dõi tqdm trực tiếp. Vì nhiều tqdm chạy đồng thời nên các dòng
+có thể xen kẽ; log riêng của từng run vẫn đầy đủ. Nếu muốn chỉ ghi file:
+
+```bash
+SWEEP_STREAM_LOGS=false \
+  GPU_LIST=0,1 EPSILON_VALUES="0.25 0.5" \
+  bash ablation/scripts/sweep_parallel_epsilon.sh
+```
+
+Tên run của mỗi batch có thêm timestamp (ví dụ
+`analysis_epsilon_0.25_seed42_20260912_133337`), vì vậy chạy lại sau khi một
+job lỗi sẽ không đụng output cũ. Có thể đặt tag cố định bằng `SWEEP_TAG=trial2`.
+
 Không để hai job dùng chung GPU. Nếu mỗi run cần nhiều GPU FSDP, chia GPU thành
 các nhóm không chồng lấn và chạy thủ công. `sweep.sh` là generic sequential
 sweep cũ; dùng `sweep_parallel.sh` khi muốn chạy đồng thời.

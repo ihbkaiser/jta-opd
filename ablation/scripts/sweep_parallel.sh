@@ -41,21 +41,39 @@ fi
 tag="${SWEEP_TAG:-$(date +%Y%m%d_%H%M%S)}"
 log_root="${OUTPUT_ROOT}/_sweep_logs/${PREFIX}_${tag}"
 mkdir -p "${log_root}"
+# Stream each child log to this terminal while teeing the exact same bytes to
+# its per-run file.  Disable with SWEEP_STREAM_LOGS=false for a quiet launcher.
+stream_logs="${SWEEP_STREAM_LOGS:-true}"
+set -o pipefail
 pids=()
 names=()
 for index in "${!values_array[@]}"; do
   value="${values_array[$index]}"
   gpu="${GPUS[$index]}"
-  run_name="analysis_${PREFIX}_${value}_seed${SEED:-42}"
+  # Include the sweep tag in the run identity so a retry never collides with
+  # an earlier partially-created output directory.
+  run_name="analysis_${PREFIX}_${value}_seed${SEED:-42}_${tag}"
   names+=("${run_name}")
-  (
+  child_command=(bash "${SCRIPT_DIR}/train.sh" g_d)
+  if [[ "${stream_logs,,}" == "true" || "${stream_logs}" == "1" || "${stream_logs,,}" == "yes" ]]; then
+    (
+      export CUDA_VISIBLE_DEVICES="${gpu}"
+      export TRAIN_NPROC_PER_NODE=1
+      export RUN_NAME="${run_name}"
+      export OUTPUT_DIR="${OUTPUT_ROOT}/${run_name}"
+      export "${VAR}=${value}"
+      "${child_command[@]}"
+    ) 2>&1 | tee "${log_root}/${run_name}.log" &
+  else
+    (
     export CUDA_VISIBLE_DEVICES="${gpu}"
     export TRAIN_NPROC_PER_NODE=1
     export RUN_NAME="${run_name}"
     export OUTPUT_DIR="${OUTPUT_ROOT}/${run_name}"
     export "${VAR}=${value}"
-    bash "${SCRIPT_DIR}/train.sh" g_d
-  ) >"${log_root}/${run_name}.log" 2>&1 &
+      "${child_command[@]}"
+    ) >"${log_root}/${run_name}.log" 2>&1 &
+  fi
   pids+=("$!")
   echo "Started ${run_name} on physical GPU ${gpu} (pid ${pids[-1]})"
 done
@@ -66,6 +84,9 @@ for index in "${!pids[@]}"; do
     echo "Finished ${names[$index]}"
   else
     echo "FAILED ${names[$index]}; see ${log_root}/${names[$index]}.log" >&2
+    echo "----- tail of ${names[$index]}.log -----" >&2
+    tail -40 "${log_root}/${names[$index]}.log" >&2 || true
+    echo "----------------------------------------" >&2
     failed=1
   fi
 done
