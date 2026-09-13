@@ -20,6 +20,9 @@ def test_common_defaults_are_canonical():
     text = (ROOT / "configs/common.yaml").read_text(encoding="utf-8")
     for expected in ("cmt_allocation_kl: 0.5", "cmt_gamma: 1.0", "cmt_successor_lambda: 1.0", "top_k: 16", "max_new_tokens: 4096"):
         assert expected in text
+    gamma_script = (ROOT / "scripts/sweep_gamma.sh").read_text(encoding="utf-8")
+    assert "CMT_GAMMA" in gamma_script
+    assert "train.sh\" g_d" in gamma_script
 
 
 def test_train_launcher_is_cwd_independent_and_keeps_token_budgets():

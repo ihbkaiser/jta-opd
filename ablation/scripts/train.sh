@@ -61,7 +61,8 @@ if [[ -z "${RUN_NAME:-}" ]]; then
   _eps_tag="$(_ablation_slug "${CMT_ALLOCATION_KL}")"
   _topk_tag="$(_ablation_slug "${TOP_K}")"
   _lr_tag="$(_ablation_slug "${LR}")"
-  RUN_NAME="cmt_${ARM}_epsilon${_eps_tag}_topk${_topk_tag}_lr${_lr_tag}_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
+  _gamma_tag="$(_ablation_slug "${CMT_GAMMA}")"
+  RUN_NAME="cmt_${ARM}_epsilon${_eps_tag}_gamma${_gamma_tag}_topk${_topk_tag}_lr${_lr_tag}_seed${SEED}_$(date +%Y%m%d_%H%M%S)"
 fi
 export RUN_NAME
 export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/../outputs/${RUN_NAME}}"
@@ -79,7 +80,7 @@ cd "${REPO_DIR}"
 if [[ "${ABLATION_DRY_RUN:-false}" == "true" || "${ABLATION_DRY_RUN:-false}" == "1" ]]; then
   echo "Dry run: ${ARM} -> ${OUTPUT_DIR}"
   echo "train_max_new_tokens=${MAX_RESPONSE_LEN} eval_max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS}"
-  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P}"
+  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} gamma=${CMT_GAMMA} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P}"
   exit 0
 fi
 exec bash "${REPO_DIR}/scripts/train_cmt_b200.sh" \

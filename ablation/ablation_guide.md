@@ -54,6 +54,19 @@ cmt_successor_lambda=1.0, learning_rate=1e-6,
 rollout temperature=1.0, rollout top_p=1.0
 ```
 
+Đối với gamma, nên bắt đầu với grid ngắn:
+
+```text
+0.95, 0.99, 0.995, 0.999, 1.0
+```
+
+Trực giác theo effective horizon `1/(1-gamma)` là: 0.95 khoảng 20 bước,
+0.99 khoảng 100 bước, 0.995 khoảng 200 bước, 0.999 khoảng 1000 bước. Đây chỉ
+là cách diễn giải để chọn grid; `gamma=1.0` vẫn là baseline finite-horizon
+canonical và không nên bị bỏ khỏi sweep. Với trajectory 2k--8k token, không
+nên bắt đầu bằng nhiều giá trị rất nhỏ (ví dụ 0.5) vì chúng gần như loại bỏ
+toàn bộ successor signal.
+
 Training và evaluation có budget token độc lập: 4096 và 7168. `top_p=1.0`
 là protocol chính để estimator CMT có diễn giải on-policy chính xác.
 
@@ -68,10 +81,10 @@ bash ablation/scripts/train.sh g_d
 Nếu không đặt `RUN_NAME`, launcher tự tạo tên khoa học dạng:
 
 ```text
-cmt_<arm>_epsilon<eps>_topk<k>_lr<lr>_seed<seed>_<timestamp>
+cmt_<arm>_epsilon<eps>_gamma<gamma>_topk<k>_lr<lr>_seed<seed>_<timestamp>
 ```
 
-Ví dụ `cmt_g_d_epsilon0p5_topk16_lr1em6_seed42_20260912_200100`.
+Ví dụ `cmt_g_d_epsilon0p5_gamma1p0_topk16_lr1em6_seed42_20260912_200100`.
 Output nằm trong `ablation/outputs/<run-name>/` và không bị ghi đè. Smoke run:
 
 ```bash
@@ -98,6 +111,9 @@ CUDA_VISIBLE_DEVICES=0 TOP_K=8 \
 
 CUDA_VISIBLE_DEVICES=0 LR=5e-7 \
   bash ablation/scripts/sweep_lr.sh
+
+CUDA_VISIBLE_DEVICES=0 GAMMA=0.99 \
+  bash ablation/scripts/sweep_gamma.sh
 ```
 
 Các run hoàn toàn độc lập. Ví dụ hôm nay chạy epsilon 0.25, hôm khác chạy
@@ -135,6 +151,9 @@ GPU_LIST=0,1,2 TOP_K_VALUES="8 16 32" \
 
 GPU_LIST=0,1,2 LR_VALUES="5e-7 1e-6 2e-6" \
   bash ablation/scripts/sweep_lr_parallel.sh
+
+GPU_LIST=0,1,2,3 GAMMA_VALUES="0.95 0.99 0.995 0.999" \
+  bash ablation/scripts/sweep_parallel_gamma.sh
 ```
 
 Mặc định stdout/stderr của từng job được `tee` ra cả terminal lẫn file log,
@@ -153,7 +172,29 @@ job lỗi sẽ không đụng output cũ. Có thể đặt tag cố định bằ
 
 Không để hai job dùng chung GPU. Nếu mỗi run cần nhiều GPU FSDP, chia GPU thành
 các nhóm không chồng lấn và chạy thủ công. `sweep.sh` là generic sequential
-sweep cũ; dùng `sweep_parallel.sh` khi muốn chạy đồng thời.
+sweep cũ (có thể gọi `bash ablation/scripts/sweep.sh gamma`); dùng
+`sweep_parallel.sh` khi muốn chạy đồng thời.
+
+Có thể dùng launcher grouped-GPU để tự động hóa trường hợp mỗi run cần nhiều
+GPU. Ví dụ 4 epsilon, mỗi run 2 GPU trong một workload 8 GPU:
+
+```bash
+GPU_GROUPS="0,1;2,3;4,5;6,7" \
+EPSILON_VALUES="0.25 0.5 0.75 1.0" \
+  bash ablation/scripts/sweep_epsilon_groups.sh
+```
+
+Launcher tự đặt `TRAIN_NPROC_PER_NODE=2` cho từng run, giữ các nhóm GPU không
+chồng lấn, stream tqdm ra terminal và lưu log riêng. Generic form:
+
+```bash
+GPU_GROUPS="0,1;2,3;4,5;6,7" \
+EPSILON_VALUES="0.25 0.5 0.75 1.0" \
+  bash ablation/scripts/sweep_parallel_groups.sh epsilon
+```
+
+Số value phải đúng bằng số group. Không dùng `sweep_parallel_epsilon.sh` cho
+trường hợp này vì file đó thiết kế một GPU cho mỗi run.
 
 ## 6. Resume và evaluation
 
@@ -218,6 +259,7 @@ Các mode khác:
 
 ```bash
 PLOT_MODE=arms bash ablation/scripts/plot_ablation.sh
+PLOT_MODE=gamma bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=top_k bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=lr AGGREGATE=auc bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=diagnostics bash ablation/scripts/plot_ablation.sh
