@@ -86,6 +86,48 @@ class EvaluationHistoryTests(unittest.TestCase):
             )
             self.assertIn("avg@8", {row["metric"] for row in metrics})
 
+    def test_partial_benchmark_eval_preserves_existing_benchmarks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            existing = {
+                "step": 4,
+                "method": "cmt",
+                "benchmarks": {
+                    "MATH-500": {"accuracy": 0.51, "metric": "avg@16"},
+                    "AIME24": {"accuracy": 0.22, "metric": "avg@16"},
+                },
+                "parameters": {"metric": "avg@16"},
+            }
+            (output / "eval_history.jsonl").write_text(
+                json.dumps(existing) + "\n", encoding="utf-8"
+            )
+            suite = {
+                "parameters": {"backend": "vllm", "num_responses": 16, "metric": "avg@16"},
+                "benchmarks": {
+                    "GPQA-Diamond": {
+                        "correct": 3,
+                        "total": 4,
+                        "problems": 4,
+                        "accuracy": 0.75,
+                        "avg_at_n": 0.75,
+                    },
+                    "AMC23": {
+                        "correct": 2,
+                        "total": 4,
+                        "problems": 4,
+                        "accuracy": 0.5,
+                        "avg_at_n": 0.5,
+                    },
+                },
+            }
+            record_checkpoint_evaluation(output, suite, method="cmt", step=4)
+            row = json.loads((output / "eval_history.jsonl").read_text())
+            self.assertEqual(
+                set(row["benchmarks"]),
+                {"MATH-500", "AIME24", "GPQA-Diamond", "AMC23"},
+            )
+            self.assertEqual(row["benchmarks"]["MATH-500"]["accuracy"], 0.51)
+
 
 if __name__ == "__main__":
     unittest.main()

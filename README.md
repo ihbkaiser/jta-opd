@@ -44,6 +44,8 @@ Có thể đổi ở launch time bằng `STORAGE_ROOT=/mount/khac`. Các path t�
 | MATH-500 | `nlp/minhpn19/data/eval/math500` |
 | AIME 2024 | `nlp/minhpn19/data/eval/aime24` |
 | AIME 2025 | `nlp/minhpn19/data/eval/aime25` |
+| GPQA-Diamond | `nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl` |
+| AMC23 | `nlp/minhpn19/data/amc23/test-00000-of-00001.parquet` |
 
 Không cần sửa YAML khi đổi cặp model hoặc train dataset. Đầu mỗi launcher có block `USER CONFIG`
 và nhận `TEACHER_MODEL`, `STUDENT_MODEL`, `TRAIN_DATA`, `PROMPT_KEY`; các tên legacy vẫn tương thích.
@@ -216,7 +218,8 @@ chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để ev
 lưu và thay thế lịch sử/file eval cũ, dùng `scripts/reeval_all_checkpoints_b200.sh`; để chỉ chạy một
 method, dùng `scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]`. Lệnh dry-run/chạy thật
 nằm trong `RUN_B200.md`.
-1.060 problem trên Competition-MATH test, MATH-500, AIME24 và AIME25 tạo đúng 16.960 responses.
+Các benchmark Competition-MATH test, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23
+được đánh giá theo đúng `num_responses` đã cấu hình.
 Step-0 base thường được generate một lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng.
 Khi các run được đánh giá độc lập, biểu đồ kiểm tra Step-0 của Competition-MATH và MATH-500
 với dung sai tối đa một điểm phần trăm; AIME không là điều kiện kiểm tra. Đường Base dùng
@@ -260,7 +263,7 @@ Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_
 cho avg@16, loss, TA score distribution, Bellman-RAC `g/V/w`, CMT support/excess diagnostics,
 và mean alignment/V/weight. `plot_training_progress.sh` hỗ trợ
 `PLOT_METHODS='opd ta rac pgt cmt'` với một hoặc nhiều method.
-Một method tạo bốn đường Competition-MATH/MATH-500/AIME24/AIME25; từ hai method trở lên tạo bốn subplot benchmark,
+Một method tạo sáu đường benchmark (thêm GPQA-Diamond và AMC23); từ hai method trở lên tạo sáu subplot benchmark,
 mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn tương thích và có nghĩa TA+RAC.
 
 ## Validation

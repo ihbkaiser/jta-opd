@@ -198,7 +198,7 @@ training_evaluation:
   interval_steps: 50
   eval_at_start: true
   eval_at_end: true
-  benchmark_names: [Competition-MATH, MATH-500, AIME24, AIME25]
+  benchmark_names: [Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond, AMC23]
   # Used only by the Hugging Face fallback backend.
   batch_size: 1
   max_new_tokens: 7168
@@ -271,6 +271,20 @@ evaluation:
       path: nlp/minhpn19/data/eval/aime24
     AIME25:
       path: nlp/minhpn19/data/eval/aime25
+    GPQA-Diamond:
+      task_type: gpqa
+      path: nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl
+      question_key: Question
+      answer_key: Correct Answer
+      # Canonical GPQA exports use these four columns. The loader also accepts
+      # a JSON ``choices`` list when present.
+      choice_keys: [Correct Answer, Incorrect Answer 1, Incorrect Answer 2, Incorrect Answer 3]
+      choice_shuffle_seed: 1234
+    AMC23:
+      task_type: math
+      path: nlp/minhpn19/data/amc23/test-00000-of-00001.parquet
+      question_key: problem
+      answer_key: answer
 
 plotting:
   smoothing_window: 10

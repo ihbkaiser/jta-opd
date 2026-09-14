@@ -352,7 +352,10 @@ Nếu truyền `OUTPUT_DIR` thứ ba, artifact vẫn được ghi vào thư mụ
 chuẩn, history của run vẫn được cập nhật. Chạy lại cùng checkpoint sẽ thay row `(step, method)`
 hiện có, không tạo duplicate.
 
-Mỗi thư mục eval chứa `summary.json`, bốn file `*_predictions.jsonl.gz`, và file gộp
+Mỗi thư mục eval chứa `summary.json`, sáu file `*_predictions.jsonl.gz` (Competition-MATH,
+MATH-500, AIME24, AIME25, GPQA-Diamond, AMC23). AMC23 dùng parquet
+`nlp/minhpn19/data/amc23/test-00000-of-00001.parquet` (cột `problem`, `answer`) và
+cùng math prompt/verifier với các benchmark toán khác. File gộp
 `model_outputs_detailed.jsonl.gz`. File gộp lưu dataset, ID, đề bài, đáp án chuẩn, prompt thực tế,
 toàn bộ response, đúng/sai từng response và generation parameters. Đọc nhanh bằng:
 
@@ -360,12 +363,21 @@ toàn bộ response, đúng/sai từng response và generation parameters. Đọ
 gzip -cd outputs/my_opd_run/opd/checkpoint_eval/checkpoint-000050/model_outputs_detailed.jsonl.gz | less
 ```
 
-Eval một RAC checkpoint trên full Competition-MATH/MATH-500/AIME24/AIME25:
+Eval một RAC checkpoint trên đủ sáu benchmark Competition-MATH/MATH-500/AIME24/AIME25/
+GPQA-Diamond/AMC23:
 
 ```bash
 RUN_NAME="$RAC_RUN_NAME" \
 RAC_CHECKPOINT="outputs/$RAC_RUN_NAME/rac_opd/checkpoint-000100" \
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_rac_b200.sh
+```
+
+Để bổ sung chỉ GPQA-Diamond và AMC23 vào history của một checkpoint cũ:
+
+```bash
+EVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+  bash scripts/eval_checkpoint_b200.sh rac \
+  outputs/my_rac_run/rac_opd/checkpoint-000100
 ```
 
 Eval Base, OPD, TA và RAC final rồi aggregate:
@@ -489,7 +501,7 @@ TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_NAME" \
   bash scripts/plot_training_progress.sh --plot-name ta_vs_rac
 ```
 
-Vẽ riêng một phương pháp để báo cáo, với bốn đường Competition-MATH/MATH-500/AIME24/AIME25 trong cùng một ảnh:
+Vẽ riêng một phương pháp để báo cáo, với sáu đường benchmark trong cùng một ảnh:
 
 ```bash
 RUN_NAME="$OPD_RUN_NAME" PLOT_METHODS=opd \

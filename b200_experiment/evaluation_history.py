@@ -77,6 +77,46 @@ def _upsert_rows(
     return output
 
 
+def _merge_history_entry(
+    rows: list[dict[str, Any]],
+    replacement: dict[str, Any],
+    *,
+    step: int,
+    method: str,
+) -> list[dict[str, Any]]:
+    """Upsert one checkpoint while preserving benchmarks absent from a partial run."""
+    output: list[dict[str, Any]] = []
+    replaced = False
+    for row in rows:
+        if not _same_key(row, step, method):
+            output.append(row)
+            continue
+        if replaced:
+            continue
+        if not isinstance(row.get("benchmarks"), dict):
+            output.append(replacement)
+            replaced = True
+            continue
+        merged = dict(row)
+        merged["benchmarks"] = {
+            **dict(row.get("benchmarks", {})),
+            **dict(replacement.get("benchmarks", {})),
+        }
+        # Runtime metadata describes the protocol used for this write. The
+        # per-benchmark metric remains authoritative when a suite is merged.
+        for key in (
+            "max_steps", "backend", "evaluation_time", "base_cache_status",
+            "parameters", "details", "model_role",
+        ):
+            if key in replacement:
+                merged[key] = replacement[key]
+        output.append(merged)
+        replaced = True
+    if not replaced:
+        output.append(replacement)
+    return output
+
+
 def _atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(path)
@@ -220,7 +260,7 @@ def record_checkpoint_evaluation(
     )
 
     history_path = run_output / "eval_history.jsonl"
-    history_rows = _upsert_rows(
+    history_rows = _merge_history_entry(
         _read_jsonl(history_path), entry, step=step, method=method
     )
     _atomic_write_jsonl(history_path, history_rows)

@@ -45,6 +45,15 @@ ARGS=(
   --seed "${REEVAL_SEED:-1234}"
   --base-cache-dir "${REEVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 )
+if [[ -n "${REEVAL_BENCHMARKS:-}" ]]; then
+  BENCHMARK_INPUT="${REEVAL_BENCHMARKS//,/ }"
+  read -r -a BENCHMARK_LIST <<< "${BENCHMARK_INPUT}"
+  if (( ${#BENCHMARK_LIST[@]} == 0 )); then
+    echo "REEVAL_BENCHMARKS must contain at least one benchmark" >&2
+    exit 2
+  fi
+  ARGS+=(--benchmarks "${BENCHMARK_LIST[@]}")
+fi
 if [[ -n "${REEVAL_WORLD_SIZE:-}" ]]; then
   ARGS+=(--world-size "${REEVAL_WORLD_SIZE}")
 fi

@@ -52,6 +52,7 @@ from .evaluation import (
     evaluate_loaded_suite,
     evaluation_metric_name,
     load_benchmark,
+    render_evaluation_prompt,
 )
 from .evaluation_cache import (
     base_evaluation_cache_key,
@@ -66,7 +67,6 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import load_models, load_student_tokenizer, validate_shared_tokenizer_protocol
-from .math_prompts import render_math_prompt
 from .fsdp import (
     clip_grad_norm,
     distributed_strategy,
@@ -2329,8 +2329,8 @@ def run_training(
         )
         if not evaluation_records:
             raise ValueError(f"Configured evaluation benchmark {first_benchmark} is empty")
-        rendered_eval_prompt = render_math_prompt(
-            tokenizer, evaluation_records[0]["problem"], config["data"]
+        rendered_eval_prompt = render_evaluation_prompt(
+            tokenizer, evaluation_records[0], config
         )
         tqdm.write(f"Fully rendered TRAIN prompt:\n{rendered_train_prompt}")
         tqdm.write(

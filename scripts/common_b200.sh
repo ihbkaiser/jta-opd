@@ -417,6 +417,21 @@ build_training_args() {
       --set "training.length_bucketed_micro_batches=${LENGTH_BUCKETED_MICRO_BATCHES:-true}"
     )
   fi
+  if [[ -n "${TRAIN_EVAL_BENCHMARKS:-}" ]]; then
+    # Accept comma- or space-separated names while keeping YAML quoting safe.
+    benchmark_input="${TRAIN_EVAL_BENCHMARKS//,/ }"
+    read -r -a benchmark_values <<< "${benchmark_input}"
+    if (( ${#benchmark_values[@]} == 0 )); then
+      echo "TRAIN_EVAL_BENCHMARKS must contain at least one benchmark" >&2
+      return 1
+    fi
+    benchmark_yaml="["
+    for benchmark_name in "${benchmark_values[@]}"; do
+      benchmark_yaml+="'${benchmark_name}',"
+    done
+    benchmark_yaml="${benchmark_yaml%,}]"
+    COMMON_TRAIN_ARGS+=(--set "training_evaluation.benchmark_names=${benchmark_yaml}")
+  fi
   if [[ -n "${TRAIN_EVAL_TARGET:-}" ]]; then
     COMMON_TRAIN_ARGS+=(
       --set "training_evaluation.target_evaluations=${TRAIN_EVAL_TARGET}"

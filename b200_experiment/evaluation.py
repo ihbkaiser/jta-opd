@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import json
 import math
+import random
 import re
 from pathlib import Path
 from typing import Any
@@ -18,7 +20,71 @@ from .math_prompts import render_math_prompt
 
 transformers_logging.disable_progress_bar()
 
-BENCHMARK_ORDER = ("Competition-MATH", "MATH-500", "AIME24", "AIME25")
+BENCHMARK_ORDER = (
+    "Competition-MATH",
+    "MATH-500",
+    "AIME24",
+    "AIME25",
+    "GPQA-Diamond",
+    "AMC23",
+)
+EXTENDED_BENCHMARK_SPECS: dict[str, dict[str, Any]] = {
+    "GPQA-Diamond": {
+        "task_type": "gpqa",
+        "path": "nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl",
+        "question_key": "Question",
+        "answer_key": "Correct Answer",
+        "choice_keys": [
+            "Correct Answer",
+            "Incorrect Answer 1",
+            "Incorrect Answer 2",
+            "Incorrect Answer 3",
+        ],
+        "choice_shuffle_seed": 1234,
+    },
+    "AMC23": {
+        # AMC23 is a standard exact-answer math benchmark.  Keep the original
+        # parquet probabilities/columns and use the same math renderer and
+        # verifier as the other math benchmarks.
+        "task_type": "math",
+        "path": "nlp/minhpn19/data/amc23/test-00000-of-00001.parquet",
+        "question_key": "problem",
+        "answer_key": "answer",
+    },
+}
+
+
+def ensure_extended_benchmark_specs(config: dict[str, Any]) -> dict[str, Any]:
+    """Backfill new benchmark specs into old resolved run configurations.
+
+    Checkpoints created before GPQA/AMC23 support have a four-benchmark
+    ``resolved_config.yaml``. Re-evaluation should be able to request the new
+    datasets without rewriting that historical file, so the defaults are
+    materialized in-memory relative to its storage root.
+    """
+    evaluation = config.setdefault("evaluation", {})
+    specs = evaluation.setdefault("benchmarks", {})
+    root = Path(config.get("paths", {}).get("storage_root", "/workspace/storage-shared"))
+    for name, default in EXTENDED_BENCHMARK_SPECS.items():
+        if name in specs:
+            continue
+        spec = json.loads(json.dumps(default))
+        path = Path(spec["path"])
+        spec["path"] = str(path if path.is_absolute() else root / path)
+        specs[name] = spec
+    # Migrate historical resolved configs in memory.  Older runs may have
+    # persisted IFEval in ``benchmark_names``; the benchmark is intentionally
+    # replaced by AMC23 for all future evaluations without rewriting the
+    # checkpoint's immutable resolved_config.yaml.
+    for section_name in ("evaluation", "training_evaluation"):
+        section = config.setdefault(section_name, {})
+        names = section.get("benchmark_names")
+        if isinstance(names, (list, tuple)):
+            section["benchmark_names"] = [
+                "AMC23" if str(name).casefold() == "ifeval" else name
+                for name in names
+            ]
+    return config
 MODEL_ORDER = ("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD")
 
 
@@ -27,10 +93,11 @@ def configured_benchmark_names(
 ) -> tuple[str, ...]:
     """Return a validated canonical benchmark subset for this resolved config."""
     specs = config.get("evaluation", {}).get("benchmarks", {})
-    names = (
-        tuple(requested)
-        if requested is not None
-        else tuple(name for name in BENCHMARK_ORDER if name in specs)
+    configured = config.get("evaluation", {}).get("benchmark_names")
+    names = tuple(requested) if requested is not None else tuple(
+        configured
+        if configured is not None
+        else (name for name in BENCHMARK_ORDER if name in specs)
     )
     if not names:
         raise ValueError("Evaluation must configure at least one benchmark")
@@ -140,6 +207,7 @@ def detailed_model_output_record(
         "problem_id": row["id"],
         "problem": row["problem"],
         "reference_answer": row["answer"],
+        "metadata": row.get("metadata", {}),
         "rendered_prompt": rendered_prompt,
         "samples_per_problem": samples,
         "problem_score": sum(map(int, correctness)) / max(samples, 1),
@@ -166,6 +234,9 @@ def detailed_model_output_record(
 QUESTION_ALIASES = ("problem", "question", "prompt", "input", "query")
 ANSWER_ALIASES = (
     "answer",
+    "correct_answer",
+    "correct answer",
+    "correctanswer",
     "ground_truth",
     "groundtruth",
     "reference_answer",
@@ -174,6 +245,85 @@ ANSWER_ALIASES = (
     "solution",
 )
 ID_ALIASES = ("id", "index", "sample_id", "unique_id", "uuid")
+
+
+def _benchmark_kind(name: str, spec: dict[str, Any]) -> str:
+    """Return the evaluator schema for one benchmark.
+
+    ``task_type`` is explicit in the shipped config.  The name fallback keeps
+    old resolved configs readable when they are re-evaluated after upgrading.
+    """
+    value = str(spec.get("task_type", spec.get("grader", ""))).strip().lower()
+    if value in {"gpqa", "multiple_choice", "multiple-choice"}:
+        return "gpqa"
+    normalized = _normalized_key(name)
+    if normalized.startswith("gpqa"):
+        return "gpqa"
+    return "math"
+
+
+def _stable_choice_permutation(identifier: str, count: int, seed: int) -> list[int]:
+    digest = hashlib.sha256(f"{seed}:{identifier}".encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    order = list(range(count))
+    rng.shuffle(order)
+    return order
+
+
+def _as_list(value: Any) -> list[Any] | None:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return list(parsed) if isinstance(parsed, list) else None
+    return None
+
+
+def _gpqa_choices(row: dict[str, Any], answer_key: str, spec: dict[str, Any]) -> tuple[list[str], int]:
+    explicit = spec.get("choice_keys")
+    if explicit is not None:
+        if not isinstance(explicit, (list, tuple)) or not explicit:
+            raise ValueError("GPQA choice_keys must be a non-empty list")
+        values = [row.get(str(key)) for key in explicit]
+    else:
+        choices_value = row.get("choices")
+        if choices_value is None:
+            choices_column = next(
+                (key for key in row if _normalized_key(key) == "choices"), None
+            )
+            choices_value = row.get(choices_column) if choices_column else None
+        values = _as_list(choices_value)
+        if values is None:
+            normalized = {_normalized_key(key): key for key in row}
+            incorrect = []
+            for index in range(1, 10):
+                key = normalized.get(f"incorrectanswer{index}")
+                if key is not None:
+                    incorrect.append(key)
+            if not incorrect:
+                # Some exports use answer_0/answer_1/... rather than the
+                # canonical GPQA column names.
+                for index in range(10):
+                    key = normalized.get(f"answer{index}")
+                    if key is not None:
+                        incorrect.append(key)
+            values = [row.get(answer_key), *(row[key] for key in incorrect)]
+        else:
+            values = list(values)
+            if row.get(answer_key) not in values:
+                values.insert(0, row.get(answer_key))
+    if any(value is None or not str(value).strip() for value in values):
+        raise ValueError("GPQA rows must contain a non-empty correct answer and choices")
+    answer = str(row[answer_key]).strip()
+    choices = [str(value).strip() for value in values]
+    try:
+        correct_index = choices.index(answer)
+    except ValueError as error:
+        raise ValueError("GPQA correct answer is absent from choice_keys") from error
+    return choices, correct_index
 
 
 def _plain(value: Any) -> Any:
@@ -258,12 +408,13 @@ def _resolve_column(
 
 def load_benchmark(
     name: str, spec: dict[str, Any]
-) -> tuple[list[dict[str, str]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     file_path = _resolve_benchmark_file(name, spec["path"])
     rows = _read_rows(file_path)
     if not rows:
         raise ValueError(f"{name} is empty: {file_path}")
     columns = list(rows[0])
+    kind = _benchmark_kind(name, spec)
     question_key = _resolve_column(
         columns, spec.get("question_key"), QUESTION_ALIASES, "question"
     )
@@ -276,23 +427,34 @@ def load_benchmark(
         id_key = None
     normalized = []
     for index, row in enumerate(rows):
-        question, answer = row.get(question_key), row.get(answer_key)
-        if (
-            question is None
-            or answer is None
-            or not str(question).strip()
-            or not str(answer).strip()
-        ):
+        question = row.get(question_key)
+        identifier = str(row.get(id_key, index) if id_key else index)
+        if question is None or not str(question).strip():
+            raise ValueError(f"{name} row {index} has an empty question/prompt")
+        answer = row.get(answer_key)
+        if answer is None or not str(answer).strip():
             raise ValueError(f"{name} row {index} has an empty question/answer")
-        normalized.append(
-            {
-                "id": str(row.get(id_key, index) if id_key else index),
-                "problem": str(question),
-                "answer": str(answer),
+        item: dict[str, Any] = {
+            "id": identifier,
+            "problem": str(question),
+            "answer": str(answer),
+        }
+        if kind == "gpqa":
+            choices, correct_index = _gpqa_choices(row, answer_key, spec)
+            # Deterministic choice shuffling avoids putting the correct option
+            # in a fixed position while keeping HF/vLLM and every re-evaluation
+            # byte-for-byte comparable.
+            shuffle_seed = int(spec.get("choice_shuffle_seed", 0))
+            order = _stable_choice_permutation(identifier, len(choices), shuffle_seed)
+            item["metadata"] = {
+                "task_type": "gpqa",
+                "choices": [choices[position] for position in order],
+                "correct_choice": order.index(correct_index),
             }
-        )
+        normalized.append(item)
     schema = {
         "benchmark": name,
+        "task_type": kind,
         "file": str(file_path),
         "format": file_path.suffix.lower().lstrip("."),
         "rows": len(rows),
@@ -301,7 +463,16 @@ def load_benchmark(
         "answer_key": answer_key,
         "id_key": id_key,
         "examples": [
-            {"id": row["id"], "problem": row["problem"][:500], "answer": row["answer"]}
+            {
+                "id": row["id"],
+                "problem": row["problem"][:500],
+                "answer": row["answer"],
+                **(
+                    {"metadata": row["metadata"]}
+                    if row.get("metadata", {}).get("task_type") == "gpqa"
+                    else {}
+                ),
+            }
             for row in normalized[:3]
         ],
     }
@@ -366,6 +537,77 @@ def _grade(response: str, answer: str) -> bool:
         return normalized(response) == normalized(answer)
 
 
+def render_evaluation_prompt(
+    tokenizer,
+    row: dict[str, Any],
+    config: dict[str, Any],
+) -> str:
+    """Render a benchmark-aware prompt using the same chat template everywhere."""
+    metadata = row.get("metadata", {})
+    task_type = metadata.get("task_type", "math")
+    if task_type == "gpqa":
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        choices = metadata.get("choices", [])
+        if not choices:
+            raise ValueError(f"GPQA row {row.get('id')} has no choices")
+        choice_text = "\n".join(
+            f"{labels[index]}. {choice}" for index, choice in enumerate(choices)
+        )
+        problem = (
+            f"{row['problem'].strip()}\n\n"
+            "Choose the single best answer from the options below. "
+            "Reply with the option letter (A, B, C, or D) and optionally a brief explanation.\n"
+            f"{choice_text}"
+        )
+        messages = [{"role": "user", "content": problem}]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **dict(config["data"].get("chat_template_kwargs", {})),
+        )
+    return render_math_prompt(tokenizer, row["problem"], config["data"])
+
+
+def _normalize_answer_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", str(value)).strip().casefold()
+    return re.sub(r"[\s\.,;:$]+", "", value)
+
+
+def _grade_gpqa(response: str, row: dict[str, Any]) -> bool:
+    metadata = row.get("metadata", {})
+    choices = [str(item) for item in metadata.get("choices", [])]
+    correct_index = metadata.get("correct_choice")
+    if not choices or correct_index is None:
+        return False
+    answer = str(row.get("answer", ""))
+    normalized_response = _normalize_answer_text(response)
+    if _normalize_answer_text(answer) == normalized_response:
+        return True
+    # Prefer an explicit final answer marker, then accept the last standalone
+    # option letter. This handles both terse "B" and explained responses.
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    matches = re.findall(
+        r"(?:final\s+answer|answer|option|choice)\s*(?:is|:)?\s*\(?([A-Z])\)?\b",
+        response,
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        matches = re.findall(r"\b([A-Z])\b", response.upper())
+    return bool(matches) and labels.find(matches[-1].upper()) == int(correct_index)
+
+
+def grade_evaluation_response(
+    response: str, row: dict[str, Any], benchmark: str | None = None
+) -> bool:
+    task_type = row.get("metadata", {}).get("task_type")
+    if task_type is None and benchmark is not None:
+        task_type = _benchmark_kind(benchmark, {})
+    if task_type == "gpqa":
+        return _grade_gpqa(response, row)
+    return _grade(response, str(row.get("answer", "")))
+
+
 @torch.inference_mode()
 def evaluate_loaded_suite(
     model,
@@ -377,6 +619,7 @@ def evaluate_loaded_suite(
     runtime_settings: dict[str, Any] | None = None,
 ):
     """Evaluate an already-loaded model without changing its training/RNG state."""
+    ensure_extended_benchmark_specs(config)
     device = next(model.parameters()).device
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -465,7 +708,7 @@ def evaluate_loaded_suite(
                     )
                     batch = records[begin : begin + batch_size]
                     prompts = [
-                        render_math_prompt(tokenizer, row["problem"], config["data"])
+                        render_evaluation_prompt(tokenizer, row, config)
                         for row in batch
                     ]
                     if prompts and not logged_eval_prompt:
@@ -507,7 +750,8 @@ def evaluate_loaded_suite(
                             begin_response : begin_response + samples_per_problem
                         ]
                         correctness = [
-                            _grade(response, row["answer"]) for response in responses
+                            grade_evaluation_response(response, row, benchmark)
+                            for response in responses
                         ]
                         correct_generations += sum(map(int, correctness))
                         graded_generations += samples_per_problem
@@ -599,6 +843,7 @@ def evaluate_suite(
     config: dict[str, Any],
     output_dir: str | Path,
 ):
+    ensure_extended_benchmark_specs(config)
     if model_name not in MODEL_ORDER:
         raise ValueError(f"Model name must be one of {MODEL_ORDER}, got {model_name!r}")
     if not torch.cuda.is_available():
@@ -666,6 +911,10 @@ def aggregate_evaluations(
         result = json.loads(source.read_text(encoding="utf-8"))
         details[model_name] = result
         current_names = tuple(result.get("benchmarks", {}))
+        # Ignore the retired IFEval entry when aggregating historical summaries;
+        # never reinterpret its score as AMC23.  New summaries contain AMC23
+        # and therefore pass through unchanged.
+        current_names = tuple(name for name in current_names if name != "IFEval")
         unknown = set(current_names) - set(BENCHMARK_ORDER)
         canonical = tuple(name for name in BENCHMARK_ORDER if name in current_names)
         if not current_names or unknown or current_names != canonical:

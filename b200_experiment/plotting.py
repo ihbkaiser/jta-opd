@@ -159,10 +159,12 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
     if not rows:
         raise ValueError(f"{spec['label']} evaluation history is empty: {history_path}")
     rows.sort(key=lambda row: int(row["step"]))
-    expected_benchmarks: tuple[str, ...] | None = None
     for row in rows:
         reported = row.get("benchmarks", {})
-        unknown = set(reported) - set(BENCHMARK_ORDER)
+        # Histories produced by the previous release can still contain an
+        # IFEval result.  It is intentionally ignored (never relabelled as
+        # AMC23) so replacing the benchmark does not make old plots unreadable.
+        unknown = set(reported) - set(BENCHMARK_ORDER) - {"IFEval"}
         benchmark_names = tuple(
             benchmark for benchmark in BENCHMARK_ORDER if benchmark in reported
         )
@@ -170,13 +172,6 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
             raise ValueError(
                 f"{spec['label']} evaluation at step {row.get('step')} has invalid "
                 f"benchmarks: {tuple(reported)}"
-            )
-        if expected_benchmarks is None:
-            expected_benchmarks = benchmark_names
-        elif benchmark_names != expected_benchmarks:
-            raise ValueError(
-                f"{spec['label']} evaluation history mixes benchmark sets: "
-                f"{expected_benchmarks} vs {benchmark_names}"
             )
         missing = [
             benchmark
@@ -194,8 +189,10 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
 def _shared_history_benchmarks(histories: dict[str, list[dict]]) -> tuple[str, ...]:
     shared: tuple[str, ...] | None = None
     for method, rows in histories.items():
-        reported = rows[0]["benchmarks"]
-        current = tuple(name for name in BENCHMARK_ORDER if name in reported)
+        available = set(BENCHMARK_ORDER)
+        for row in rows:
+            available.intersection_update(row.get("benchmarks", {}))
+        current = tuple(name for name in BENCHMARK_ORDER if name in available)
         if shared is None:
             shared = current
         elif current != shared:
@@ -403,21 +400,28 @@ def _plot_single_method_accuracy(
         "MATH-500": "tab:blue",
         "AIME24": "tab:orange",
         "AIME25": "tab:green",
+        "GPQA-Diamond": "tab:brown",
+        "AMC23": "tab:pink",
     }
     line_styles = {
         "Competition-MATH": ":",
         "MATH-500": "-",
         "AIME24": "--",
         "AIME25": "-.",
+        "GPQA-Diamond": (0, (3, 1, 1, 1)),
+        "AMC23": (0, (5, 2)),
     }
-    steps = [int(row["step"]) for row in rows]
     fig, axis = plt.subplots(figsize=(9, 5.5))
     accuracy_values: list[float] = []
     for benchmark in benchmark_names:
-        values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
+        available = [row for row in rows if benchmark in row.get("benchmarks", {})]
+        values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in available]
+        benchmark_steps = [int(row["step"]) for row in available]
+        if not values:
+            continue
         accuracy_values.extend(values)
         axis.plot(
-            steps,
+            benchmark_steps,
             values,
             color=colors[benchmark],
             linestyle=line_styles[benchmark],

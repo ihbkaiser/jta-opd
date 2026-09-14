@@ -9,7 +9,12 @@ from pathlib import Path
 
 from .autotune import run_batch_autotune
 from .config import apply_overrides, load_with_overlays, resolve_runtime_paths, save_config
-from .evaluation import aggregate_evaluations, configured_benchmark_names, evaluate_suite
+from .evaluation import (
+    aggregate_evaluations,
+    configured_benchmark_names,
+    ensure_extended_benchmark_specs,
+    evaluate_suite,
+)
 from .evaluation_history import record_checkpoint_evaluation
 from .plotting import plot_results, plot_training_progress
 from .preflight import run_preflight
@@ -135,7 +140,12 @@ def _record_standalone_history(
 
 
 def _evaluate_checkpoint(args) -> dict:
-    config = _configured(args)
+    config = ensure_extended_benchmark_specs(_configured(args))
+    if getattr(args, "benchmarks", None):
+        # A partial re-evaluation (for example only GPQA-Diamond + AMC23)
+        # changes the requested suite without mutating the resolved training
+        # configuration on disk.
+        config.setdefault("evaluation", {})["benchmark_names"] = list(args.benchmarks)
     started = time.perf_counter()
     if str(config.get("evaluation", {}).get("backend", "hf")).lower() != "vllm":
         suite = evaluate_suite(args.name, args.model, config, args.output)
@@ -222,6 +232,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--model", required=True)
     evaluate.add_argument("--output", required=True)
+    evaluate.add_argument(
+        "--benchmarks",
+        nargs="+",
+        help=(
+            "Optional canonical benchmark subset. Useful for partial re-evaluation; "
+            "the selected results are merged into the existing history."
+        ),
+    )
     evaluate.add_argument(
         "--history-run-output",
         help=(

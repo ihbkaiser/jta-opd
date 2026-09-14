@@ -122,6 +122,20 @@ if [[ -n "${HISTORY_RUN_OUTPUT}" ]]; then
   )
 fi
 
+BENCHMARK_ARGS=()
+if [[ -n "${EVAL_BENCHMARKS:-}" ]]; then
+  BENCHMARK_INPUT="${EVAL_BENCHMARKS//,/ }"
+  read -r -a BENCHMARK_LIST <<< "${BENCHMARK_INPUT}"
+  if (( ${#BENCHMARK_LIST[@]} == 0 )); then
+    echo "EVAL_BENCHMARKS must contain at least one benchmark" >&2
+    exit 2
+  fi
+  BENCHMARK_ARGS=(--benchmarks "${BENCHMARK_LIST[@]}")
+  echo "Benchmarks: ${BENCHMARK_LIST[*]}"
+else
+  echo "Benchmarks: all configured benchmarks"
+fi
+
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --config "${METHOD_CONFIG}" \
@@ -129,6 +143,7 @@ exec "${PYTHON_BIN}" -m b200_experiment.cli evaluate \
   --name "${MODEL_NAME}" \
   --model "${CHECKPOINT_PATH}" \
   --output "${EVAL_OUTPUT}" \
+  "${BENCHMARK_ARGS[@]}" \
   --set "paths.storage_root=${STORAGE_ROOT}" \
   --set "evaluation.backend=${EVAL_BACKEND:-vllm}" \
   --set "evaluation.temperature=${EVAL_TEMPERATURE:-1.0}" \

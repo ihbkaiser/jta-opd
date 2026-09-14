@@ -19,14 +19,15 @@ from transformers import AutoTokenizer
 from .config import load_config
 from .distributed import isolate_distributed_subprocess_environment
 from .evaluation import (
-    _grade,
     configured_benchmark_names,
     detailed_model_output_record,
     evaluation_metric_name,
+    ensure_extended_benchmark_specs,
+    grade_evaluation_response,
     load_benchmark,
     metric_problem_score,
+    render_evaluation_prompt,
 )
-from .math_prompts import render_math_prompt
 
 
 def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
@@ -86,7 +87,9 @@ def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
 
 
 def _prompt(tokenizer, problem: str, config: dict[str, Any]) -> str:
-    return render_math_prompt(tokenizer, problem, config["data"])
+    # Kept for callers that use the historical helper directly. New code
+    # renders the complete normalized row so GPQA/AMC23 metadata is retained.
+    return render_evaluation_prompt(tokenizer, {"problem": problem, "metadata": {}}, config)
 
 
 def evaluate_vllm_suite(
@@ -100,6 +103,7 @@ def evaluate_vllm_suite(
     # initialized vLLM/CUDA runtime.
     from vllm import LLM, SamplingParams
 
+    ensure_extended_benchmark_specs(config)
     model_path = Path(model_path).resolve()
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +135,7 @@ def evaluate_vllm_suite(
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     loaded: dict[str, tuple[list[dict[str, str]], dict[str, Any]]] = {}
     prompts: list[str] = []
-    prompt_rows: list[tuple[str, dict[str, str], str]] = []
+    prompt_rows: list[tuple[str, dict[str, Any], str]] = []
     for benchmark in benchmark_names:
         records, schema = load_benchmark(
             benchmark, config["evaluation"]["benchmarks"][benchmark]
@@ -146,7 +150,7 @@ def evaluate_vllm_suite(
             ]
         loaded[benchmark] = (records, schema)
         for row in records:
-            rendered_prompt = _prompt(tokenizer, row["problem"], config)
+            rendered_prompt = render_evaluation_prompt(tokenizer, row, config)
             prompts.append(rendered_prompt)
             prompt_rows.append((benchmark, row, rendered_prompt))
 
@@ -259,7 +263,8 @@ def evaluate_vllm_suite(
                 with gzip.open(prediction_path, "wt", encoding="utf-8") as handle:
                     for row, rendered_prompt, responses in grouped[benchmark]:
                         correctness = [
-                            _grade(response, row["answer"]) for response in responses
+                            grade_evaluation_response(response, row, benchmark)
+                            for response in responses
                         ]
                         correct += sum(map(int, correctness))
                         graded += samples_per_problem

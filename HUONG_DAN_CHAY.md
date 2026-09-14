@@ -326,6 +326,19 @@ EVAL_LIMIT=20 EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
 
 ### Eval một checkpoint bất kỳ
 
+Mặc định mỗi lần train/eval mới dùng đủ **6 benchmark** theo thứ tự:
+`Competition-MATH`, `MATH-500`, `AIME24`, `AIME25`, `GPQA-Diamond`, `AMC23`.
+GPQA-Diamond đọc từ `nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl` và dùng
+các cột `Question`, `Correct Answer`, `Incorrect Answer 1/2/3`; AMC23 đọc từ
+`nlp/minhpn19/data/amc23/test-00000-of-00001.parquet`, dùng cột `problem` và `answer`,
+và được render/chấm bằng cùng math prompt/verifier như các benchmark toán còn lại.
+GPQA được xáo trộn đáp án một cách deterministic để tránh thiên lệch vị trí. Các lần
+train mới vì vậy sẽ
+tự ghi thêm hai cột/biểu đồ này mà không thay đổi protocol của bốn bộ cũ.
+Muốn debug nhanh chỉ hai bộ mới trong lúc train (không khuyến nghị cho comparison
+chính), thêm `TRAIN_EVAL_BENCHMARKS="GPQA-Diamond,AMC23"`; mặc định biến này bỏ
+trống để luôn chạy đủ sáu bộ.
+
 ```bash
 EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
   bash scripts/eval_checkpoint_b200.sh cmt \
@@ -349,6 +362,44 @@ EVAL_NUM_RESPONSES=8 EVAL_METRIC=pass@8 EVAL_TEMPERATURE=0.7 \
 
 Chạy lại cùng lệnh cho cùng checkpoint sẽ thay đúng row `(step, method)` trong
 `eval_history.jsonl`, không tạo bản ghi trùng.
+
+Chỉ re-evaluate hai benchmark mới cho một checkpoint (bốn benchmark cũ vẫn giữ nguyên
+trong `eval_history.jsonl` và `eval_metrics.csv`):
+
+```bash
+EVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+EVAL_NUM_RESPONSES=16 EVAL_METRIC=avg@16 EVAL_TEMPERATURE=0.7 \
+  bash scripts/eval_checkpoint_b200.sh cmt \
+  "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100"
+```
+
+Re-evaluate **toàn bộ checkpoint** của một run chỉ với hai bộ mới:
+
+```bash
+REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+REEVAL_NUM_RESPONSES=16 REEVAL_METRIC=avg@16 \
+CUDA_VISIBLE_DEVICES=0,1 REEVAL_WORLD_SIZE=2 \
+  bash scripts/reeval_method_checkpoints_b200.sh cmt "$CMT_RUN_NAME"
+```
+
+Các run tạo trước khi cập nhật (resolved config chỉ có 4 bộ) cũng chạy được: script tự
+bổ sung spec của hai dataset trong bộ nhớ, không sửa `resolved_config.yaml` hay checkpoint.
+
+Lệnh trên merge theo `(step, method, benchmark)`: kết quả cũ của
+`Competition-MATH/MATH-500/AIME24/AIME25` không bị xóa. Chạy lại cùng protocol cho
+cùng checkpoint/benchmark sẽ thay đúng kết quả benchmark đó. Nếu dùng `pass@8`, các
+file metric-specific `eval_history_pass_at_8.jsonl` vẫn được tách như trước.
+Nếu history cũ còn dòng IFEval, plotting chỉ bỏ qua dòng benchmark legacy đó; nó không
+được gán nhãn lại thành AMC23.
+
+Nếu mục tiêu là pass@8 thay vì bổ sung vào history avg@16, chạy biến thể sau; kết quả
+được lưu ở bộ file `*_pass_at_8` riêng và không trộn metric với đường avg@16:
+
+```bash
+REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=pass@8 \
+  bash scripts/reeval_method_checkpoints_b200.sh cmt "$CMT_RUN_NAME"
+```
 
 Với `CUDA_VISIBLE_DEVICES` có nhiều GPU, evaluator tự chia benchmark deterministic thành các
 shard, chạy một vLLM `TP=1` trên mỗi GPU rồi merge lại; với một GPU behavior không đổi. Có thể
@@ -418,6 +469,12 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" \
 RAC_RUN_NAME="$RAC_RUN_NAME" PGT_RUN_NAME="$PGT_RUN_NAME" CMT_RUN_NAME="$CMT_RUN_NAME" \
   bash scripts/plot_training_progress.sh --plot-name all_methods
 ```
+
+Khi các history đã có đủ sáu benchmark, cùng lệnh này tự tạo **6 biểu đồ accuracy**
+(mỗi benchmark một panel), gồm thêm `GPQA-Diamond` và `AMC23`. Để vẽ riêng các run
+đã re-evaluate pass@8, trỏ script tới history pass@8 tương ứng hoặc copy/symlink file
+đó thành `eval_history.jsonl` trong thư mục plot input; plotting không trộn các metric
+khác nhau trong một hình.
 
 Chỉ vẽ CMT:
 

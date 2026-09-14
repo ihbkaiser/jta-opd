@@ -17,6 +17,7 @@ from typing import Any
 from .config import load_config, resolve_runtime_paths
 from .evaluation import (
     configured_benchmark_names,
+    ensure_extended_benchmark_specs,
     evaluation_metric_name,
 )
 from .evaluation_cache import evaluate_or_reuse_base
@@ -100,7 +101,9 @@ def discover_evaluation_targets(
     config_path = run_output / "resolved_config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(f"Missing resolved training config: {config_path}")
-    config = resolve_runtime_paths(load_config(config_path))
+    config = ensure_extended_benchmark_specs(
+        resolve_runtime_paths(load_config(config_path))
+    )
     configured_method = str(config.get("experiment", {}).get("method", "")).lower()
     if configured_method != method:
         raise ValueError(
@@ -322,6 +325,131 @@ def _write_history_atomically(
     metrics_backup.unlink(missing_ok=True)
 
 
+def _read_history_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _read_metric_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _merge_partial_history(
+    existing: list[dict[str, Any]], new_rows: list[dict[str, Any]], method: str
+) -> list[dict[str, Any]]:
+    """Merge re-evaluated benchmark dictionaries by (step, method)."""
+    merged = [dict(row) for row in existing]
+    for replacement in new_rows:
+        step = int(replacement["step"])
+        found = False
+        for index, row in enumerate(merged):
+            if int(row.get("step", -1)) != step or str(row.get("method")) != method:
+                continue
+            if not isinstance(row.get("benchmarks"), dict):
+                merged[index] = replacement
+                found = True
+                break
+            row_copy = dict(row)
+            row_copy["benchmarks"] = {
+                **dict(row.get("benchmarks", {})),
+                **dict(replacement.get("benchmarks", {})),
+            }
+            for key in (
+                "max_steps", "backend", "evaluation_time", "base_cache_status",
+                "parameters", "details", "model_role",
+            ):
+                if key in replacement:
+                    row_copy[key] = replacement[key]
+            merged[index] = row_copy
+            found = True
+            break
+        if not found:
+            merged.append(replacement)
+    return sorted(merged, key=lambda row: (int(row.get("step", 0)), str(row.get("method", ""))))
+
+
+def _merge_partial_metrics(
+    existing: list[dict[str, Any]], new_rows: list[dict[str, Any]], method: str
+) -> list[dict[str, Any]]:
+    keys = {
+        (int(row.get("step", -1)), str(row.get("method", "")), str(row.get("benchmark", "")))
+        for row in new_rows
+    }
+    output = [
+        row
+        for row in existing
+        if (
+            int(row.get("step", -1)),
+            str(row.get("method", "")),
+            str(row.get("benchmark", "")),
+        )
+        not in keys
+    ]
+    output.extend(new_rows)
+    return sorted(output, key=lambda row: (int(row.get("step", 0)), str(row.get("method", "")), str(row.get("benchmark", ""))))
+
+
+def _merge_step_artifacts(
+    staged: Path, destination: Path, suite: dict[str, Any]
+) -> dict[str, Any]:
+    """Preserve old benchmark prediction files when a step is partially re-run."""
+    if not destination.is_dir() or not (destination / "summary.json").is_file():
+        return suite
+    try:
+        old_suite = json.loads((destination / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return suite
+    new_names = set(suite.get("benchmarks", {}))
+    # Copy predictions for benchmarks not present in this partial suite. Their
+    # paths already point at the destination step directory and remain valid.
+    for name, result in old_suite.get("benchmarks", {}).items():
+        if name in new_names:
+            continue
+        prediction_value = result.get("predictions")
+        if not prediction_value:
+            continue
+        prediction = destination / Path(prediction_value).name
+        if prediction.is_file():
+            shutil.copy2(prediction, staged / prediction.name)
+
+    old_detailed_value = old_suite.get("detailed_outputs")
+    new_detailed_value = suite.get("detailed_outputs")
+    if not old_detailed_value or not new_detailed_value:
+        old_detailed = new_detailed = None
+    else:
+        old_detailed = destination / Path(old_detailed_value).name
+        new_detailed = staged / Path(new_detailed_value).name
+    if old_detailed is not None and new_detailed is not None and old_detailed.is_file() and new_detailed.is_file():
+        # Keep old detailed rows for untouched benchmarks and replace rows for
+        # benchmarks that were explicitly re-evaluated.
+        import gzip
+
+        old_rows: list[dict[str, Any]] = []
+        with gzip.open(old_detailed, "rt", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    row = json.loads(line)
+                    if row.get("benchmark") not in new_names:
+                        old_rows.append(row)
+        with gzip.open(new_detailed, "rt", encoding="utf-8") as handle:
+            new_rows = [json.loads(line) for line in handle if line.strip()]
+        with gzip.open(new_detailed, "wt", encoding="utf-8") as handle:
+            for row in (*old_rows, *new_rows):
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    merged = dict(suite)
+    merged["benchmarks"] = {
+        **dict(old_suite.get("benchmarks", {})),
+        **dict(suite.get("benchmarks", {})),
+    }
+    return merged
+
+
 def _runtime_settings(
     config: dict[str, Any], args: argparse.Namespace
 ) -> dict[str, Any]:
@@ -360,7 +488,9 @@ def _runtime_settings(
         "limit": None,
         "benchmark_names": list(
             configured_benchmark_names(
-                config, training_evaluation.get("benchmark_names")
+                config,
+                getattr(args, "benchmarks", None)
+                or training_evaluation.get("benchmark_names"),
             )
         ),
         "vllm": vllm_settings,
@@ -495,6 +625,7 @@ def _reevaluate_method(
                     f"Missing staged detailed outputs: {detailed_outputs}"
                 )
             suite["detailed_outputs"] = str(step_dir / detailed_outputs.name)
+            suite = _merge_step_artifacts(staged, step_dir, suite)
             summary_path.write_text(
                 json.dumps(suite, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
@@ -570,6 +701,15 @@ def _reevaluate_method(
             }
         )
 
+    # Partial benchmark runs must augment, rather than erase, an existing
+    # checkpoint row. This is what lets GPQA/AMC23 be added to histories that
+    # already contain the original four datasets.
+    history = _merge_partial_history(
+        _read_history_rows(history_path), history, method
+    )
+    metric_rows = _merge_partial_metrics(
+        _read_metric_rows(metrics_path), metric_rows, method
+    )
     _write_history_atomically(
         run_output,
         history,
@@ -625,6 +765,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--num-responses", type=int, default=16)
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        help=(
+            "Optional canonical benchmark subset. Existing history rows are merged "
+            "per benchmark, so omitted datasets are preserved."
+        ),
+    )
     parser.add_argument(
         "--metric",
         default=None,
