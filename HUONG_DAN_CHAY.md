@@ -167,6 +167,9 @@ Multi-GPU training-time evaluation yêu cầu `training_evaluation.backend=vllm`
 dùng được cho single-GPU.
 Có thể ghi pass@8 ngay trong periodic evaluation bằng
 `TRAIN_EVAL_NUM_RESPONSES=8 TRAIN_EVAL_METRIC=pass@8`.
+Các launcher `ablation/scripts/train.sh g`, `g_x` và `g_d` mặc định đánh giá đủ
+6 benchmark: Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23.
+Có thể chủ động chạy một subset bằng `TRAIN_EVAL_BENCHMARKS="MATH-500,GPQA-Diamond"`.
 Seed sampling của vLLM trong periodic evaluation được điều khiển riêng bằng
 `TRAIN_EVAL_SEED` (ví dụ `TRAIN_EVAL_SEED=42`); biến này không thay đổi
 `SEED` của optimizer/data hoặc `ROLLOUT_SEED` của student rollout. Nếu không đặt,

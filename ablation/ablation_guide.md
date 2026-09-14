@@ -234,7 +234,9 @@ export PLOT_MODE=epsilon       # arms, epsilon, top_k, lr, diagnostics
 export INPUT_ROOT=ablation/outputs
 export FIGURE_ROOT=ablation/figures
 export PLOT_TAG=qwen14b_4b_epsilon
-export BENCHMARK=MATH-500
+export BENCHMARK=MATH-500       # dùng cho mode hyperparameter (một dataset)
+# dùng cho mode arms (6 panel)
+export BENCHMARKS="Competition-MATH,MATH-500,AIME24,AIME25,GPQA-Diamond,AMC23"
 export METRIC=accuracy
 export AGGREGATE=final          # final hoặc auc
 ```
@@ -265,6 +267,13 @@ PLOT_MODE=top_k bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=lr AGGREGATE=auc bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=diagnostics bash ablation/scripts/plot_ablation.sh
 ```
+
+Ở `PLOT_MODE=arms`, script tạo hai hình multi-panel 2x3, gồm đủ
+Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23:
+`ablation_curves.png` (đường học của `g`, `g_x`, `g_d`) và
+`ablation_final.png` (điểm cuối của ba arm). Có thể chọn một tập con bằng
+`BENCHMARKS="MATH-500,GPQA-Diamond"`. Các mode `epsilon`, `gamma`, `top_k`,
+`lr` vẫn dùng `BENCHMARK` để vẽ một dataset cụ thể.
 
 Mỗi lệnh tạo một thư mục mới dưới `ablation/figures/`, ví dụ
 `ablation/figures/qwen14b_4b_epsilon/`. Nếu `PLOT_TAG` đã tồn tại, launcher tự

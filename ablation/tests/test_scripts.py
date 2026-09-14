@@ -14,6 +14,16 @@ def test_launchers_resolve_paths_from_script_directory():
     train = (ROOT / "scripts/train.sh").read_text(encoding="utf-8")
     assert "MAX_RESPONSE_LEN" in train and "TRAIN_EVAL_MAX_NEW_TOKENS" in train
     assert "TRAIN_EVAL_SEED" in train
+    assert "TRAIN_EVAL_BENCHMARKS" in train
+    for benchmark in (
+        "Competition-MATH",
+        "MATH-500",
+        "AIME24",
+        "AIME25",
+        "GPQA-Diamond",
+        "AMC23",
+    ):
+        assert benchmark in train
     assert "selector.cmt_ablation_arm" in train
 
 
@@ -46,4 +56,6 @@ def test_plot_launcher_uses_a_fresh_named_directory():
     text = (ROOT / "scripts/plot_ablation.sh").read_text(encoding="utf-8")
     assert "FIGURE_ROOT" in text
     assert "PLOT_TAG" in text
+    assert "BENCHMARKS" in text
+    assert "--benchmarks" in text
     assert "date +%Y%m%d_%H%M%S_%N" in text

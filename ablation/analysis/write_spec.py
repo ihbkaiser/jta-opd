@@ -30,6 +30,15 @@ def main() -> int:
         "learning_rate": float(os.environ.get("LR", os.environ.get("LEARNING_RATE", "1e-6"))),
         "train_max_new_tokens": int(os.environ.get("MAX_RESPONSE_LEN", "4096")),
         "eval_max_new_tokens": int(os.environ.get("TRAIN_EVAL_MAX_NEW_TOKENS", "7168")),
+        "eval_seed": int(os.environ.get("TRAIN_EVAL_SEED", "1234")),
+        "eval_benchmarks": [
+            item.strip()
+            for item in os.environ.get(
+                "TRAIN_EVAL_BENCHMARKS",
+                "Competition-MATH,MATH-500,AIME24,AIME25,GPQA-Diamond,AMC23",
+            ).replace(",", " ").split()
+            if item.strip()
+        ],
         "rollout_temperature": float(os.environ.get("ROLLOUT_TEMPERATURE", "1.0")),
         "rollout_top_p": float(os.environ.get("ROLLOUT_TOP_P", "1.0")),
         "student_model": os.environ.get("STUDENT_MODEL", ""),

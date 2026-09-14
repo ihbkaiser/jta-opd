@@ -10,6 +10,10 @@ FIGURE_ROOT="${FIGURE_ROOT:-${OUTPUT_DIR:-${SCRIPT_DIR}/../figures}}"
 # modes: arms, epsilon, gamma, top_k, lr, diagnostics
 export PLOT_MODE="${PLOT_MODE:-arms}"
 export BENCHMARK="${BENCHMARK:-MATH-500}"
+# The arms comparison mirrors the main training plot and shows all six
+# evaluation datasets. Hyperparameter modes keep BENCHMARK for a focused
+# single-dataset plot; BENCHMARKS remains overrideable for partial diagnostics.
+export BENCHMARKS="${BENCHMARKS:-Competition-MATH,MATH-500,AIME24,AIME25,GPQA-Diamond,AMC23}"
 export METRIC="${METRIC:-accuracy}"
 export AGGREGATE="${AGGREGATE:-final}"
 # Either set RUN_NAMES as a space-separated list, or fill these slots below.
@@ -42,7 +46,7 @@ case "${PLOT_MODE}" in
   arms|ablation)
     COMMAND=("${PYTHON_BIN}" "${SCRIPT_DIR}/../plots/plot_ablation.py"
       --input-root "${INPUT_ROOT}" --output-dir "${OUTPUT_DIR}"
-      --benchmark "${BENCHMARK}" --metric "${METRIC}")
+      --benchmarks "${BENCHMARKS}" --metric "${METRIC}")
     ;;
   epsilon|gamma|top_k|lr)
     COMMAND=("${PYTHON_BIN}" "${SCRIPT_DIR}/../plots/plot_hparam.py"

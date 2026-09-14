@@ -44,6 +44,10 @@ export TRAIN_EVAL_INTERVAL="${TRAIN_EVAL_INTERVAL:-50}"
 export TRAIN_EVAL_NUM_RESPONSES="${TRAIN_EVAL_NUM_RESPONSES:-8}"
 export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-0.7}"
 export TRAIN_EVAL_TOP_P="${TRAIN_EVAL_TOP_P:-0.95}"
+# Keep ablation training-time evaluation aligned with the six-benchmark
+# comparison protocol.  This is still overrideable for a deliberately partial
+# diagnostic run (for example TRAIN_EVAL_BENCHMARKS=MATH-500).
+export TRAIN_EVAL_BENCHMARKS="${TRAIN_EVAL_BENCHMARKS:-Competition-MATH,MATH-500,AIME24,AIME25,GPQA-Diamond,AMC23}"
 # Seed riêng cho vLLM evaluation trong lúc train; không thay đổi seed rollout
 # hoặc seed của optimizer/data. Có thể override bằng TRAIN_EVAL_SEED=42.
 export TRAIN_EVAL_SEED="${TRAIN_EVAL_SEED:-1234}"
@@ -83,7 +87,7 @@ cd "${REPO_DIR}"
 if [[ "${ABLATION_DRY_RUN:-false}" == "true" || "${ABLATION_DRY_RUN:-false}" == "1" ]]; then
   echo "Dry run: ${ARM} -> ${OUTPUT_DIR}"
   echo "train_max_new_tokens=${MAX_RESPONSE_LEN} eval_max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS}"
-  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} gamma=${CMT_GAMMA} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P} eval_seed=${TRAIN_EVAL_SEED}"
+  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} gamma=${CMT_GAMMA} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P} eval_seed=${TRAIN_EVAL_SEED} eval_benchmarks=${TRAIN_EVAL_BENCHMARKS}"
   exit 0
 fi
 exec bash "${REPO_DIR}/scripts/train_cmt_b200.sh" \
