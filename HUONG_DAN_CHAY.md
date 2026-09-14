@@ -566,13 +566,21 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
   nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
   ```
 
-  Dừng các process cũ do chính bạn sở hữu hoặc chọn GPU còn trống. Khi chạy nhiều GPU, phải
-  khai báo rõ danh sách GPU; script tự tạo một replica vLLM `TP=1` trên mỗi GPU:
+  Dừng các process cũ do chính bạn sở hữu hoặc chọn GPU còn trống. Các launcher eval/re-eval
+  hiện tự phát hiện và dùng toàn bộ GPU khi `CUDA_VISIBLE_DEVICES` chưa được đặt; nếu muốn
+  giới hạn một GPU hoặc một nhóm GPU thì đặt biến này rõ ràng. Script tự tạo một replica vLLM
+  `TP=1` trên mỗi GPU. Những lệnh eval độc lập cùng trỏ vào một GPU sẽ được xếp hàng bằng
+  filesystem lock, không khởi tạo hai engine chồng lên nhau:
 
   ```bash
   CUDA_VISIBLE_DEVICES=0,1 REEVAL_WORLD_SIZE=2 \
     bash scripts/reeval_pass8_b200.sh cmt "$CMT_RUN_NAME"
   ```
+
+  Sau một lỗi vLLM, launcher cũng dọn cả process group của EngineCore/worker; vì vậy worker
+  mồ côi không còn giữ VRAM cho các lệnh sau. Nếu `nvidia-smi` vẫn cho thấy process training
+  hoặc vLLM khác đang chiếm GPU, không có cách an toàn để ép re-eval dùng chung VRAM đó: hãy
+  chờ tiến trình kết thúc, chọn GPU khác, hoặc giảm workload của tiến trình đang chạy.
 
   Không bọc script re-eval này trong `torchrun`; nó tự quản lý các worker vLLM. Có thể truyền
   `EVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90` (hoặc `REEVAL_VLLM_GPU_MEMORY_UTILIZATION=0.90`) chỉ

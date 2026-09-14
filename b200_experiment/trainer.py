@@ -115,7 +115,10 @@ from .selectors import (
 from .selectors.pgt_selector import PGTOutput
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
 from .tensorboard_logging import TensorBoardLogger
-from .vllm_evaluation import merge_vllm_evaluation_shards
+from .vllm_evaluation import (
+    _terminate_process_group,
+    merge_vllm_evaluation_shards,
+)
 from .vllm_rollout import VLLMRolloutEngine
 
 
@@ -810,36 +813,51 @@ def _evaluate_vllm_subprocess(
     torch.cuda.empty_cache()
     try:
         if abort_path is None:
-            # Preserve the original single-GPU subprocess behavior exactly.
-            subprocess.run(command, cwd=repo_root, env=environment, check=True)
+            # Preserve the original blocking single-GPU behavior while still
+            # retaining a process handle for descendant cleanup on failure.
+            process = subprocess.Popen(
+                command,
+                cwd=repo_root,
+                env=environment,
+                start_new_session=True,
+            )
+            try:
+                return_code = process.wait()
+            except BaseException:
+                _terminate_process_group(process)
+                raise
+            if return_code != 0:
+                # A failed vLLM launcher may leave EngineCore workers alive
+                # even after its own exit.
+                _terminate_process_group(process)
+                raise subprocess.CalledProcessError(return_code, command)
         else:
-            process = subprocess.Popen(command, cwd=repo_root, env=environment)
+            process = subprocess.Popen(
+                command,
+                cwd=repo_root,
+                env=environment,
+                # vLLM creates EngineCore/worker descendants. Keep them in a
+                # dedicated session so abort/timeout cleanup cannot orphan GPU
+                # allocations that break later evaluation.
+                start_new_session=True,
+            )
             started = time.monotonic()
             while process.poll() is None:
                 if abort_path.is_file():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                    _terminate_process_group(process)
                     raise RuntimeError(
                         "Periodic evaluation aborted because another rank "
                         f"reported failure: {abort_path.read_text(encoding='utf-8')}"
                     )
                 if timeout_sec is not None and time.monotonic() - started >= timeout_sec:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                    _terminate_process_group(process)
                     raise TimeoutError(
                         "Periodic evaluation subprocess exceeded the configured "
                         f"filesystem timeout of {timeout_sec:.1f}s"
                     )
                 time.sleep(0.25)
             if process.returncode != 0:
+                _terminate_process_group(process)
                 raise subprocess.CalledProcessError(process.returncode, command)
         return json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
     finally:

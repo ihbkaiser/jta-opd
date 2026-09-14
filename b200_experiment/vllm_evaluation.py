@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gzip
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -28,6 +30,99 @@ from .evaluation import (
     metric_problem_score,
     render_evaluation_prompt,
 )
+
+
+def _terminate_process_group(process: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Terminate a vLLM launcher and all of its engine worker descendants.
+
+    vLLM creates EngineCore/worker processes below the Python launcher. Calling
+    ``Popen.terminate`` on the launcher alone can orphan those children after a
+    failed evaluation, leaving most of a 180-GiB GPU allocated and making the
+    next re-evaluation fail before vLLM starts. Distributed evaluators are
+    launched in their own sessions, so killing the process group is scoped to
+    exactly one evaluation worker.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        if process.poll() is None:
+            process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            if process.poll() is None:
+                process.kill()
+        process.wait()
+
+
+@contextmanager
+def _exclusive_evaluation_gpu_locks(
+    devices: list[str], timeout: float = 24 * 60 * 60
+):
+    """Serialize independent re-evaluations that target the same GPU.
+
+    Separate shell commands commonly inherit the launcher default
+    ``CUDA_VISIBLE_DEVICES=0``. Without a lock, the first vLLM process reserves
+    the GPU and every other command races into the same device. Locks are
+    filesystem based, released automatically if a process crashes, and
+    acquired in sorted device order to avoid deadlocks for multi-GPU masks.
+    """
+    normalized = sorted(
+        {str(device).strip() for device in devices if str(device).strip()},
+        key=lambda value: (0, int(value)) if value.isdigit() else (1, value),
+    )
+    if not normalized:
+        yield
+        return
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Linux production path
+        yield
+        return
+
+    lock_root = Path(
+        os.environ.get(
+            "BELLMANOPD_EVAL_LOCK_DIR",
+            f"/tmp/bellmanopd-vllm-eval-locks-{os.getuid()}",
+        )
+    )
+    lock_root.mkdir(parents=True, exist_ok=True)
+    handles = []
+    started = time.monotonic()
+    announced = False
+    try:
+        for device in normalized:
+            path = lock_root / f"gpu-{device}.lock"
+            handle = path.open("a+")
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not announced:
+                        print(
+                            "Another evaluation is using GPU "
+                            f"{device}; waiting for its vLLM process to exit...",
+                            flush=True,
+                        )
+                        announced = True
+                    if time.monotonic() - started >= timeout:
+                        raise TimeoutError(
+                            f"Timed out after {timeout:.0f}s waiting for evaluation "
+                            f"GPU lock(s) on {','.join(normalized)}"
+                        )
+                    time.sleep(1.0)
+            handles.append(handle)
+        yield
+    finally:
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
 
 def _resolve_gpu_memory_utilization(vllm_settings: dict[str, Any]) -> float:
@@ -92,7 +187,7 @@ def _prompt(tokenizer, problem: str, config: dict[str, Any]) -> str:
     return render_evaluation_prompt(tokenizer, {"problem": problem, "metadata": {}}, config)
 
 
-def evaluate_vllm_suite(
+def _evaluate_vllm_suite_impl(
     model_name: str,
     model_path: str | Path,
     config: dict[str, Any],
@@ -550,7 +645,7 @@ def merge_vllm_evaluation_shards(
     return suite
 
 
-def evaluate_vllm_distributed(
+def _evaluate_vllm_distributed_impl(
     model_name: str,
     model_path: str | Path,
     config: dict[str, Any],
@@ -569,7 +664,7 @@ def evaluate_vllm_distributed(
     if requested_world <= 0:
         raise ValueError("world_size must be a positive integer")
     if requested_world <= 1:
-        return evaluate_vllm_suite(
+        return _evaluate_vllm_suite_impl(
             model_name, model_path, config, output_dir, runtime_settings
         )
     if requested_world > len(devices):
@@ -594,6 +689,11 @@ def evaluate_vllm_distributed(
                 "VLLM_LOGGING_LEVEL", "WARNING"
             )
             environment["PYTHONUNBUFFERED"] = "1"
+            # The parent owns the per-GPU lock for the lifetime of this
+            # distributed evaluation. Child evaluators must not try to lock
+            # the same device again after their inherited file descriptors
+            # are closed by Popen.
+            environment["BELLMANOPD_EVAL_LOCK_HELD"] = "1"
             environment["PYTHONPATH"] = os.pathsep.join(
                 filter(None, (str(repo_root), environment.get("PYTHONPATH", "")))
             )
@@ -623,7 +723,16 @@ def evaluate_vllm_distributed(
                 json.dumps(child_settings),
             ]
             commands.append(command)
-            processes.append(subprocess.Popen(command, cwd=repo_root, env=environment))
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    cwd=repo_root,
+                    env=environment,
+                    # Keep vLLM EngineCore/worker descendants in a dedicated
+                    # process group so failure cleanup cannot orphan GPU users.
+                    start_new_session=True,
+                )
+            )
         timeout = float(runtime_settings.get("sync_timeout_sec", 24 * 60 * 60))
         if timeout <= 0:
             raise ValueError("sync_timeout_sec must be positive")
@@ -641,6 +750,12 @@ def evaluate_vllm_distributed(
                     f"Distributed vLLM evaluation exceeded {timeout:.1f}s"
                 )
             time.sleep(0.25)
+        # A launcher can exit after writing summary.json while an EngineCore
+        # worker is still shutting down. Reap/terminate the dedicated process
+        # groups before releasing the GPU locks, otherwise the next independent
+        # eval can observe stale VRAM usage for a short window.
+        for process in processes:
+            _terminate_process_group(process)
         return merge_vllm_evaluation_shards(
             model_name,
             model_path,
@@ -651,17 +766,101 @@ def evaluate_vllm_distributed(
         )
     except BaseException:
         for process in processes:
-            if process.poll() is None:
-                process.terminate()
-        for process in processes:
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            # Also attempt cleanup for launchers that already exited with an
+            # error: their vLLM EngineCore descendants can outlive the parent.
+            _terminate_process_group(process)
         raise
     finally:
         shutil.rmtree(coordination, ignore_errors=True)
+
+
+def evaluate_vllm_distributed(
+    model_name: str,
+    model_path: str | Path,
+    config: dict[str, Any],
+    output_dir: str | Path,
+    runtime_settings: dict[str, Any],
+    resolved_config_path: str | Path,
+    *,
+    world_size: int | None = None,
+) -> dict[str, Any]:
+    """Run evaluation with exclusive GPU ownership and clean failure teardown.
+
+    The implementation remains one TP=1 child per selected GPU.  The
+    filesystem lock only prevents independent re-evaluation commands from
+    concurrently placing two vLLM engines on the same device; it does not
+    change sampling, sharding, or the evaluation result.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    devices = [item.strip() for item in visible.split(",") if item.strip()]
+    if not devices:
+        devices = [str(index) for index in range(torch.cuda.device_count())]
+    requested_world = int((len(devices) or 1) if world_size is None else world_size)
+    if requested_world <= 0:
+        raise ValueError("world_size must be a positive integer")
+    if requested_world > len(devices):
+        raise ValueError(
+            f"Requested {requested_world} evaluation workers but only "
+            f"{len(devices)} GPUs are visible ({visible!r})"
+        )
+    lock_timeout = float(
+        runtime_settings.get(
+            "gpu_lock_timeout_sec",
+            runtime_settings.get("vllm", {}).get(
+                "gpu_lock_timeout_sec", 24 * 60 * 60
+            ),
+        )
+    )
+    if lock_timeout <= 0:
+        raise ValueError("gpu_lock_timeout_sec must be positive")
+    with _exclusive_evaluation_gpu_locks(devices[:requested_world], lock_timeout):
+        return _evaluate_vllm_distributed_impl(
+            model_name,
+            model_path,
+            config,
+            output_dir,
+            runtime_settings,
+            resolved_config_path,
+            world_size=requested_world,
+        )
+
+
+def evaluate_vllm_suite(
+    model_name: str,
+    model_path: str | Path,
+    config: dict[str, Any],
+    output_dir: str | Path,
+    runtime_settings: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate one vLLM engine while serializing access to its GPU.
+
+    Distributed parent evaluators set ``BELLMANOPD_EVAL_LOCK_HELD`` before
+    spawning their children. Direct single-GPU evaluation and training-time
+    evaluator children acquire the same lock here, preventing independent
+    commands from racing on one device.
+    """
+    if os.environ.get("BELLMANOPD_EVAL_LOCK_HELD") == "1":
+        return _evaluate_vllm_suite_impl(
+            model_name, model_path, config, output_dir, runtime_settings
+        )
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    devices = [item.strip() for item in visible.split(",") if item.strip()]
+    if not devices:
+        devices = [str(index) for index in range(torch.cuda.device_count())]
+    lock_timeout = float(
+        runtime_settings.get(
+            "gpu_lock_timeout_sec",
+            runtime_settings.get("vllm", {}).get(
+                "gpu_lock_timeout_sec", 24 * 60 * 60
+            ),
+        )
+    )
+    if lock_timeout <= 0:
+        raise ValueError("gpu_lock_timeout_sec must be positive")
+    with _exclusive_evaluation_gpu_locks(devices[:1] or devices, lock_timeout):
+        return _evaluate_vllm_suite_impl(
+            model_name, model_path, config, output_dir, runtime_settings
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

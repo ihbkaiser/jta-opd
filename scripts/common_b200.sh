@@ -3,6 +3,19 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+# Evaluation launchers opt into automatic discovery so an unset
+# CUDA_VISIBLE_DEVICES on a multi-GPU node does not silently funnel every
+# independent re-evaluation into physical GPU 0. Training launchers keep their
+# historical explicit defaults and set their mask before sourcing this file.
+if [[ "${B200_EVAL_USE_ALL_GPUS:-false}" =~ ^(1|true|TRUE|yes|YES)$ ]] && [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    _B200_AUTO_GPU_LIST="$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d' | tr -d ' ' | paste -sd, -)"
+    if [[ -n "${_B200_AUTO_GPU_LIST}" ]]; then
+      export CUDA_VISIBLE_DEVICES="${_B200_AUTO_GPU_LIST}"
+      echo "Auto-selected all visible GPUs for evaluation: ${CUDA_VISIBLE_DEVICES}" >&2
+    fi
+  fi
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 export HF_HUB_DISABLE_PROGRESS_BARS=1

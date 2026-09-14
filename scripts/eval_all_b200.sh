@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export B200_EVAL_USE_ALL_GPUS=true
 source "${SCRIPT_DIR}/common_b200.sh"
 
 resolve_run_paths

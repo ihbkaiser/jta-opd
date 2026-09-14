@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export B200_EVAL_USE_ALL_GPUS=true
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common_b200.sh"
 
 usage() {
