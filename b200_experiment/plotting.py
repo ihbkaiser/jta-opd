@@ -221,11 +221,14 @@ def _align_opd_cmt_for_plot(
     """Align OPD/CMT Step-0 points using the requested asymmetric rule.
 
     The raw ``eval_history.jsonl`` files are never modified.  For plotting,
-    when OPD starts above CMT, the OPD-CMT gap is added to every CMT point.  If
-    CMT starts above OPD, only OPD's Step-0 point is lifted.  The shared Base
-    reference is the higher of the two initial values, so the two initial
-    points coincide without inventing a correction for the whole OPD curve in
-    the second case.
+    this rule is applied independently to every benchmark shared by OPD/CMT
+    (including GPQA-Diamond and AMC23): when OPD starts above CMT, the OPD-CMT
+    gap is added to every CMT point.  If CMT starts above OPD, only OPD's
+    Step-0 point is lifted.  The shared Base reference is the higher of the two
+    initial values, so the two initial points coincide without inventing a
+    correction for the whole OPD curve in the second case.  This is separate
+    from the Step-0 consistency gate, which intentionally checks only
+    Competition-MATH and MATH-500.
     """
     opd_label = _PROGRESS_METHODS["opd"]["label"]
     cmt_label = _PROGRESS_METHODS["cmt"]["label"]

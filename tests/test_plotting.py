@@ -38,7 +38,11 @@ class PlottingTests(unittest.TestCase):
 
     @staticmethod
     def _write_training_output(
-        output: Path, accuracy: float, *, base_accuracy: float = 0.1
+        output: Path,
+        accuracy: float,
+        *,
+        base_accuracy: float = 0.1,
+        benchmark_names: tuple[str, ...] = ("MATH-500", "AIME24", "AIME25"),
     ) -> None:
         output.mkdir()
         with (output / "metrics.jsonl").open("w", encoding="utf-8") as handle:
@@ -53,7 +57,7 @@ class PlottingTests(unittest.TestCase):
                             "step": step,
                             "benchmarks": {
                                 name: {"accuracy": value}
-                                for name in ("MATH-500", "AIME24", "AIME25")
+                                for name in benchmark_names
                             },
                         }
                     )
@@ -136,6 +140,90 @@ class PlottingTests(unittest.TestCase):
                 cmt_rows[0]["benchmarks"]["AIME24"]["accuracy"], 0.12
             )
             self.assertAlmostEqual(payload["base_accuracy"]["MATH-500"], 0.12)
+
+    def test_opd_cmt_alignment_applies_to_all_six_benchmarks(self):
+        benchmarks = (
+            "Competition-MATH",
+            "MATH-500",
+            "AIME24",
+            "AIME25",
+            "GPQA-Diamond",
+            "AMC23",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            opd_output = root / "opd"
+            cmt_output = root / "cmt"
+            self._write_training_output(
+                opd_output,
+                0.20,
+                base_accuracy=0.12,
+                benchmark_names=benchmarks,
+            )
+            self._write_training_output(
+                cmt_output,
+                0.30,
+                base_accuracy=0.10,
+                benchmark_names=benchmarks,
+            )
+
+            paths = plot_training_progress(
+                root / "results",
+                opd_output=opd_output,
+                cmt_output=cmt_output,
+                methods=["opd", "cmt"],
+            )
+            payload = json.loads(Path(paths["history_json"]).read_text())
+            cmt_rows = payload["histories"]["CMT-OPD"]
+            for benchmark in benchmarks:
+                self.assertAlmostEqual(
+                    cmt_rows[0]["benchmarks"][benchmark]["accuracy"], 0.12
+                )
+                self.assertAlmostEqual(
+                    cmt_rows[1]["benchmarks"][benchmark]["accuracy"], 0.32
+                )
+
+    def test_opd_cmt_inverse_alignment_only_lifts_opd_base_on_all_six_benchmarks(self):
+        benchmarks = (
+            "Competition-MATH",
+            "MATH-500",
+            "AIME24",
+            "AIME25",
+            "GPQA-Diamond",
+            "AMC23",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            opd_output = root / "opd"
+            cmt_output = root / "cmt"
+            self._write_training_output(
+                opd_output,
+                0.20,
+                base_accuracy=0.10,
+                benchmark_names=benchmarks,
+            )
+            self._write_training_output(
+                cmt_output,
+                0.30,
+                base_accuracy=0.12,
+                benchmark_names=benchmarks,
+            )
+
+            paths = plot_training_progress(
+                root / "results",
+                opd_output=opd_output,
+                cmt_output=cmt_output,
+                methods=["opd", "cmt"],
+            )
+            payload = json.loads(Path(paths["history_json"]).read_text())
+            opd_rows = payload["histories"]["OPD"]
+            for benchmark in benchmarks:
+                self.assertAlmostEqual(
+                    opd_rows[0]["benchmarks"][benchmark]["accuracy"], 0.12
+                )
+                self.assertAlmostEqual(
+                    opd_rows[1]["benchmarks"][benchmark]["accuracy"], 0.20
+                )
 
     def test_opd_cmt_alignment_only_lifts_opd_base_when_cmt_is_higher(self):
         with tempfile.TemporaryDirectory() as temporary:
