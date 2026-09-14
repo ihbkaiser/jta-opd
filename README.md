@@ -222,8 +222,8 @@ Các benchmark Competition-MATH test, MATH-500, AIME24, AIME25, GPQA-Diamond và
 được đánh giá theo đúng `num_responses` đã cấu hình.
 Step-0 base thường được generate một lần và cache có fingerprint; mọi checkpoint đã train vẫn eval riêng.
 Khi các run được đánh giá độc lập, biểu đồ kiểm tra Step-0 của Competition-MATH và MATH-500
-với dung sai tối đa một điểm phần trăm; AIME không là điều kiện kiểm tra. Đường Base dùng
-trung bình các phép đo Step-0. Evaluator bật vLLM
+với dung sai tối đa hai điểm phần trăm; AIME không là điều kiện kiểm tra. Đường Base dùng
+giá trị Step-0 đã căn chỉnh khi so sánh OPD với CMT-OPD. Evaluator bật vLLM
 `performance_mode=throughput`, chunked prefill và async scheduling mặc định.
 
 <!-- B200_AUTOTUNE_RESULT_START -->

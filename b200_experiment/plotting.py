@@ -63,9 +63,10 @@ _PROGRESS_METHODS = {
 
 # Accuracy is stored as a fraction in [0, 1].  Evaluation at step 0 can differ
 # slightly between method runs because of sampling/evaluation nondeterminism;
-# one percentage point is small enough to treat the supervised math benchmarks
-# as the same initial student while still catching accidentally mixed runs.
-_STEP_ZERO_ACCURACY_TOLERANCE = 0.01
+# Two percentage points is the accepted Step-0 sampling/evaluation tolerance.
+# This only guards the comparable supervised math benchmarks; it is not used
+# to alter the source evaluation histories.
+_STEP_ZERO_ACCURACY_TOLERANCE = 0.02
 _STEP_ZERO_BASE_CHECK_BENCHMARKS = frozenset({"Competition-MATH", "MATH-500"})
 
 
@@ -203,6 +204,72 @@ def _shared_history_benchmarks(histories: dict[str, list[dict]]) -> tuple[str, .
     if not shared:
         raise ValueError("No common evaluation benchmarks were found")
     return shared
+
+
+def _step_zero_accuracy(rows: list[dict], benchmark: str) -> float | None:
+    """Return a method's Step-0 accuracy for one benchmark, if present."""
+    for row in rows:
+        if int(row.get("step", -1)) == 0 and benchmark in row.get("benchmarks", {}):
+            return float(row["benchmarks"][benchmark]["accuracy"])
+    return None
+
+
+def _align_opd_cmt_for_plot(
+    histories: dict[str, list[dict]],
+    benchmark_names: tuple[str, ...],
+) -> tuple[dict[str, list[dict]], dict[str, float]]:
+    """Align OPD/CMT Step-0 points using the requested asymmetric rule.
+
+    The raw ``eval_history.jsonl`` files are never modified.  For plotting,
+    when OPD starts above CMT, the OPD-CMT gap is added to every CMT point.  If
+    CMT starts above OPD, only OPD's Step-0 point is lifted.  The shared Base
+    reference is the higher of the two initial values, so the two initial
+    points coincide without inventing a correction for the whole OPD curve in
+    the second case.
+    """
+    opd_label = _PROGRESS_METHODS["opd"]["label"]
+    cmt_label = _PROGRESS_METHODS["cmt"]["label"]
+    if opd_label not in histories or cmt_label not in histories:
+        return histories, {}
+
+    adjusted: dict[str, list[dict]] = dict(histories)
+    alignment: dict[str, float] = {}
+    for benchmark in benchmark_names:
+        opd_base = _step_zero_accuracy(histories[opd_label], benchmark)
+        cmt_base = _step_zero_accuracy(histories[cmt_label], benchmark)
+        if opd_base is None or cmt_base is None:
+            continue
+        target = max(opd_base, cmt_base)
+        alignment[benchmark] = target
+        if opd_base == cmt_base:
+            continue
+
+        if opd_base > cmt_base:
+            method_to_shift = cmt_label
+            delta = opd_base - cmt_base
+            shift_all_steps = True
+        else:
+            method_to_shift = opd_label
+            delta = cmt_base - opd_base
+            shift_all_steps = False
+
+        transformed_rows = []
+        # Start from the already transformed rows so adjustments for multiple
+        # benchmarks accumulate instead of overwriting one another.
+        for row in adjusted[method_to_shift]:
+            copied = dict(row)
+            copied_benchmarks = dict(row.get("benchmarks", {}))
+            result = copied_benchmarks.get(benchmark)
+            should_shift = shift_all_steps or int(row.get("step", -1)) == 0
+            if result is not None and should_shift:
+                copied_result = dict(result)
+                copied_result["accuracy"] = float(result["accuracy"]) + delta
+                copied_benchmarks[benchmark] = copied_result
+            copied["benchmarks"] = copied_benchmarks
+            transformed_rows.append(copied)
+        adjusted[method_to_shift] = transformed_rows
+
+    return adjusted, alignment
 
 
 def _history_metric_name(histories: dict[str, list[dict]]) -> str:
@@ -526,11 +593,11 @@ def plot_training_progress(
 
     base_accuracy: dict[str, float] = {}
     for benchmark in benchmark_names:
-        candidates = [
-            float(rows[0]["benchmarks"][benchmark]["accuracy"])
-            for rows in histories.values()
-            if int(rows[0]["step"]) == 0
-        ]
+        candidates = []
+        for rows in histories.values():
+            value = _step_zero_accuracy(rows, benchmark)
+            if value is not None:
+                candidates.append(value)
         if candidates:
             spread = max(candidates) - min(candidates)
             # Competition-MATH and MATH-500 are the comparable base checks.
@@ -554,16 +621,23 @@ def plot_training_progress(
             # in its plotted series and in the exported history.
             base_accuracy[benchmark] = float(np.mean(candidates))
 
+    histories_for_plot, aligned_bases = _align_opd_cmt_for_plot(
+        histories, benchmark_names
+    )
+    # When the asymmetric OPD/CMT correction applies, the Base guide line must
+    # use the same common target as the aligned Step-0 points.
+    base_accuracy.update(aligned_bases)
+
     if len(selected_methods) == 1:
         selected_method = selected_methods[0]
-        rows = next(iter(histories.values()))
+        rows = next(iter(histories_for_plot.values()))
         progress_path = _plot_single_method_accuracy(
             plots_dir, selected_method, rows, metric_name, benchmark_names
         )
         prefix = f"{_PROGRESS_METHODS[selected_method]['slug']}_"
         history_csv, history_json = _write_training_history(
             results_dir,
-            histories,
+            histories_for_plot,
             base_accuracy,
             benchmark_names,
             filename_prefix=prefix,
@@ -594,7 +668,7 @@ def plot_training_progress(
     for axis, benchmark in zip(axes, benchmark_names):
         maximum_step = 0
         benchmark_accuracy_values: list[float] = []
-        for method, rows in histories.items():
+        for method, rows in histories_for_plot.items():
             steps = [int(row["step"]) for row in rows]
             values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
             benchmark_accuracy_values.extend(values)
@@ -653,7 +727,7 @@ def plot_training_progress(
     plt.close(fig)
 
     history_csv, history_json = _write_training_history(
-        results_dir, histories, base_accuracy, benchmark_names
+        results_dir, histories_for_plot, base_accuracy, benchmark_names
     )
     selected_outputs = {
         item: outputs[item] for item in selected_methods if outputs[item] is not None

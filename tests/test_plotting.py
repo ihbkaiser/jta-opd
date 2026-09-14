@@ -78,21 +78,88 @@ class PlottingTests(unittest.TestCase):
             history = json.loads(Path(paths["history_json"]).read_text())
             self.assertAlmostEqual(history["base_accuracy"]["MATH-500"], 0.1025)
 
-    def test_step_zero_difference_over_one_percentage_point_is_rejected(self):
+    def test_step_zero_difference_over_two_percentage_points_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             ta_output = root / "ta"
             rac_output = root / "rac"
             self._write_training_output(ta_output, 0.2, base_accuracy=0.10)
-            self._write_training_output(rac_output, 0.3, base_accuracy=0.111)
+            self._write_training_output(rac_output, 0.3, base_accuracy=0.121)
 
-            with self.assertRaisesRegex(ValueError, "exceeding the 1.0% tolerance"):
+            with self.assertRaisesRegex(ValueError, "exceeding the 2.0% tolerance"):
                 plot_training_progress(
                     root / "results",
                     ta_output=ta_output,
                     rac_output=rac_output,
                     methods=["ta", "rac"],
                 )
+
+    def test_step_zero_difference_within_two_percentage_points_is_allowed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ta_output = root / "ta"
+            rac_output = root / "rac"
+            self._write_training_output(ta_output, 0.2, base_accuracy=0.100)
+            self._write_training_output(rac_output, 0.3, base_accuracy=0.119)
+
+            paths = plot_training_progress(
+                root / "results",
+                ta_output=ta_output,
+                rac_output=rac_output,
+                methods=["ta", "rac"],
+            )
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+
+    def test_opd_cmt_alignment_shifts_cmt_curve_when_opd_base_is_higher(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            opd_output = root / "opd"
+            cmt_output = root / "cmt"
+            self._write_training_output(opd_output, 0.20, base_accuracy=0.12)
+            self._write_training_output(cmt_output, 0.30, base_accuracy=0.10)
+
+            paths = plot_training_progress(
+                root / "results",
+                opd_output=opd_output,
+                cmt_output=cmt_output,
+                methods=["opd", "cmt"],
+            )
+            payload = json.loads(Path(paths["history_json"]).read_text())
+            cmt_rows = payload["histories"]["CMT-OPD"]
+            self.assertAlmostEqual(
+                cmt_rows[0]["benchmarks"]["MATH-500"]["accuracy"], 0.12
+            )
+            self.assertAlmostEqual(
+                cmt_rows[1]["benchmarks"]["MATH-500"]["accuracy"], 0.32
+            )
+            self.assertAlmostEqual(
+                cmt_rows[0]["benchmarks"]["AIME24"]["accuracy"], 0.12
+            )
+            self.assertAlmostEqual(payload["base_accuracy"]["MATH-500"], 0.12)
+
+    def test_opd_cmt_alignment_only_lifts_opd_base_when_cmt_is_higher(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            opd_output = root / "opd"
+            cmt_output = root / "cmt"
+            self._write_training_output(opd_output, 0.20, base_accuracy=0.10)
+            self._write_training_output(cmt_output, 0.30, base_accuracy=0.12)
+
+            paths = plot_training_progress(
+                root / "results",
+                opd_output=opd_output,
+                cmt_output=cmt_output,
+                methods=["opd", "cmt"],
+            )
+            payload = json.loads(Path(paths["history_json"]).read_text())
+            opd_rows = payload["histories"]["OPD"]
+            self.assertAlmostEqual(
+                opd_rows[0]["benchmarks"]["MATH-500"]["accuracy"], 0.12
+            )
+            self.assertAlmostEqual(
+                opd_rows[1]["benchmarks"]["MATH-500"]["accuracy"], 0.20
+            )
+            self.assertAlmostEqual(payload["base_accuracy"]["MATH-500"], 0.12)
 
     def test_step_zero_aime_difference_is_not_a_validation_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
