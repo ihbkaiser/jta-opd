@@ -405,8 +405,9 @@ REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=pass@8 \
 ```
 
 Với `CUDA_VISIBLE_DEVICES` có nhiều GPU, evaluator tự chia benchmark deterministic thành các
-shard, chạy một vLLM `TP=1` trên mỗi GPU rồi merge lại; với một GPU behavior không đổi. Có thể
-chọn số worker bằng `EVAL_WORLD_SIZE`.
+shard, chạy một vLLM `TP=1` trên mỗi GPU rồi merge lại; với một GPU kết quả/protocol không đổi,
+nhưng mỗi checkpoint được chạy trong subprocess riêng để engine cũ không giữ VRAM cho
+checkpoint kế tiếp. Có thể chọn số worker bằng `EVAL_WORLD_SIZE`.
 
 ## 7. Re-evaluate toàn bộ checkpoint
 

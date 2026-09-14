@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import gc
 import gzip
 import json
 import os
@@ -187,6 +188,45 @@ def _prompt(tokenizer, problem: str, config: dict[str, Any]) -> str:
     return render_evaluation_prompt(tokenizer, {"problem": problem, "metadata": {}}, config)
 
 
+def _release_vllm_engine(engine: Any) -> None:
+    """Stop a vLLM engine and release its CUDA allocations synchronously.
+
+    Re-evaluation of many checkpoints happens in one Python process when
+    ``world_size=1``.  Relying on process exit for cleanup therefore leaks the
+    previous ``LLM`` instance into the next checkpoint.  vLLM has exposed
+    different shutdown hooks across releases, so call the available hooks
+    defensively, then drop references and flush the local CUDA allocator.
+    """
+    if engine is None:
+        return
+    candidates = [engine, getattr(engine, "llm_engine", None)]
+    called: set[tuple[int, str]] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for method_name in ("shutdown_background_loop", "shutdown", "close"):
+            method = getattr(candidate, method_name, None)
+            marker = (id(candidate), method_name)
+            if not callable(method) or marker in called:
+                continue
+            called.add(marker)
+            try:
+                method()
+            except Exception:
+                # Cleanup must not mask the original evaluation exception;
+                # object destruction below remains a valid fallback.
+                pass
+    del candidates
+    del engine
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
 def _evaluate_vllm_suite_impl(
     model_name: str,
     model_path: str | Path,
@@ -288,15 +328,25 @@ def _evaluate_vllm_suite_impl(
         f"Eval {model_name}: loading vLLM engine for "
         f"{len(prompts)} {sample_scope} samples..."
     )
-    engine = LLM(**engine_kwargs)
-    sampling = SamplingParams(
-        n=samples_per_problem,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_new_tokens,
-    )
-    # One call produces one tqdm progress bar for all configured benchmarks.
-    generated = engine.generate(prompts, sampling, use_tqdm=True) if prompts else []
+    engine = None
+    try:
+        engine = LLM(**engine_kwargs)
+        sampling = SamplingParams(
+            n=samples_per_problem,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_new_tokens,
+        )
+        # One call produces one tqdm progress bar for all configured benchmarks.
+        generated = (
+            engine.generate(prompts, sampling, use_tqdm=True) if prompts else []
+        )
+    finally:
+        # This is essential for sequential checkpoint re-evaluation in one
+        # process. Training-time evaluation already gets process-level cleanup,
+        # but the world_size=1 re-eval path does not.
+        _release_vllm_engine(engine)
+        engine = None
     if len(generated) != len(prompt_rows):
         raise RuntimeError(
             f"vLLM returned {len(generated)} outputs for {len(prompt_rows)} prompts"
@@ -663,10 +713,6 @@ def _evaluate_vllm_distributed_impl(
     requested_world = int((len(devices) or 1) if world_size is None else world_size)
     if requested_world <= 0:
         raise ValueError("world_size must be a positive integer")
-    if requested_world <= 1:
-        return _evaluate_vllm_suite_impl(
-            model_name, model_path, config, output_dir, runtime_settings
-        )
     if requested_world > len(devices):
         raise ValueError(
             f"Requested {requested_world} evaluation workers but only "

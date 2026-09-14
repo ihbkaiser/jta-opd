@@ -12,6 +12,7 @@ from unittest.mock import patch
 from b200_experiment.evaluation import metric_problem_score
 from b200_experiment.vllm_evaluation import (
     _resolve_gpu_memory_utilization,
+    _release_vllm_engine,
     evaluate_vllm_suite,
     merge_vllm_evaluation_shards,
 )
@@ -48,7 +49,21 @@ class _LLM:
         ]
 
 
+class _ClosableEngine:
+    def __init__(self):
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+
+
 class VllmEvaluationTests(unittest.TestCase):
+    def test_engine_cleanup_calls_shutdown_hook(self):
+        engine = _ClosableEngine()
+        with patch("torch.cuda.is_available", return_value=False):
+            _release_vllm_engine(engine)
+        self.assertEqual(engine.shutdown_calls, 1)
+
     def test_pass_at_k_uses_unbiased_without_replacement_estimator(self):
         self.assertAlmostEqual(
             metric_problem_score([True] + [False] * 15, "pass@8"), 0.5
