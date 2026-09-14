@@ -269,7 +269,12 @@ def _write_history_atomically(
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
     metrics_temp = run_output / f".{metrics_path.name}.reeval-{uuid.uuid4().hex}.tmp"
-    fieldnames = (
+    # Keep the canonical avg@8/pass@8 schema first, but preserve legacy columns
+    # found in an existing CSV.  Older runs may contain ``avg_at_16``; partial
+    # re-evaluation must not fail (or silently discard that historical value)
+    # merely because the new evaluation protocol uses avg@8.  Dynamic extras
+    # also make this writer forward-compatible with future metric fields.
+    canonical_fieldnames = (
         "step",
         "method",
         "backend",
@@ -286,8 +291,22 @@ def _write_history_atomically(
         "metric",
         "evaluation_time_sec",
     )
+    canonical_set = set(canonical_fieldnames)
+    extra_fieldnames = tuple(
+        sorted(
+            {
+                str(key)
+                for row in metric_rows
+                for key in row
+                if str(key) not in canonical_set
+            }
+        )
+    )
+    fieldnames = (*canonical_fieldnames, *extra_fieldnames)
     with metrics_temp.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            handle, fieldnames=fieldnames, extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(metric_rows)
 

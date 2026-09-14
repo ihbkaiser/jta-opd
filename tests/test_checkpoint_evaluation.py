@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from b200_experiment.checkpoint_evaluation import (
+    _merge_partial_metrics,
     _reevaluation_artifact_paths,
     _write_history_atomically,
     discover_evaluation_targets,
@@ -149,6 +150,70 @@ class CheckpointEvaluationTests(unittest.TestCase):
             self.assertEqual(rows, history)
             self.assertEqual(metric_rows[0]["accuracy"], "0.5")
             self.assertFalse(any(output.glob(".*pre-reeval-*")))
+
+    def test_legacy_avg_at_16_metric_column_is_preserved_during_avg8_reeval(self):
+        """Partial avg@8 re-evaluation must tolerate old avg@16 CSV rows."""
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            old_metrics = output / "eval_metrics.csv"
+            with old_metrics.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=(
+                        "step",
+                        "method",
+                        "benchmark",
+                        "accuracy",
+                        "avg_at_16",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "step": 1,
+                        "method": "opd",
+                        "benchmark": "MATH-500",
+                        "accuracy": 0.4,
+                        "avg_at_16": 0.41,
+                    }
+                )
+            new_metrics = [
+                {
+                    "step": 1,
+                    "method": "opd",
+                    "benchmark": "GPQA-Diamond",
+                    "accuracy": 0.5,
+                    "avg_at_n": 0.5,
+                    "metric": "avg@8",
+                },
+                {
+                    "step": 1,
+                    "method": "opd",
+                    "benchmark": "MATH-500",
+                    "accuracy": 0.45,
+                    "avg_at_n": 0.45,
+                    "metric": "avg@8",
+                    "evaluation_time_sec": 1.0,
+                },
+            ]
+            with old_metrics.open(newline="", encoding="utf-8") as handle:
+                existing_metrics = list(csv.DictReader(handle))
+            _write_history_atomically(
+                output,
+                [{"step": 1, "method": "opd"}],
+                _merge_partial_metrics(existing_metrics, new_metrics, "opd"),
+            )
+
+            with old_metrics.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertIn("avg_at_16", rows[0])
+            self.assertEqual(rows[0]["avg_at_16"], "0.41")
+            self.assertEqual(
+                next(row for row in rows if row["benchmark"] == "GPQA-Diamond")[
+                    "accuracy"
+                ],
+                "0.5",
+            )
 
     def test_dry_run_validates_all_three_methods_without_writing_eval_files(self):
         with tempfile.TemporaryDirectory() as temporary:
