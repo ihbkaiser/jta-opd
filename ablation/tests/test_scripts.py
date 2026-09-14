@@ -39,3 +39,10 @@ def test_train_launcher_is_cwd_independent_and_keeps_token_budgets():
         )
         assert "train_max_new_tokens=4096 eval_max_new_tokens=7168" in result.stdout
         assert (output / "ablation_spec.json").is_file()
+
+
+def test_plot_launcher_uses_a_fresh_named_directory():
+    text = (ROOT / "scripts/plot_ablation.sh").read_text(encoding="utf-8")
+    assert "FIGURE_ROOT" in text
+    assert "PLOT_TAG" in text
+    assert "date +%Y%m%d_%H%M%S_%N" in text

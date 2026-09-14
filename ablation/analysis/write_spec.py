@@ -32,6 +32,9 @@ def main() -> int:
         "eval_max_new_tokens": int(os.environ.get("TRAIN_EVAL_MAX_NEW_TOKENS", "7168")),
         "rollout_temperature": float(os.environ.get("ROLLOUT_TEMPERATURE", "1.0")),
         "rollout_top_p": float(os.environ.get("ROLLOUT_TOP_P", "1.0")),
+        "student_model": os.environ.get("STUDENT_MODEL", ""),
+        "teacher_model": os.environ.get("TEACHER_MODEL", ""),
+        "train_dataset": os.environ.get("TRAIN_DATASET", ""),
         "git_commit": commit,
         "command": os.environ.get("ABLATION_COMMAND", ""),
     }

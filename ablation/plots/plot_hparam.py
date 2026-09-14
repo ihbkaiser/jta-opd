@@ -7,6 +7,19 @@ import json
 from pathlib import Path
 
 
+def _save_pair(fig, output_dir: Path, stem: str) -> None:
+    index = 0
+    while True:
+        suffix = "" if index == 0 else f"_{index:03d}"
+        png = output_dir / f"{stem}{suffix}.png"
+        pdf = output_dir / f"{stem}{suffix}.pdf"
+        if not png.exists() and not pdf.exists():
+            fig.savefig(png, dpi=180)
+            fig.savefig(pdf)
+            return
+        index += 1
+
+
 def _result(row, benchmark, metric):
     values = row.get("benchmarks", {})
     item = values.get(benchmark)
@@ -67,8 +80,7 @@ def main() -> int:
     ax.grid(alpha=.25)
     fig.tight_layout()
     stem = f"hparam_{args.parameter}_{args.aggregate}"
-    fig.savefig(args.output_dir / f"{stem}.png", dpi=180)
-    fig.savefig(args.output_dir / f"{stem}.pdf")
+    _save_pair(fig, args.output_dir, stem)
     return 0
 
 

@@ -33,6 +33,20 @@ def _benchmark(row, requested: str):
     return next(iter(values.values()), None)
 
 
+def _save_pair(fig, output_dir: Path, stem: str) -> None:
+    """Never replace an existing figure when a plot command is repeated."""
+    index = 0
+    while True:
+        suffix = "" if index == 0 else f"_{index:03d}"
+        png = output_dir / f"{stem}{suffix}.png"
+        pdf = output_dir / f"{stem}{suffix}.pdf"
+        if not png.exists() and not pdf.exists():
+            fig.savefig(png, dpi=180)
+            fig.savefig(pdf)
+            return
+        index += 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-root", type=Path, required=True)
@@ -78,8 +92,7 @@ def main() -> int:
     ax.grid(alpha=.25)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(args.output_dir / "ablation_curves.png", dpi=180)
-    fig.savefig(args.output_dir / "ablation_curves.pdf")
+    _save_pair(fig, args.output_dir, "ablation_curves")
     plt.close(fig)
 
     finals = {}
@@ -98,8 +111,7 @@ def main() -> int:
     ax.set_title("Final CMT ablation comparison")
     ax.grid(axis="y", alpha=.25)
     fig.tight_layout()
-    fig.savefig(args.output_dir / "ablation_final.png", dpi=180)
-    fig.savefig(args.output_dir / "ablation_final.pdf")
+    _save_pair(fig, args.output_dir, "ablation_final")
     return 0
 
 

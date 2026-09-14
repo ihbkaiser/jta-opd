@@ -232,7 +232,8 @@ File `ablation/scripts/plot_ablation.sh` có các biến:
 ```bash
 export PLOT_MODE=epsilon       # arms, epsilon, top_k, lr, diagnostics
 export INPUT_ROOT=ablation/outputs
-export OUTPUT_DIR=ablation/figures
+export FIGURE_ROOT=ablation/figures
+export PLOT_TAG=qwen14b_4b_epsilon
 export BENCHMARK=MATH-500
 export METRIC=accuracy
 export AGGREGATE=final          # final hoặc auc
@@ -265,7 +266,11 @@ PLOT_MODE=lr AGGREGATE=auc bash ablation/scripts/plot_ablation.sh
 PLOT_MODE=diagnostics bash ablation/scripts/plot_ablation.sh
 ```
 
-Mỗi lệnh lưu cả PNG và PDF trong `ablation/figures/`.
+Mỗi lệnh tạo một thư mục mới dưới `ablation/figures/`, ví dụ
+`ablation/figures/qwen14b_4b_epsilon/`. Nếu `PLOT_TAG` đã tồn tại, launcher tự
+thêm timestamp thay vì ghi đè. Khi không đặt `PLOT_TAG`, tên có timestamp
+nanosecond được tạo tự động. Các Python plotter cũng tự tạo hậu tố `_001`,
+`_002`, ... nếu được gọi trực tiếp vào một thư mục đã có figure.
 
 ## 8. Cấu trúc và reproducibility
 

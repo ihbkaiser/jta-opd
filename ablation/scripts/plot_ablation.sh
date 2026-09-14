@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 export INPUT_ROOT="${INPUT_ROOT:-${SCRIPT_DIR}/../outputs}"
-export OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/../figures}"
+FIGURE_ROOT="${FIGURE_ROOT:-${OUTPUT_DIR:-${SCRIPT_DIR}/../figures}}"
 # modes: arms, epsilon, gamma, top_k, lr, diagnostics
 export PLOT_MODE="${PLOT_MODE:-arms}"
 export BENCHMARK="${BENCHMARK:-MATH-500}"
@@ -18,10 +18,20 @@ export RUN_NAME_1="${RUN_NAME_1:-}"
 export RUN_NAME_2="${RUN_NAME_2:-}"
 export RUN_NAME_3="${RUN_NAME_3:-}"
 export RUN_NAME_4="${RUN_NAME_4:-}"
+export PLOT_TAG="${PLOT_TAG:-}"
 # ============================================================
 
 if [[ -z "${RUN_NAMES}" ]]; then
   RUN_NAMES="${RUN_NAME_1} ${RUN_NAME_2} ${RUN_NAME_3} ${RUN_NAME_4}"
+fi
+
+if [[ -z "${PLOT_TAG}" ]]; then
+  PLOT_TAG="plot_${PLOT_MODE}_$(date +%Y%m%d_%H%M%S_%N)"
+fi
+PLOT_TAG="$(printf '%s' "${PLOT_TAG}" | tr ' /:' '___')"
+OUTPUT_DIR="${FIGURE_ROOT}/${PLOT_TAG}"
+if [[ -e "${OUTPUT_DIR}" ]]; then
+  OUTPUT_DIR="${FIGURE_ROOT}/${PLOT_TAG}_$(date +%Y%m%d_%H%M%S_%N)"
 fi
 RUN_ARGS=()
 for name in ${RUN_NAMES}; do
