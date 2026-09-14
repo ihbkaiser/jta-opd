@@ -1239,7 +1239,7 @@ def _run_training_evaluation(
         ),
         "top_p": float(settings.get("top_p", config["evaluation"].get("top_p", 0.95))),
         "num_responses": int(
-            settings.get("num_responses", config["evaluation"].get("num_responses", 16))
+            settings.get("num_responses", config["evaluation"].get("num_responses", 8))
         ),
         "batch_size": int(
             settings.get("batch_size", config["evaluation"].get("batch_size", 16))
@@ -1323,7 +1323,7 @@ def _run_training_evaluation(
                     int(result["total"]) for result in suite["benchmarks"].values()
                 )
                 tqdm.write(
-                    "Reused untouched-base avg@16 evaluation "
+                    "Reused untouched-base avg@8 evaluation "
                     f"({cache_status} cache); skipped {skipped_responses:,} generations."
                 )
         else:
@@ -1365,7 +1365,7 @@ def _run_training_evaluation(
                 "total": result["total"],
                 "accuracy": result["accuracy"],
                 "avg_at_n": result.get("avg_at_n", result["accuracy"]),
-                **({"avg_at_16": result["avg_at_16"]} if "avg_at_16" in result else {}),
+                **({"avg_at_8": result["avg_at_8"]} if "avg_at_8" in result else {}),
                 **({"pass_at_k": result["pass_at_k"]} if "pass_at_k" in result else {}),
                 **({"pass_at_8": result["pass_at_8"]} if "pass_at_8" in result else {}),
                 "problems": result.get("problems"),
@@ -1392,7 +1392,7 @@ def _run_training_evaluation(
         "total",
         "accuracy",
         "avg_at_n",
-        "avg_at_16",
+        "avg_at_8",
         "pass_at_k",
         "pass_at_8",
         "problems",

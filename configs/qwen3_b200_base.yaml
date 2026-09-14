@@ -192,7 +192,7 @@ training_evaluation:
   backend: vllm
   temperature: 0.7
   top_p: 0.95
-  num_responses: 16
+  num_responses: 8
   metric: null
   target_evaluations: null
   interval_steps: 50
@@ -243,7 +243,7 @@ evaluation:
   backend: vllm
   temperature: 0.7
   top_p: 0.95
-  num_responses: 16
+  num_responses: 8
   batch_size: 1
   max_new_tokens: 7168
   limit: null
@@ -274,17 +274,18 @@ evaluation:
     GPQA-Diamond:
       task_type: gpqa
       path: nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl
-      question_key: Question
-      answer_key: Correct Answer
-      # Canonical GPQA exports use these four columns. The loader also accepts
-      # a JSON ``choices`` list when present.
-      choice_keys: [Correct Answer, Incorrect Answer 1, Incorrect Answer 2, Incorrect Answer 3]
+      # The server copy uses the prompt/ground_truth export: the prompt
+      # contains its own A./B./C./D. option block.  The loader also migrates
+      # older resolved configs that used Question/Correct Answer columns.
+      question_key: prompt
+      answer_key: ground_truth
       choice_shuffle_seed: 1234
     AMC23:
       task_type: math
       path: nlp/minhpn19/data/amc23/test-00000-of-00001.parquet
-      question_key: problem
+      question_key: question
       answer_key: answer
+      id_key: id
 
 plotting:
   smoothing_window: 10

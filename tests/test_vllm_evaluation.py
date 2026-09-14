@@ -178,7 +178,7 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(suite["parameters"]["metric"], "accuracy")
             self.assertEqual(result["total"], 1)
             self.assertEqual(result["avg_at_n"], 1.0)
-            self.assertNotIn("avg_at_16", result)
+            self.assertNotIn("avg_at_8", result)
             detailed_path = Path(suite["detailed_outputs"])
             self.assertEqual(detailed_path.name, "model_outputs_detailed.jsonl.gz")
             with gzip.open(detailed_path, "rt", encoding="utf-8") as handle:
@@ -260,7 +260,7 @@ class VllmEvaluationTests(unittest.TestCase):
                 "max_new_tokens": 32,
                 "temperature": 1.0,
                 "top_p": 0.95,
-                "num_responses": 16,
+                "num_responses": 8,
                 "benchmark_names": list(benchmarks),
                 "vllm": {
                     "max_num_seqs": 64,
@@ -296,13 +296,13 @@ class VllmEvaluationTests(unittest.TestCase):
             self.assertEqual(_LLM.instances[0].kwargs["performance_mode"], "throughput")
             self.assertEqual(calls[0][1].kwargs["temperature"], 1.0)
             self.assertEqual(calls[0][1].kwargs["top_p"], 0.95)
-            self.assertEqual(calls[0][1].kwargs["n"], 16)
+            self.assertEqual(calls[0][1].kwargs["n"], 8)
             self.assertTrue(suite["parameters"]["do_sample"])
             self.assertEqual(
                 [suite["benchmarks"][name]["accuracy"] for name in benchmarks],
                 [1.0, 1.0, 1.0],
             )
-            self.assertEqual(suite["benchmarks"]["MATH-500"]["total"], 16)
+            self.assertEqual(suite["benchmarks"]["MATH-500"]["total"], 8)
             self.assertEqual(suite["benchmarks"]["MATH-500"]["problems"], 1)
 
     def test_two_rank_shards_merge_to_single_gpu_metrics_and_order(self):

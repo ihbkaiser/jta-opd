@@ -110,7 +110,7 @@ def evaluate_vllm_suite(
     max_new_tokens = int(runtime_settings.get("max_new_tokens", 2048))
     temperature = float(runtime_settings.get("temperature", 0.7))
     top_p = float(runtime_settings.get("top_p", 0.95))
-    samples_per_problem = int(runtime_settings.get("num_responses", 16))
+    samples_per_problem = int(runtime_settings.get("num_responses", 8))
     metric_name = evaluation_metric_name(
         samples_per_problem, runtime_settings.get("metric")
     )
@@ -327,8 +327,8 @@ def evaluate_vllm_suite(
                     benchmark_result["pass_at_k"] = selected_score
                     if metric_name == "pass@8":
                         benchmark_result["pass_at_8"] = selected_score
-                elif samples_per_problem == 16:
-                    benchmark_result["avg_at_16"] = selected_score
+                elif samples_per_problem == 8:
+                    benchmark_result["avg_at_8"] = selected_score
                 suite["benchmarks"][benchmark] = benchmark_result
     finally:
         grade_progress.close()
@@ -495,8 +495,8 @@ def merge_vllm_evaluation_shards(
             result["pass_at_k"] = result["accuracy"]
             if expected_parameters["metric"] == "pass@8":
                 result["pass_at_8"] = result["accuracy"]
-        elif samples_per_problem == 16:
-            result["avg_at_16"] = result["avg_at_n"]
+        elif samples_per_problem == 8:
+            result["avg_at_8"] = result["avg_at_n"]
         merged_benchmarks[benchmark] = result
 
     detailed_rows_by_rank: list[list[dict[str, Any]]] = []

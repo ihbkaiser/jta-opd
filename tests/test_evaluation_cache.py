@@ -34,7 +34,7 @@ class BaseEvaluationCacheTests(unittest.TestCase):
             "backend": "vllm",
             "temperature": 1.0,
             "top_p": 0.95,
-            "num_responses": 16,
+            "num_responses": 8,
             "max_new_tokens": 32,
             "limit": None,
             "benchmark_names": ["MATH-500"],
@@ -88,7 +88,7 @@ class BaseEvaluationCacheTests(unittest.TestCase):
                 "backend": "vllm",
                 "temperature": 1.0,
                 "top_p": 0.95,
-                "num_responses": 16,
+                "num_responses": 8,
                 "max_new_tokens": 32,
                 "limit": None,
                 "benchmark_names": list(benchmarks),
@@ -108,7 +108,7 @@ class BaseEvaluationCacheTests(unittest.TestCase):
                             "backend": "vllm",
                             "temperature": 1.0,
                             "top_p": 0.95,
-                            "num_responses": 16,
+                            "num_responses": 8,
                             "max_new_tokens": 32,
                             "limit": None,
                         },
@@ -120,8 +120,8 @@ class BaseEvaluationCacheTests(unittest.TestCase):
                             handle.write("{}\n")
                         suite["benchmarks"][name] = {
                             "correct": 1,
-                            "total": 16,
-                            "accuracy": 1 / 16,
+                            "total": 8,
+                            "accuracy": 1 / 8,
                             "predictions": str(prediction),
                         }
                     detailed_outputs = destination / "model_outputs_detailed.jsonl.gz"

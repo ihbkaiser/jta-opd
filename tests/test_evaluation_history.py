@@ -93,16 +93,16 @@ class EvaluationHistoryTests(unittest.TestCase):
                 "step": 4,
                 "method": "cmt",
                 "benchmarks": {
-                    "MATH-500": {"accuracy": 0.51, "metric": "avg@16"},
-                    "AIME24": {"accuracy": 0.22, "metric": "avg@16"},
+                    "MATH-500": {"accuracy": 0.51, "metric": "avg@8"},
+                    "AIME24": {"accuracy": 0.22, "metric": "avg@8"},
                 },
-                "parameters": {"metric": "avg@16"},
+                "parameters": {"metric": "avg@8"},
             }
             (output / "eval_history.jsonl").write_text(
                 json.dumps(existing) + "\n", encoding="utf-8"
             )
             suite = {
-                "parameters": {"backend": "vllm", "num_responses": 16, "metric": "avg@16"},
+                "parameters": {"backend": "vllm", "num_responses": 8, "metric": "avg@8"},
                 "benchmarks": {
                     "GPQA-Diamond": {
                         "correct": 3,

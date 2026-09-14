@@ -278,7 +278,7 @@ def _write_history_atomically(
         "total",
         "accuracy",
         "avg_at_n",
-        "avg_at_16",
+        "avg_at_8",
         "pass_at_k",
         "pass_at_8",
         "problems",
@@ -656,8 +656,8 @@ def _reevaluate_method(
                     "accuracy": result["accuracy"],
                     "avg_at_n": result.get("avg_at_n", result["accuracy"]),
                     **(
-                        {"avg_at_16": result["avg_at_16"]}
-                        if "avg_at_16" in result
+                        {"avg_at_8": result["avg_at_8"]}
+                        if "avg_at_8" in result
                         else {}
                     ),
                     "problems": result.get("problems"),
@@ -764,7 +764,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmt-output")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--num-responses", type=int, default=16)
+    parser.add_argument("--num-responses", type=int, default=8)
     parser.add_argument(
         "--benchmarks",
         nargs="+",
@@ -776,7 +776,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--metric",
         default=None,
-        help="Evaluation metric, e.g. avg@16 or pass@8 (pass@8 uses 8 samples).",
+        help="Evaluation metric, e.g. avg@8 or pass@8 (both use 8 samples).",
     )
     parser.add_argument(
         "--world-size",

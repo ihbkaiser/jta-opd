@@ -33,8 +33,8 @@ ARGS=(
   --methods "${SELECTED_METHODS[@]}"
   --temperature "${REEVAL_TEMPERATURE:-0.7}"
   --top-p "${REEVAL_TOP_P:-0.95}"
-  --num-responses "${REEVAL_NUM_RESPONSES:-16}"
-  --metric "${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-16}}"
+  --num-responses "${REEVAL_NUM_RESPONSES:-8}"
+  --metric "${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-8}}"
   --max-new-tokens "${REEVAL_MAX_NEW_TOKENS:-7168}"
   --tensor-parallel-size "${REEVAL_VLLM_TENSOR_PARALLEL_SIZE:-${EVAL_VLLM_TENSOR_PARALLEL_SIZE:-1}}"
   --gpu-memory-utilization "${REEVAL_VLLM_GPU_MEMORY_UTILIZATION:-${EVAL_VLLM_GPU_MEMORY_UTILIZATION:-auto}}"
@@ -94,8 +94,8 @@ case "${REEVAL_DRY_RUN:-false}" in
 esac
 
 echo "Re-evaluating every saved checkpoint for: ${SELECTED_METHODS[*]}."
-REEVAL_METRIC_LABEL="${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-16}}"
-echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-16}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
+REEVAL_METRIC_LABEL="${REEVAL_METRIC:-avg@${REEVAL_NUM_RESPONSES:-8}}"
+echo "${REEVAL_METRIC_LABEL}: n=${REEVAL_NUM_RESPONSES:-8}, temperature=${REEVAL_TEMPERATURE:-0.7}, top_p=${REEVAL_TOP_P:-0.95}; backend: vLLM"
 echo "vLLM devices: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>}; workers=${REEVAL_WORLD_SIZE:-auto (one per visible GPU)}; TP=1 per worker"
 if [[ "${IS_DRY_RUN}" == "true" ]]; then
   echo "Dry run: files will only be validated and listed; nothing will be written."

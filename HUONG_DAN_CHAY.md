@@ -93,7 +93,7 @@ export TOP_K=16
 export SAVE_INTERVAL=50
 export EVAL_INTERVAL=50
 export TRAIN_EVAL_ENABLED=true
-export TRAIN_EVAL_NUM_RESPONSES=16
+export TRAIN_EVAL_NUM_RESPONSES=8
 export TRAIN_EVAL_SYNC_TIMEOUT_SEC=86400
 export ROLLOUT_TEMPERATURE=1.0
 export ROLLOUT_TOP_P=1.0
@@ -269,7 +269,7 @@ transition weight, `R`, `M`, `H`, successor excess và sequential gain.
 
 ## 6. Evaluation checkpoint cuối
 
-Đánh giá riêng từng method; mặc định dùng vLLM, `temperature=0.7`, `top_p=0.95`, `n=16`:
+Đánh giá riêng từng method; mặc định dùng vLLM, `temperature=0.7`, `top_p=0.95`, `n=8`:
 
 ```bash
 OPD_RUN_NAME="$OPD_RUN_NAME" bash scripts/eval_opd_b200.sh
@@ -328,11 +328,14 @@ EVAL_LIMIT=20 EVAL_NUM_RESPONSES=1 EVAL_TEMPERATURE=1 \
 
 Mặc định mỗi lần train/eval mới dùng đủ **6 benchmark** theo thứ tự:
 `Competition-MATH`, `MATH-500`, `AIME24`, `AIME25`, `GPQA-Diamond`, `AMC23`.
-GPQA-Diamond đọc từ `nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl` và dùng
-các cột `Question`, `Correct Answer`, `Incorrect Answer 1/2/3`; AMC23 đọc từ
-`nlp/minhpn19/data/amc23/test-00000-of-00001.parquet`, dùng cột `problem` và `answer`,
-và được render/chấm bằng cùng math prompt/verifier như các benchmark toán còn lại.
-GPQA được xáo trộn đáp án một cách deterministic để tránh thiên lệch vị trí. Các lần
+GPQA-Diamond đọc từ `nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl`. Bản dữ liệu
+hiện tại có các cột `id`, `prompt`, `ground_truth`; bốn lựa chọn A./B./C./D. đã nằm
+trong `prompt` và `ground_truth` là chữ cái đáp án đúng. Loader cũng tương thích với
+export cũ có các cột `Question`, `Correct Answer`, `Incorrect Answer 1/2/3`.
+AMC23 đọc từ `nlp/minhpn19/data/amc23/test-00000-of-00001.parquet`, dùng cột `question`,
+`answer` và `id`, rồi được render/chấm bằng cùng math prompt/verifier như các benchmark
+toán còn lại. GPQA chỉ xáo trộn đáp án khi lựa chọn nằm ở các cột riêng; với prompt đã
+nhúng lựa chọn, thứ tự A--D được giữ nguyên để không làm sai `ground_truth`. Các lần
 train mới vì vậy sẽ
 tự ghi thêm hai cột/biểu đồ này mà không thay đổi protocol của bốn bộ cũ.
 Muốn debug nhanh chỉ hai bộ mới trong lúc train (không khuyến nghị cho comparison
@@ -368,7 +371,7 @@ trong `eval_history.jsonl` và `eval_metrics.csv`):
 
 ```bash
 EVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
-EVAL_NUM_RESPONSES=16 EVAL_METRIC=avg@16 EVAL_TEMPERATURE=0.7 \
+EVAL_NUM_RESPONSES=8 EVAL_METRIC=avg@8 EVAL_TEMPERATURE=0.7 \
   bash scripts/eval_checkpoint_b200.sh cmt \
   "outputs/${CMT_RUN_NAME}/cmt_opd/checkpoint-000100"
 ```
@@ -377,7 +380,7 @@ Re-evaluate **toàn bộ checkpoint** của một run chỉ với hai bộ mới
 
 ```bash
 REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
-REEVAL_NUM_RESPONSES=16 REEVAL_METRIC=avg@16 \
+REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=avg@8 \
 CUDA_VISIBLE_DEVICES=0,1 REEVAL_WORLD_SIZE=2 \
   bash scripts/reeval_method_checkpoints_b200.sh cmt "$CMT_RUN_NAME"
 ```
@@ -392,8 +395,8 @@ file metric-specific `eval_history_pass_at_8.jsonl` vẫn được tách như tr
 Nếu history cũ còn dòng IFEval, plotting chỉ bỏ qua dòng benchmark legacy đó; nó không
 được gán nhãn lại thành AMC23.
 
-Nếu mục tiêu là pass@8 thay vì bổ sung vào history avg@16, chạy biến thể sau; kết quả
-được lưu ở bộ file `*_pass_at_8` riêng và không trộn metric với đường avg@16:
+Nếu mục tiêu là pass@8 thay vì bổ sung vào history avg@8, chạy biến thể sau; kết quả
+được lưu ở bộ file `*_pass_at_8` riêng và không trộn metric với đường avg@8:
 
 ```bash
 REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
@@ -419,7 +422,7 @@ Chạy thật toàn bộ checkpoint của CMT:
 
 ```bash
 REEVAL_METHODS=cmt \
-REEVAL_NUM_RESPONSES=16 REEVAL_TEMPERATURE=0.7 REEVAL_TOP_P=0.95 \
+REEVAL_NUM_RESPONSES=8 REEVAL_TEMPERATURE=0.7 REEVAL_TOP_P=0.95 \
   CMT_RUN_NAME="$CMT_RUN_NAME" \
   bash scripts/reeval_method_checkpoints_b200.sh cmt
 ```

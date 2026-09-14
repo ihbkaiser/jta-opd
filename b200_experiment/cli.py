@@ -165,7 +165,7 @@ def _evaluate_checkpoint(args) -> dict:
                 "backend": "vllm",
                 "temperature": evaluation.get("temperature", 0.7),
                 "top_p": evaluation.get("top_p", 0.95),
-                "num_responses": evaluation.get("num_responses", 16),
+                "num_responses": evaluation.get("num_responses", 8),
                 "metric": evaluation.get("metric"),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),

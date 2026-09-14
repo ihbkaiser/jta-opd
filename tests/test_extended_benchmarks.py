@@ -16,6 +16,57 @@ from b200_experiment.evaluation import (
 
 
 class ExtendedBenchmarkTests(unittest.TestCase):
+    def test_gpqa_prompt_ground_truth_export_and_old_config_are_migrated(self):
+        """The downloaded GPQA file has id/prompt/ground_truth columns."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "gpqa_diamond.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "id": 7,
+                        "prompt": (
+                            "Which option is correct?\n\n"
+                            "A. first answer\n"
+                            "B. second answer\n"
+                            "C. third answer\n"
+                            "D. fourth answer"
+                        ),
+                        "ground_truth": "D",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # Simulate a checkpoint's historical resolved config.  Missing
+            # Question/Correct Answer/Incorrect Answer columns should fall
+            # back to the prompt/ground_truth schema automatically.
+            rows, schema = load_benchmark(
+                "GPQA-Diamond",
+                {
+                    "task_type": "gpqa",
+                    "path": str(path),
+                    "question_key": "Question",
+                    "answer_key": "Correct Answer",
+                    "choice_keys": [
+                        "Correct Answer",
+                        "Incorrect Answer 1",
+                        "Incorrect Answer 2",
+                        "Incorrect Answer 3",
+                    ],
+                },
+            )
+            self.assertEqual(schema["question_key"], "prompt")
+            self.assertEqual(schema["answer_key"], "ground_truth")
+            self.assertEqual(rows[0]["id"], "7")
+            self.assertEqual(rows[0]["metadata"]["choices"], [
+                "first answer",
+                "second answer",
+                "third answer",
+                "fourth answer",
+            ])
+            self.assertEqual(rows[0]["metadata"]["correct_choice"], 3)
+            self.assertTrue(rows[0]["metadata"]["choices_embedded"])
+
     def test_gpqa_jsonl_normalizes_choices_and_grades_letters(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "gpqa_diamond.jsonl"
@@ -62,18 +113,23 @@ class ExtendedBenchmarkTests(unittest.TestCase):
     def test_amc23_parquet_uses_standard_math_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "test-00000-of-00001.parquet"
-            pd.DataFrame([{"problem": "What is 2+2?", "answer": "4"}]).to_parquet(path)
+            pd.DataFrame(
+                [{"id": 7, "question": "What is 2+2?", "answer": "4"}]
+            ).to_parquet(path)
             rows, schema = load_benchmark(
                 "AMC23",
                 {
                     "task_type": "math",
                     "path": str(path),
-                    "question_key": "problem",
+                    "question_key": "question",
                     "answer_key": "answer",
+                    "id_key": "id",
                 },
             )
             self.assertEqual(schema["task_type"], "math")
-            self.assertEqual(rows[0], {"id": "0", "problem": "What is 2+2?", "answer": "4"})
+            self.assertEqual(
+                rows[0], {"id": "7", "problem": "What is 2+2?", "answer": "4"}
+            )
 
     def test_configured_order_includes_new_benchmarks_and_allows_subset(self):
         config = {

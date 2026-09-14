@@ -32,14 +32,8 @@ EXTENDED_BENCHMARK_SPECS: dict[str, dict[str, Any]] = {
     "GPQA-Diamond": {
         "task_type": "gpqa",
         "path": "nlp/minhpn19/data/GPQA-Diamond/gpqa_diamond.jsonl",
-        "question_key": "Question",
-        "answer_key": "Correct Answer",
-        "choice_keys": [
-            "Correct Answer",
-            "Incorrect Answer 1",
-            "Incorrect Answer 2",
-            "Incorrect Answer 3",
-        ],
+        "question_key": "prompt",
+        "answer_key": "ground_truth",
         "choice_shuffle_seed": 1234,
     },
     "AMC23": {
@@ -48,8 +42,9 @@ EXTENDED_BENCHMARK_SPECS: dict[str, dict[str, Any]] = {
         # verifier as the other math benchmarks.
         "task_type": "math",
         "path": "nlp/minhpn19/data/amc23/test-00000-of-00001.parquet",
-        "question_key": "problem",
+        "question_key": "question",
         "answer_key": "answer",
+        "id_key": "id",
     },
 }
 
@@ -282,13 +277,55 @@ def _as_list(value: Any) -> list[Any] | None:
     return None
 
 
-def _gpqa_choices(row: dict[str, Any], answer_key: str, spec: dict[str, Any]) -> tuple[list[str], int]:
+_GPQA_OPTION_BLOCK_RE = re.compile(
+    r"(?ms)^[ \t]*([A-D])[ \t]*[.)][ \t]*(.*?)(?=^[ \t]*[A-D][ \t]*[.)][ \t]*|\Z)"
+)
+
+
+def _embedded_gpqa_choices(prompt: Any) -> list[str] | None:
+    """Extract an A--D option block embedded in a GPQA prompt.
+
+    The downloaded GPQA Diamond export used by this project has only
+    ``id``, ``prompt`` and ``ground_truth`` columns.  Its prompt already
+    contains the four labelled options, so there are no separate choice
+    columns to read.  Return the last complete A/B/C/D block; using the last
+    block also avoids accidentally treating an ``A.``/``B.`` example in the
+    question stem as the answer choices.
+    """
+    matches = list(_GPQA_OPTION_BLOCK_RE.finditer(str(prompt or "")))
+    for end in range(len(matches), 3, -1):
+        block = matches[end - 4 : end]
+        labels = [match.group(1).upper() for match in block]
+        if labels == ["A", "B", "C", "D"]:
+            values = [re.sub(r"\s+", " ", match.group(2)).strip() for match in block]
+            if all(values):
+                return values
+    return None
+
+
+def _gpqa_choices(
+    row: dict[str, Any], answer_key: str, spec: dict[str, Any]
+) -> tuple[list[str], int, bool]:
+    """Resolve GPQA choices across canonical and prompt/ground-truth exports.
+
+    ``choices_embedded`` is true when the source prompt already contains the
+    labelled options.  Such prompts must not be shuffled or have a second
+    option block appended during rendering: the ground-truth letter refers to
+    the original block in the prompt.
+    """
+    values: list[Any] | None = None
     explicit = spec.get("choice_keys")
     if explicit is not None:
         if not isinstance(explicit, (list, tuple)) or not explicit:
             raise ValueError("GPQA choice_keys must be a non-empty list")
-        values = [row.get(str(key)) for key in explicit]
-    else:
+        explicit_values = [row.get(str(key)) for key in explicit]
+        # Historical configs use ``Question``/``Correct Answer`` and explicit
+        # choice columns.  If a newer export has prompt/ground_truth instead,
+        # fall through to the schema-independent choices below.
+        if all(value is not None and str(value).strip() for value in explicit_values):
+            values = explicit_values
+
+    if values is None:
         choices_value = row.get("choices")
         if choices_value is None:
             choices_column = next(
@@ -296,34 +333,79 @@ def _gpqa_choices(row: dict[str, Any], answer_key: str, spec: dict[str, Any]) ->
             )
             choices_value = row.get(choices_column) if choices_column else None
         values = _as_list(choices_value)
-        if values is None:
-            normalized = {_normalized_key(key): key for key in row}
-            incorrect = []
-            for index in range(1, 10):
-                key = normalized.get(f"incorrectanswer{index}")
+        if values is not None:
+            values = list(values)
+            answer_value = row.get(answer_key)
+            # A few exports provide only the incorrect choices in ``choices``
+            # and store the correct text separately.  Preserve the historical
+            # loader behavior for text answers, but do not insert a letter
+            # such as ``D`` as if it were an option text.
+            if (
+                answer_value is not None
+                and not re.fullmatch(
+                    r"(?:option|choice)?\s*[A-D]\s*[.)]?",
+                    str(answer_value).strip(),
+                    re.I,
+                )
+                and all(
+                    _normalized_key(value) != _normalized_key(answer_value)
+                    for value in values
+                )
+            ):
+                values.insert(0, answer_value)
+
+    if values is None:
+        normalized = {_normalized_key(key): key for key in row}
+        incorrect = []
+        for index in range(1, 10):
+            key = normalized.get(f"incorrectanswer{index}")
+            if key is not None:
+                incorrect.append(key)
+        if not incorrect:
+            # Some exports use answer_0/answer_1/... rather than the
+            # canonical GPQA column names.
+            for index in range(10):
+                key = normalized.get(f"answer{index}")
                 if key is not None:
                     incorrect.append(key)
-            if not incorrect:
-                # Some exports use answer_0/answer_1/... rather than the
-                # canonical GPQA column names.
-                for index in range(10):
-                    key = normalized.get(f"answer{index}")
-                    if key is not None:
-                        incorrect.append(key)
+        if incorrect:
             values = [row.get(answer_key), *(row[key] for key in incorrect)]
-        else:
-            values = list(values)
-            if row.get(answer_key) not in values:
-                values.insert(0, row.get(answer_key))
-    if any(value is None or not str(value).strip() for value in values):
-        raise ValueError("GPQA rows must contain a non-empty correct answer and choices")
+
+    choices_embedded = False
+    if values is None:
+        values = _embedded_gpqa_choices(row.get("prompt", row.get("problem", "")))
+        choices_embedded = values is not None
+
+    if values is None or any(
+        value is None or not str(value).strip() for value in values
+    ):
+        raise ValueError(
+            "GPQA rows must contain a non-empty correct answer and choices; "
+            "supported schemas are canonical choice columns, a choices list, "
+            "or a prompt containing A./B./C./D. options"
+        )
+
     answer = str(row[answer_key]).strip()
     choices = [str(value).strip() for value in values]
-    try:
-        correct_index = choices.index(answer)
-    except ValueError as error:
-        raise ValueError("GPQA correct answer is absent from choice_keys") from error
-    return choices, correct_index
+    letter = re.fullmatch(r"(?:option|choice)?\s*([A-D])\s*[.)]?", answer, re.I)
+    if letter and 0 <= ord(letter.group(1).upper()) - ord("A") < len(choices):
+        correct_index = ord(letter.group(1).upper()) - ord("A")
+    else:
+        normalized_answer = _normalized_key(answer)
+        try:
+            correct_index = choices.index(answer)
+        except ValueError:
+            matches = [
+                index
+                for index, choice in enumerate(choices)
+                if _normalized_key(choice) == normalized_answer
+            ]
+            if not matches:
+                raise ValueError(
+                    "GPQA correct answer is absent from the resolved choices"
+                ) from None
+            correct_index = matches[0]
+    return choices, correct_index, choices_embedded
 
 
 def _plain(value: Any) -> Any:
@@ -393,6 +475,16 @@ def _resolve_column(
 ) -> str:
     if explicit:
         if explicit not in columns:
+            # Resolved configs are immutable and may predate a dataset export
+            # rename (for example ``Question`` -> ``prompt`` and
+            # ``Correct Answer`` -> ``ground_truth`` in GPQA Diamond).  Keep
+            # honoring an explicit key when present, but safely migrate to a
+            # known semantic alias when the old key is absent.
+            normalized = {_normalized_key(column): column for column in columns}
+            for alias in aliases:
+                replacement = normalized.get(_normalized_key(alias))
+                if replacement is not None:
+                    return replacement
             raise ValueError(
                 f"Configured {kind} column {explicit!r} is absent; columns={columns}"
             )
@@ -440,16 +532,26 @@ def load_benchmark(
             "answer": str(answer),
         }
         if kind == "gpqa":
-            choices, correct_index = _gpqa_choices(row, answer_key, spec)
+            choices, correct_index, choices_embedded = _gpqa_choices(
+                row, answer_key, spec
+            )
             # Deterministic choice shuffling avoids putting the correct option
             # in a fixed position while keeping HF/vLLM and every re-evaluation
-            # byte-for-byte comparable.
-            shuffle_seed = int(spec.get("choice_shuffle_seed", 0))
-            order = _stable_choice_permutation(identifier, len(choices), shuffle_seed)
+            # byte-for-byte comparable.  Prompt-embedded options already have
+            # labels referenced by ``ground_truth``; changing their order
+            # would invalidate the original prompt, so preserve that order.
+            if choices_embedded:
+                order = list(range(len(choices)))
+            else:
+                shuffle_seed = int(spec.get("choice_shuffle_seed", 0))
+                order = _stable_choice_permutation(
+                    identifier, len(choices), shuffle_seed
+                )
             item["metadata"] = {
                 "task_type": "gpqa",
                 "choices": [choices[position] for position in order],
                 "correct_choice": order.index(correct_index),
+                "choices_embedded": choices_embedded,
             }
         normalized.append(item)
     schema = {
@@ -550,15 +652,24 @@ def render_evaluation_prompt(
         choices = metadata.get("choices", [])
         if not choices:
             raise ValueError(f"GPQA row {row.get('id')} has no choices")
-        choice_text = "\n".join(
-            f"{labels[index]}. {choice}" for index, choice in enumerate(choices)
-        )
-        problem = (
-            f"{row['problem'].strip()}\n\n"
-            "Choose the single best answer from the options below. "
-            "Reply with the option letter (A, B, C, or D) and optionally a brief explanation.\n"
-            f"{choice_text}"
-        )
+        if metadata.get("choices_embedded"):
+            # The source prompt already contains its A./B./C./D. block.  Do
+            # not append a second (possibly reordered) block: ground_truth is
+            # defined against the original labels.
+            problem = (
+                f"{row['problem'].strip()}\n\n"
+                "Reply with the option letter (A, B, C, or D) and optionally a brief explanation."
+            )
+        else:
+            choice_text = "\n".join(
+                f"{labels[index]}. {choice}" for index, choice in enumerate(choices)
+            )
+            problem = (
+                f"{row['problem'].strip()}\n\n"
+                "Choose the single best answer from the options below. "
+                "Reply with the option letter (A, B, C, or D) and optionally a brief explanation.\n"
+                f"{choice_text}"
+            )
         messages = [{"role": "user", "content": problem}]
         return tokenizer.apply_chat_template(
             messages,
@@ -628,7 +739,7 @@ def evaluate_loaded_suite(
     max_new_tokens = int(evaluation.get("max_new_tokens", 2048))
     temperature = float(evaluation.get("temperature", 0.7))
     top_p = float(evaluation.get("top_p", 0.95))
-    samples_per_problem = int(evaluation.get("num_responses", 16))
+    samples_per_problem = int(evaluation.get("num_responses", 8))
     metric_name = evaluation_metric_name(
         samples_per_problem, evaluation.get("metric")
     )
@@ -818,8 +929,8 @@ def evaluate_loaded_suite(
                 benchmark_result["pass_at_k"] = selected_score
                 if metric_name == "pass@8":
                     benchmark_result["pass_at_8"] = selected_score
-            elif samples_per_problem == 16:
-                benchmark_result["avg_at_16"] = selected_score
+            elif samples_per_problem == 8:
+                benchmark_result["avg_at_8"] = selected_score
             suite["benchmarks"][benchmark] = benchmark_result
     finally:
         detailed_handle.close()
@@ -862,7 +973,7 @@ def evaluate_suite(
                 "backend": "vllm",
                 "temperature": evaluation.get("temperature", 0.7),
                 "top_p": evaluation.get("top_p", 0.95),
-                "num_responses": evaluation.get("num_responses", 16),
+                "num_responses": evaluation.get("num_responses", 8),
                 "metric": evaluation.get("metric"),
                 "max_new_tokens": evaluation.get("max_new_tokens", 2048),
                 "limit": evaluation.get("limit"),

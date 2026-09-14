@@ -282,7 +282,7 @@ def _history_metric_name(histories: dict[str, list[dict]]) -> str:
                 metrics.add(str(configured))
                 continue
             samples = {
-                int(result.get("samples_per_problem", 16))
+                int(result.get("samples_per_problem", 8))
                 for result in row["benchmarks"].values()
             }
             if len(samples) != 1:
@@ -788,7 +788,7 @@ def plot_results(
             f"{MODEL_ORDER[1:]}; got {plotted_models}"
         )
 
-    metric_name = "avg@16"
+    metric_name = "avg@8"
     comparison_json = results_dir / "comparison.json"
     if comparison_json.is_file():
         comparison_payload = json.loads(comparison_json.read_text(encoding="utf-8"))

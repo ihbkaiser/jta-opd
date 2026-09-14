@@ -213,8 +213,8 @@ prompt batch 64, `n=1`, PPO mini-batch toàn cục 16 trajectory, rồi micro-ba
 Prompt/response là `1024/7168`, eval/save mỗi 50 optimizer step. Micro-batch không tự
 giảm khi OOM và LR không tự scale; thử `8 → 16`, rồi lùi về `4` nếu thiếu VRAM, giữ global batch 64.
 
-Evaluation mặc định dùng vLLM `n=16`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric
-chính là `avg@16`, tức mean của `number_correct/16` theo problem. Để eval lại toàn bộ checkpoint đã
+Evaluation mặc định dùng vLLM `n=8`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric
+chính là `avg@8`, tức mean của `number_correct/8` theo problem. Để eval lại toàn bộ checkpoint đã
 lưu và thay thế lịch sử/file eval cũ, dùng `scripts/reeval_all_checkpoints_b200.sh`; để chỉ chạy một
 method, dùng `scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]`. Lệnh dry-run/chạy thật
 nằm trong `RUN_B200.md`.
@@ -260,7 +260,7 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 `--set logging.selected_tokens_enabled=true` cho một run audit ngắn.
 
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
-cho avg@16, loss, TA score distribution, Bellman-RAC `g/V/w`, CMT support/excess diagnostics,
+cho avg@8, loss, TA score distribution, Bellman-RAC `g/V/w`, CMT support/excess diagnostics,
 và mean alignment/V/weight. `plot_training_progress.sh` hỗ trợ
 `PLOT_METHODS='opd ta rac pgt cmt'` với một hoặc nhiều method.
 Một method tạo sáu đường benchmark (thêm GPQA-Diamond và AMC23); từ hai method trở lên tạo sáu subplot benchmark,

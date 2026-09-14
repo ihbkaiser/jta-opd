@@ -144,8 +144,8 @@ barrier; filesystem sentinel phát hiện completion/failure, và chỉ dùng co
 Vì vậy multi-GPU periodic evaluation yêu cầu `training_evaluation.backend=vllm`; HF fallback chỉ
 được dùng khi chạy một GPU.
 
-Full eval có 1.060 problem và `n=16`, vì vậy progress của vLLM hiển thị 16.960 generated responses
-(`1.060 * 16`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
+Full eval có 1.060 problem và `n=8`, vì vậy progress của vLLM hiển thị 8.480 generated responses
+(`1.060 * 8`); đây không phải rollout train `n=1`. Để không lặp lại lượt base tốn thời gian, step 0
 được cache theo fingerprint của model, dataset, evaluator và toàn bộ protocol. OPD sinh lần đầu;
 TA-OPD/RAC copy đúng cùng prediction. Một run bị lỗi trước step train đầu tiên cũng tái sử dụng
 `training_eval/step-000000` hợp lệ khi chạy lại. Có thể tắt bằng
@@ -240,7 +240,7 @@ CMT thêm support coverage/common mass/local-excess/sequential-gain/learning-val
 Debug vLLM/HF log-prob MAE chỉ xuất hiện khi chủ động bật sanity validation. Mọi giá trị đã được
 reduce toàn cục trước khi rank 0 ghi.
 
-Full avg@16 trên 1.060 problem bắt buộc sinh 16.960 response cho mỗi checkpoint khác nhau; không thể
+Full avg@8 trên 1.060 problem bắt buộc sinh 8.480 response cho mỗi checkpoint khác nhau; không thể
 giảm con số này mà vẫn giữ nguyên metric. Nếu ưu tiên thời gian train không bị chặn bởi eval, có thể
 lưu đúng mỗi 50 step, tắt eval inline, rồi chạy evaluator trên các checkpoint sau train (kết quả
 checkpoint không đổi, nhưng về mặt vận hành đây không còn là eval đồng bộ bên trong train):
@@ -259,14 +259,14 @@ REEVAL_TEMPERATURE="$TRAIN_EVAL_TEMPERATURE" \
 ```
 
 Step 0 vẫn chỉ generate một lần nhờ shared fingerprint cache. Không đổi training `NUM_RESPONSES=1`,
-`TRAIN_EVAL_NUM_RESPONSES=16` hoặc `MAX_RESPONSE_LENGTH` nếu mục tiêu là so sánh đúng protocol hiện
+`TRAIN_EVAL_NUM_RESPONSES=8` hoặc `MAX_RESPONSE_LENGTH` nếu mục tiêu là so sánh đúng protocol hiện
 tại; các thay đổi đó nhanh hơn nhưng là thí nghiệm khác.
 
-### Accuracy một response thay cho avg@16
+### Accuracy một response thay cho avg@8
 
-Nếu không cần avg@16, đặt `TRAIN_EVAL_NUM_RESPONSES=1`. Mỗi checkpoint chỉ sinh một response cho
-mỗi problem, tức 1.060 generation trên bốn bộ thay vì 16.960. Output, CSV và biểu đồ tự ghi nhãn
-`accuracy`, không còn ghi nhầm `avg@16`:
+Nếu không cần avg@8, đặt `TRAIN_EVAL_NUM_RESPONSES=1`. Mỗi checkpoint chỉ sinh một response cho
+mỗi problem, tức 1.060 generation trên sáu bộ thay vì 8.480. Output, CSV và biểu đồ tự ghi nhãn
+`accuracy`, không còn ghi nhầm `avg@8`:
 
 ```bash
 TRAIN_EVAL_NUM_RESPONSES=1 TRAIN_EVAL_TEMPERATURE=1 \
@@ -287,7 +287,7 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 ```
 
 Với temperature 1 đây là sampled accuracy@1 theo seed cố định, không phải greedy decoding. Chế độ
-n=1 nhanh hơn nhiều nhưng có variance lớn hơn n=16; phải dùng cùng n/temperature/top-p/seed cho cả
+n=1 nhanh hơn nhiều nhưng có variance lớn hơn n=8; phải dùng cùng n/temperature/top-p/seed cho cả
 các method đang so sánh.
 
 ## Resume after interruption
@@ -335,7 +335,7 @@ CUDA_VISIBLE_DEVICES=0 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
   bash scripts/eval_checkpoint_b200.sh opd \
   outputs/my_opd_run/opd/checkpoint-000050
 
-CUDA_VISIBLE_DEVICES=1 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=16 \
+CUDA_VISIBLE_DEVICES=1 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=8 \
   bash scripts/eval_checkpoint_b200.sh ta-opd \
   outputs/my_ta_run/ta_opd/checkpoint-000100
 
@@ -345,7 +345,7 @@ CUDA_VISIBLE_DEVICES=2 EVAL_TEMPERATURE=1 EVAL_NUM_RESPONSES=1 \
 ```
 
 `METHOD` nhận `opd`, `ta-opd` (hoặc `ta`), `rac`, `pgt` hoặc `cmt`. Script dùng vLLM mặc định; có thể đặt
-`EVAL_BACKEND=hf`. Mặc định riêng của launcher chung là `temperature=1`, `n=16`; đặt
+`EVAL_BACKEND=hf`. Mặc định riêng của launcher chung là `temperature=1`, `n=8`; đặt
 `EVAL_NUM_RESPONSES=1` để lấy accuracy một response thay vì avg@n.
 
 Nếu truyền `OUTPUT_DIR` thứ ba, artifact vẫn được ghi vào thư mục đó; với layout checkpoint
@@ -353,8 +353,10 @@ chuẩn, history của run vẫn được cập nhật. Chạy lại cùng check
 hiện có, không tạo duplicate.
 
 Mỗi thư mục eval chứa `summary.json`, sáu file `*_predictions.jsonl.gz` (Competition-MATH,
-MATH-500, AIME24, AIME25, GPQA-Diamond, AMC23). AMC23 dùng parquet
-`nlp/minhpn19/data/amc23/test-00000-of-00001.parquet` (cột `problem`, `answer`) và
+MATH-500, AIME24, AIME25, GPQA-Diamond, AMC23). GPQA-Diamond dùng export
+`id,prompt,ground_truth`, trong đó prompt đã có sẵn các lựa chọn A--D; loader cũng nhận
+export cũ với các cột lựa chọn riêng. AMC23 dùng parquet
+`nlp/minhpn19/data/amc23/test-00000-of-00001.parquet` (cột `id`, `question`, `answer`) và
 cùng math prompt/verifier với các benchmark toán khác. File gộp
 `model_outputs_detailed.jsonl.gz`. File gộp lưu dataset, ID, đề bài, đáp án chuẩn, prompt thực tế,
 toàn bộ response, đúng/sai từng response và generation parameters. Đọc nhanh bằng:
@@ -387,8 +389,8 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" RAC_RUN_NAME="$RAC_RUN_N
 CUDA_VISIBLE_DEVICES=0 bash scripts/eval_all_b200.sh
 ```
 
-Evaluation mặc định dùng vLLM sampling (`n=16`, `temperature=0.7`, `top_p=0.95`,
-`max_new_tokens=7168`) và báo cáo `avg@16`; mỗi problem lưu đủ 16 generation/correctness.
+Evaluation mặc định dùng vLLM sampling (`n=8`, `temperature=0.7`, `top_p=0.95`,
+`max_new_tokens=7168`) và báo cáo `avg@8`; mỗi problem lưu đủ 8 generation/correctness.
 Fallback: `EVAL_BACKEND=hf`. Tensor parallel example:
 
 ```bash
@@ -397,10 +399,10 @@ CUDA_VISIBLE_DEVICES=0,1 EVAL_VLLM_TENSOR_PARALLEL_SIZE=2 \
 bash scripts/eval_all_b200.sh
 ```
 
-## Re-eval mọi checkpoint đã lưu theo protocol avg@16
+## Re-eval mọi checkpoint đã lưu theo protocol avg@8
 
 Script dưới đây tìm `checkpoint-<step>` và `final/` trong các output đã chọn. Nó cũng eval lại base ở
-step 0 để toàn bộ đường avg@16 dùng cùng protocol. Mỗi `training_eval/step-*` tương ứng,
+step 0 để toàn bộ đường avg@8 dùng cùng protocol. Mỗi `training_eval/step-*` tương ứng,
 `eval_history.jsonl` và `eval_metrics.csv` cũ sẽ bị thay thế; raw prediction và `summary.json`
 trong từng step cũng bị thay thế. Base được generate một lần rồi tái sử dụng cho hai method còn
 lại; checkpoint sau train vẫn được eval độc lập. Đặt `REEVAL_REUSE_BASE=false` nếu cần cố ý sinh
@@ -455,8 +457,8 @@ REEVAL_TEMPERATURE=1 REEVAL_NUM_RESPONSES=1 \
   bash scripts/reeval_method_checkpoints_b200.sh opd "$OPD_RUN_NAME"
 ```
 
-Đổi `opd` thành `ta`, `rac`, `pgt` hoặc `cmt` và truyền run name tương ứng. Với avg@16, đổi
-`REEVAL_NUM_RESPONSES=16`. Nếu đã export `OPD_RUN_NAME`, có thể bỏ đối số run name. Cũng có thể
+Đổi `opd` thành `ta`, `rac`, `pgt` hoặc `cmt` và truyền run name tương ứng. Với avg@8, đặt
+`REEVAL_NUM_RESPONSES=8`. Nếu đã export `OPD_RUN_NAME`, có thể bỏ đối số run name. Cũng có thể
 chỉ trực tiếp output không theo layout mặc định:
 
 ```bash

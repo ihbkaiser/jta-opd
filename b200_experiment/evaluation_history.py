@@ -27,7 +27,7 @@ EVAL_METRIC_FIELDS = (
     "total",
     "accuracy",
     "avg_at_n",
-    "avg_at_16",
+    "avg_at_8",
     "pass_at_k",
     "pass_at_8",
     "problems",
@@ -193,7 +193,7 @@ def _history_entry(
             ),
             "metric": result.get("metric", metric_name),
         }
-        for key in ("avg_at_16", "pass_at_k", "pass_at_8"):
+        for key in ("avg_at_8", "pass_at_k", "pass_at_8"):
             if key in result:
                 entry[key] = result[key]
         benchmarks[str(name)] = entry
