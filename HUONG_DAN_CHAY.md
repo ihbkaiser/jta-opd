@@ -94,6 +94,7 @@ export SAVE_INTERVAL=50
 export EVAL_INTERVAL=50
 export TRAIN_EVAL_ENABLED=true
 export TRAIN_EVAL_NUM_RESPONSES=8
+export TRAIN_EVAL_SEED=42
 export TRAIN_EVAL_SYNC_TIMEOUT_SEC=86400
 export ROLLOUT_TEMPERATURE=1.0
 export ROLLOUT_TOP_P=1.0
@@ -166,6 +167,10 @@ Multi-GPU training-time evaluation yêu cầu `training_evaluation.backend=vllm`
 dùng được cho single-GPU.
 Có thể ghi pass@8 ngay trong periodic evaluation bằng
 `TRAIN_EVAL_NUM_RESPONSES=8 TRAIN_EVAL_METRIC=pass@8`.
+Seed sampling của vLLM trong periodic evaluation được điều khiển riêng bằng
+`TRAIN_EVAL_SEED` (ví dụ `TRAIN_EVAL_SEED=42`); biến này không thay đổi
+`SEED` của optimizer/data hoặc `ROLLOUT_SEED` của student rollout. Nếu không đặt,
+training-time evaluation giữ mặc định `1234` để tương thích các run cũ.
 Các rank phải cùng nhìn thấy `experiment.output_dir` (filesystem dùng chung) để đọc sentinel và
 merge shard.
 Output mặc định:

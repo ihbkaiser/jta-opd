@@ -44,6 +44,9 @@ export TRAIN_EVAL_INTERVAL="${TRAIN_EVAL_INTERVAL:-50}"
 export TRAIN_EVAL_NUM_RESPONSES="${TRAIN_EVAL_NUM_RESPONSES:-8}"
 export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-0.7}"
 export TRAIN_EVAL_TOP_P="${TRAIN_EVAL_TOP_P:-0.95}"
+# Seed riêng cho vLLM evaluation trong lúc train; không thay đổi seed rollout
+# hoặc seed của optimizer/data. Có thể override bằng TRAIN_EVAL_SEED=42.
+export TRAIN_EVAL_SEED="${TRAIN_EVAL_SEED:-1234}"
 export TRAIN_EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-7168}"
 export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 export DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-fsdp}"
@@ -80,7 +83,7 @@ cd "${REPO_DIR}"
 if [[ "${ABLATION_DRY_RUN:-false}" == "true" || "${ABLATION_DRY_RUN:-false}" == "1" ]]; then
   echo "Dry run: ${ARM} -> ${OUTPUT_DIR}"
   echo "train_max_new_tokens=${MAX_RESPONSE_LEN} eval_max_new_tokens=${TRAIN_EVAL_MAX_NEW_TOKENS}"
-  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} gamma=${CMT_GAMMA} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P}"
+  echo "top_k=${TOP_K} epsilon=${CMT_ALLOCATION_KL} gamma=${CMT_GAMMA} lr=${LR} rollout_top_p=${ROLLOUT_TOP_P} eval_seed=${TRAIN_EVAL_SEED}"
   exit 0
 fi
 exec bash "${REPO_DIR}/scripts/train_cmt_b200.sh" \

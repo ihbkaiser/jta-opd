@@ -13,6 +13,7 @@ def test_launchers_resolve_paths_from_script_directory():
         assert "SCRIPT_DIR" in text
     train = (ROOT / "scripts/train.sh").read_text(encoding="utf-8")
     assert "MAX_RESPONSE_LEN" in train and "TRAIN_EVAL_MAX_NEW_TOKENS" in train
+    assert "TRAIN_EVAL_SEED" in train
     assert "selector.cmt_ablation_arm" in train
 
 
