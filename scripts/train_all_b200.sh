@@ -7,8 +7,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # child method, regardless of legacy variables inherited by this shell.
 export STUDENT_MODEL="${STUDENT_MODEL:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}"
 export TEACHER_MODEL="${TEACHER_MODEL:-models/Qwen3-8B}"
-export TRAIN_DATA="${TRAIN_DATA:-nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet}"
-export PROMPT_KEY="${PROMPT_KEY:-problem}"
+export TRAIN_DATASET="${TRAIN_DATASET:-competition_math}"
+if [[ -z "${TRAIN_DATA:-}" ]]; then
+  case "${TRAIN_DATASET,,}" in
+    dapo_math|dapo-math|dapo)
+      export TRAIN_DATA="nlp/minhpn19/data/DAPO-Math-17k-Processed"
+      export PROMPT_KEY="${PROMPT_KEY:-prompt}"
+      ;;
+    *)
+      export TRAIN_DATA="nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet"
+      export PROMPT_KEY="${PROMPT_KEY:-problem}"
+      ;;
+  esac
+else
+  if [[ -z "${PROMPT_KEY:-}" && "${TRAIN_DATASET,,}" =~ ^dapo(_math|-math)?$ ]]; then
+    export PROMPT_KEY="prompt"
+  else
+    export PROMPT_KEY="${PROMPT_KEY:-problem}"
+  fi
+fi
 # ==============================================================
 
 # ================= BASIC PARAMETERS: EDIT HERE =================

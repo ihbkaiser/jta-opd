@@ -65,6 +65,47 @@ class GRPOTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(advantages, torch.tensor([1.0, -1.0, 1.0, -1.0])))
 
+    def test_dapo_solution_field_is_used_for_math_reward(self):
+        rollout = self._rollout()
+        records = [
+            {"prompt": "p", "solution": "42"},
+            {"prompt": "p", "solution": "0"},
+            {"prompt": "q", "solution": "7"},
+            {"prompt": "q", "solution": "0"},
+        ]
+        _, advantages, stats = _grpo_group_advantages(
+            rollout,
+            _Tokenizer(),
+            records,
+            torch.ones(4, dtype=torch.bool),
+            [0, 1, 0, 1],
+            2,
+            torch.device("cpu"),
+            answer_key="answer",
+            benchmark="Competition-MATH",
+        )
+        self.assertTrue(torch.allclose(advantages, torch.tensor([1.0, -1.0, 1.0, -1.0])))
+        self.assertEqual(stats["reward_mean"], 0.5)
+
+    def test_dapo_nested_reward_model_ground_truth_is_fallback(self):
+        rollout = self._rollout()
+        records = [
+            {"prompt": "p", "reward_model": {"ground_truth": "42"}},
+            {"prompt": "p", "reward_model": {"ground_truth": "0"}},
+            {"prompt": "q", "reward_model": {"ground_truth": "7"}},
+            {"prompt": "q", "reward_model": {"ground_truth": "0"}},
+        ]
+        _, advantages, _ = _grpo_group_advantages(
+            rollout,
+            _Tokenizer(),
+            records,
+            torch.ones(4, dtype=torch.bool),
+            [0, 1, 0, 1],
+            2,
+            torch.device("cpu"),
+        )
+        self.assertTrue(torch.allclose(advantages, torch.tensor([1.0, -1.0, 1.0, -1.0])))
+
 
 if __name__ == "__main__":
     unittest.main()

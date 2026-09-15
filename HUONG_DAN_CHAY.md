@@ -179,6 +179,22 @@ MAX_STEPS=10 RUN_NAME=grpo_debug bash scripts/train_grpo_b200.sh
 GRPO dùng `rollout.temperature=1.0` để log-prob hành vi từ vLLM là đúng mẫu số PPO;
 không đặt `ROLLOUT_TEMPERATURE` khác 1.0.
 
+Với `TRAIN_DATASET=dapo_math`, DAPO-Math-17k dùng trường đáp án `solution`
+(và bản sao `reward_model.ground_truth`), không dùng `answer`. Launcher GRPO tự
+chọn `GRPO_ANSWER_KEY=solution`; `GRPO_REWARD_BENCHMARK` vẫn nên để
+`Competition-MATH` vì biến này chọn math grader, không phải tên dataset:
+
+```bash
+TRAIN_DATASET=dapo_math \
+GRPO_REWARD_BENCHMARK=Competition-MATH \
+GRPO_RUN_NAME="grpo_dapo_math_seed42" \
+  bash scripts/train_grpo_b200.sh
+```
+
+Có thể override thủ công bằng `GRPO_ANSWER_KEY=solution`. Code cũng fallback
+an toàn qua các field `answer`, `solution`, `ground_truth` và
+`reward_model.ground_truth` nếu dataset custom không dùng schema mặc định.
+
 Trong workflow tuần tự, GRPO mặc định tắt để không vô tình phát sinh thêm GPU-hours;
 bật rõ ràng như sau:
 

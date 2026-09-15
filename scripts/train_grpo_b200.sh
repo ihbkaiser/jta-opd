@@ -39,7 +39,18 @@ export BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 # GRPO needs multiple samples for every prompt in order to form a relative
 # baseline. Keep this separate from TRAIN_EVAL_NUM_RESPONSES.
 export GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-8}"
-export GRPO_ANSWER_KEY="${GRPO_ANSWER_KEY:-answer}"
+if [[ -z "${GRPO_ANSWER_KEY:-}" ]]; then
+  case "${TRAIN_DATASET,,}" in
+    dapo_math|dapo-math|dapo)
+      # DAPO-Math-17k-Processed uses the top-level `solution` field and also
+      # carries the same value as reward_model.ground_truth.
+      export GRPO_ANSWER_KEY="solution"
+      ;;
+    *)
+      export GRPO_ANSWER_KEY="answer"
+      ;;
+  esac
+fi
 export GRPO_REWARD_BENCHMARK="${GRPO_REWARD_BENCHMARK:-Competition-MATH}"
 # For GRPO this is not an independent knob: the rollout response count must
 # equal the group size, even when a shell inherited NUM_RESPONSES=1 from an

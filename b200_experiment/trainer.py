@@ -2006,6 +2006,52 @@ def _save_checkpoint(
     return checkpoint
 
 
+def _grpo_answer_value(record: dict[str, Any], configured_key: str) -> Any:
+    """Resolve a GRPO answer across common math-dataset schemas.
+
+    Competition-MATH uses ``answer`` while DAPO-Math-17k uses ``solution``
+    and stores a duplicate answer under ``reward_model.ground_truth``.  The
+    reward benchmark selects the grading family (math vs. GPQA); it is not a
+    dataset-name switch and must not be used to guess this field.
+    """
+
+    def nonempty(value: Any) -> Any | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    def lookup(key: str) -> Any | None:
+        current: Any = record
+        for part in str(key).split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return nonempty(current)
+
+    configured = lookup(configured_key)
+    if configured is not None:
+        return configured
+
+    # Keep this fallback deliberately small and deterministic.  It lets one
+    # GRPO launcher work for the shipped Competition-MATH and DAPO exports,
+    # while an explicitly configured key still has precedence.
+    for key in (
+        "answer",
+        "solution",
+        "ground_truth",
+        "reference_answer",
+        "target",
+        "final_answer",
+        "reward_model.ground_truth",
+    ):
+        value = lookup(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _grpo_group_advantages(
     rollout,
     tokenizer,
@@ -2039,12 +2085,22 @@ def _grpo_group_advantages(
             rollout.response_ids[row][valid].detach().cpu().tolist(),
             skip_special_tokens=True,
         )
-        if answer_key not in record:
+        answer = _grpo_answer_value(record, answer_key)
+        if answer is None:
+            available = ", ".join(sorted(map(str, record))) or "<none>"
             raise KeyError(
-                f"GRPO reward answer field {answer_key!r} is missing from training row"
+                f"GRPO could not resolve answer field {answer_key!r}; "
+                f"tried answer/solution/ground_truth aliases; available fields: {available}"
             )
+        # grade_evaluation_response intentionally consumes the canonical
+        # ``answer`` key.  Adapt only this ephemeral grading row, leaving the
+        # original dataset record and checkpoint metadata unchanged.
+        reward_record = record
+        if record.get("answer") != answer:
+            reward_record = dict(record)
+            reward_record["answer"] = answer
         rewards[row] = float(
-            grade_evaluation_response(response, record, benchmark=benchmark)
+            grade_evaluation_response(response, reward_record, benchmark=benchmark)
         )
     if rewards.numel() % group_size:
         raise ValueError("GRPO rollout rows are not divisible by the group size")
