@@ -75,8 +75,17 @@ là protocol chính để estimator CMT có diễn giải on-policy chính xác.
 ```bash
 bash ablation/scripts/train.sh g
 bash ablation/scripts/train.sh g_x
-bash ablation/scripts/train.sh g_d
 ```
+
+`g_d` chính là score canonical của CMT production (`learning_value`). Vì vậy,
+nếu đã có một run CMT với cùng student/teacher, seed, rollout, `top_k`,
+`epsilon`, `gamma`, `successor_lambda`, learning rate và evaluation protocol,
+không cần chạy lại `ablation/scripts/train.sh g_d`. Khi vẽ arms, truyền run CMT
+đó qua `GD_CMT_RUN_NAME` (hoặc `G_D_RUN_NAME`); plotting sẽ đọc trực tiếp
+`outputs/<run>/cmt_opd/eval_history.jsonl`, không copy hay sửa file production.
+
+Chỉ chạy `g_d` trong ablation khi cần kiểm tra reproducibility độc lập hoặc khi
+CMT production không dùng đúng cấu hình so sánh.
 
 Nếu không đặt `RUN_NAME`, launcher tự tạo tên khoa học dạng:
 
@@ -88,7 +97,8 @@ Ví dụ `cmt_g_d_epsilon0p5_gamma1p0_topk16_lr1em6_seed42_20260912_200100`.
 Output nằm trong `ablation/outputs/<run-name>/` và không bị ghi đè. Smoke run:
 
 ```bash
-MAX_STEPS=2 bash ablation/scripts/train.sh g_d
+MAX_STEPS=2 bash ablation/scripts/train.sh g
+MAX_STEPS=2 bash ablation/scripts/train.sh g_x
 ```
 
 Liệt kê các run để lấy tên tự động cho bước plotting:
@@ -274,6 +284,31 @@ Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23:
 `ablation_final.png` (điểm cuối của ba arm). Có thể chọn một tập con bằng
 `BENCHMARKS="MATH-500,GPQA-Diamond"`. Các mode `epsilon`, `gamma`, `top_k`,
 `lr` vẫn dùng `BENCHMARK` để vẽ một dataset cụ thể.
+
+Ví dụ dùng hai run ablation mới và CMT production làm `g_d`:
+
+```bash
+PLOT_MODE=arms \
+RUN_NAMES="g_run_name g_x_run_name" \
+GD_CMT_RUN_NAME="cmt_20260910_162411_583912493" \
+  bash ablation/scripts/plot_ablation.sh
+```
+
+Mặc định script sẽ đọc:
+`outputs/<GD_CMT_RUN_NAME>/cmt_opd/eval_history.jsonl`. Có thể truyền đường dẫn
+đầy đủ nếu output nằm ở nơi khác:
+
+```bash
+PLOT_MODE=arms \
+RUN_NAMES="g_run_name g_x_run_name" \
+GD_CMT_OUTPUT_DIR="/workspace/storage-shared/nlp/minhpn19/BellmanOPD/outputs/cmt_.../cmt_opd" \
+GD_CMT_RUN_NAME="cmt_..." \
+  bash ablation/scripts/plot_ablation.sh
+```
+
+`G_D_CMT_RUN_NAME`, `G_D_RUN_NAME` và `GD_RUN_NAME` là alias của `GD_CMT_RUN_NAME`. Output CMT
+production chỉ được đọc; script không tạo `ablation_spec.json` giả và không sửa
+`eval_history.jsonl`.
 
 Mỗi lệnh tạo một thư mục mới dưới `ablation/figures/`, ví dụ
 `ablation/figures/qwen14b_4b_epsilon/`. Nếu `PLOT_TAG` đã tồn tại, launcher tự

@@ -22,6 +22,10 @@ export RUN_NAME_1="${RUN_NAME_1:-}"
 export RUN_NAME_2="${RUN_NAME_2:-}"
 export RUN_NAME_3="${RUN_NAME_3:-}"
 export RUN_NAME_4="${RUN_NAME_4:-}"
+# Canonical g_d is already the production CMT score.  Set one of these to
+# reuse that run instead of training an ablation/g_d duplicate.
+export GD_CMT_RUN_NAME="${GD_CMT_RUN_NAME:-${G_D_CMT_RUN_NAME:-${G_D_RUN_NAME:-${GD_RUN_NAME:-}}}}"
+export GD_CMT_OUTPUT_DIR="${GD_CMT_OUTPUT_DIR:-${G_D_CMT_OUTPUT_DIR:-${G_D_OUTPUT_DIR:-${GD_OUTPUT_DIR:-}}}}"
 export PLOT_TAG="${PLOT_TAG:-}"
 # ============================================================
 
@@ -47,6 +51,18 @@ case "${PLOT_MODE}" in
     COMMAND=("${PYTHON_BIN}" "${SCRIPT_DIR}/../plots/plot_ablation.py"
       --input-root "${INPUT_ROOT}" --output-dir "${OUTPUT_DIR}"
       --benchmarks "${BENCHMARKS}" --metric "${METRIC}")
+    if [[ -n "${GD_CMT_RUN_NAME}" || -n "${GD_CMT_OUTPUT_DIR}" ]]; then
+      if [[ -z "${GD_CMT_OUTPUT_DIR}" ]]; then
+        GD_CMT_OUTPUT_DIR="${CMT_OUTPUT_ROOT:-${REPO_DIR}/outputs}/${GD_CMT_RUN_NAME}/cmt_opd"
+      fi
+      if [[ -z "${GD_CMT_RUN_NAME}" ]]; then
+        GD_CMT_RUN_NAME="$(basename "$(dirname "${GD_CMT_OUTPUT_DIR%/}")")"
+      fi
+      COMMAND+=(
+        --g-d-output "${GD_CMT_OUTPUT_DIR}"
+        --g-d-run-name "${GD_CMT_RUN_NAME}"
+      )
+    fi
     ;;
   epsilon|gamma|top_k|lr)
     COMMAND=("${PYTHON_BIN}" "${SCRIPT_DIR}/../plots/plot_hparam.py"

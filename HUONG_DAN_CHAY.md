@@ -220,6 +220,11 @@ RUN_NAME="$PGT_RUN_NAME" bash scripts/train_pgt_b200.sh
 Các launcher dùng chung rollout, checkpoint, TensorBoard và evaluation pipeline; teacher scoring
 chỉ áp dụng cho OPD/TA/CMT, không áp dụng cho GRPO.
 
+Trong CMT ablation, `g_d` chính là score canonical `learning_value` của CMT. Nếu
+đã có CMT production run cùng cấu hình, không cần train lại `g_d`; chỉ train
+`g` và `g_x`, sau đó truyền `GD_CMT_RUN_NAME` khi vẽ trong
+`ablation/scripts/plot_ablation.sh`.
+
 Training-time evaluation tự dùng toàn bộ GPU training khi `world_size>1`: mỗi rank chạy một
 vLLM replica độc lập với `tensor_parallel_size=1`, nhận shard deterministic của benchmark, rồi
 rank 0 merge lại thành đúng `summary.json`, prediction files và `model_outputs_detailed.jsonl.gz`
@@ -231,8 +236,9 @@ Multi-GPU training-time evaluation yêu cầu `training_evaluation.backend=vllm`
 dùng được cho single-GPU.
 Có thể ghi pass@8 ngay trong periodic evaluation bằng
 `TRAIN_EVAL_NUM_RESPONSES=8 TRAIN_EVAL_METRIC=pass@8`.
-Các launcher `ablation/scripts/train.sh g`, `g_x` và `g_d` mặc định đánh giá đủ
-6 benchmark: Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23.
+Các launcher `ablation/scripts/train.sh g`, `g_x` và (nếu thực sự chạy độc lập)
+`g_d` mặc định đánh giá đủ 6 benchmark: Competition-MATH, MATH-500, AIME24,
+AIME25, GPQA-Diamond và AMC23.
 Có thể chủ động chạy một subset bằng `TRAIN_EVAL_BENCHMARKS="MATH-500,GPQA-Diamond"`.
 Seed sampling của vLLM trong periodic evaluation được điều khiển riêng bằng
 `TRAIN_EVAL_SEED` (ví dụ `TRAIN_EVAL_SEED=42`); biến này không thay đổi

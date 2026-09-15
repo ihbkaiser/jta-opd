@@ -68,3 +68,46 @@ def test_arm_plot_accepts_benchmark_subset(tmp_path, monkeypatch):
     )
     assert main() == 0
     assert (output / "ablation_curves.png").is_file()
+
+
+def test_arm_plot_can_reuse_production_cmt_as_g_d(tmp_path, monkeypatch):
+    _write_run(tmp_path, "g")
+    _write_run(tmp_path, "g_x")
+    cmt_output = tmp_path / "outputs" / "cmt_existing" / "cmt_opd"
+    cmt_output.mkdir(parents=True)
+    rows = [
+        {
+            "step": step,
+            "benchmarks": {
+                benchmark: {"accuracy": 0.60 + 0.01 * step / 10}
+                for benchmark in BENCHMARK_ORDER
+            },
+        }
+        for step in (0, 10)
+    ]
+    (cmt_output / "eval_history.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    output = tmp_path / "figures"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "plot_ablation.py",
+            "--input-root",
+            str(tmp_path),
+            "--output-dir",
+            str(output),
+            "--run-name",
+            "run_g",
+            "--run-name",
+            "run_g_x",
+            "--g-d-output",
+            str(cmt_output),
+            "--g-d-run-name",
+            "cmt_existing",
+        ],
+    )
+    assert main() == 0
+    assert (output / "ablation_curves.png").is_file()
+    assert (output / "ablation_final.png").is_file()

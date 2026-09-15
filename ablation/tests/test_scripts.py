@@ -59,3 +59,6 @@ def test_plot_launcher_uses_a_fresh_named_directory():
     assert "BENCHMARKS" in text
     assert "--benchmarks" in text
     assert "date +%Y%m%d_%H%M%S_%N" in text
+    assert "GD_CMT_RUN_NAME" in text
+    assert "--g-d-output" in text
+    assert "--g-d-run-name" in text

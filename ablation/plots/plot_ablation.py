@@ -52,6 +52,16 @@ def _resolve_benchmarks(single: str | None, multiple: str | None) -> tuple[str, 
     return tuple(name for name in BENCHMARK_ORDER if name in resolved)
 
 
+def _read_history(history_path: Path) -> list[dict]:
+    """Read a history file while preserving partial/missing benchmark rows."""
+
+    return [
+        json.loads(line)
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def _runs(root: Path, selected: set[str] | None = None):
     for spec_path in sorted(root.rglob("ablation_spec.json")):
         if selected and spec_path.parent.name not in selected:
@@ -60,14 +70,58 @@ def _runs(root: Path, selected: set[str] | None = None):
             spec = json.loads(spec_path.read_text(encoding="utf-8"))
             history_path = spec_path.parent / "eval_history.jsonl"
             if history_path.is_file():
-                rows = [
-                    json.loads(line)
-                    for line in history_path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
+                rows = _read_history(history_path)
                 yield spec_path.parent, spec, rows
         except (OSError, json.JSONDecodeError):
             continue
+
+
+def _resolve_external_history(output: Path) -> Path:
+    """Resolve a production method output to its eval history.
+
+    Users commonly provide either ``outputs/<run>/cmt_opd`` or the run root
+    ``outputs/<run>``.  Accept both forms without copying or modifying the
+    production CMT artifacts.
+    """
+
+    output = output.expanduser().resolve()
+    if output.is_file():
+        if output.name != "eval_history.jsonl":
+            raise ValueError(
+                f"External g_d path must be eval_history.jsonl or a directory: {output}"
+            )
+        return output
+    candidates = (
+        output / "eval_history.jsonl",
+        output / "cmt_opd" / "eval_history.jsonl",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find eval_history.jsonl for external g_d/CMT output; checked: "
+        + ", ".join(str(candidate) for candidate in candidates)
+    )
+
+
+def _external_gd_run(output: Path, run_name: str | None):
+    """Yield a virtual g_d run backed by an existing production CMT history."""
+
+    history_path = _resolve_external_history(output)
+    rows = _read_history(history_path)
+    if run_name:
+        label = run_name
+    elif history_path.parent.name == "cmt_opd":
+        label = history_path.parent.parent.name
+    else:
+        label = history_path.parent.name
+    spec = {
+        "arm": "g_d",
+        "run_name": label,
+        "source": "production_cmt",
+        "history_path": str(history_path),
+    }
+    yield history_path.parent, spec, rows
 
 
 def _benchmark(row: dict, requested: str):
@@ -282,11 +336,32 @@ def main() -> int:
         dest="run_names",
         help="Restrict the plot to these output directory names (repeatable)",
     )
+    parser.add_argument(
+        "--g-d-output",
+        type=Path,
+        help=(
+            "Optional production CMT output (or run root) to use as the g_d arm; "
+            "no files are copied or changed"
+        ),
+    )
+    parser.add_argument(
+        "--g-d-run-name",
+        help="Label for the external production CMT run used as g_d",
+    )
     args = parser.parse_args()
 
     benchmarks = _resolve_benchmarks(args.benchmark, args.benchmarks)
     grouped = {benchmark: defaultdict(list) for benchmark in benchmarks}
-    for path, spec, rows in _runs(args.input_root, set(args.run_names or [])):
+    runs = list(_runs(args.input_root, set(args.run_names or [])))
+    if args.g_d_output is not None:
+        # An explicitly supplied production CMT is authoritative for g_d.  Do
+        # not accidentally plot an old ablation/g_d directory as a duplicate
+        # arm when INPUT_ROOT contains historical runs.
+        runs = [
+            item for item in runs if str(item[1].get("arm", "")) != "g_d"
+        ]
+        runs.extend(_external_gd_run(args.g_d_output, args.g_d_run_name))
+    for path, spec, rows in runs:
         arm = str(spec.get("arm", path.name))
         if arm not in ARMS:
             continue
