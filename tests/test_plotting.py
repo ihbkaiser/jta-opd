@@ -249,6 +249,67 @@ class PlottingTests(unittest.TestCase):
             )
             self.assertAlmostEqual(payload["base_accuracy"]["MATH-500"], 0.12)
 
+    def test_partial_step_skips_missing_points_but_keeps_other_benchmarks(self):
+        benchmarks = (
+            "Competition-MATH",
+            "MATH-500",
+            "AIME24",
+            "AIME25",
+            "GPQA-Diamond",
+            "AMC23",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outputs = {}
+            for method in ("opd", "ta", "cmt"):
+                output = root / method
+                self._write_training_output(
+                    output,
+                    0.25,
+                    benchmark_names=benchmarks,
+                )
+                outputs[method] = output
+
+            # Simulate a partial re-evaluation at one OPD checkpoint: the
+            # GPQA/AMC rows exist, while the four legacy datasets are absent.
+            history_path = outputs["opd"] / "eval_history.jsonl"
+            rows = [json.loads(line) for line in history_path.read_text().splitlines()]
+            rows[1]["benchmarks"] = {
+                name: rows[1]["benchmarks"][name]
+                for name in ("GPQA-Diamond", "AMC23")
+            }
+            history_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            paths = plot_training_progress(
+                root / "results",
+                opd_output=outputs["opd"],
+                ta_output=outputs["ta"],
+                cmt_output=outputs["cmt"],
+                methods=["opd", "ta", "cmt"],
+            )
+            self.assertTrue(Path(paths["accuracy_over_steps"]).is_file())
+            payload = json.loads(Path(paths["history_json"]).read_text())
+            opd_step = next(
+                row for row in payload["histories"]["OPD"] if row["step"] == 100
+            )
+            self.assertEqual(
+                set(opd_step["benchmarks"]), {"GPQA-Diamond", "AMC23"}
+            )
+            with Path(paths["history_csv"]).open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                csv_rows = list(csv.DictReader(handle))
+            opd_csv_step = next(
+                row
+                for row in csv_rows
+                if row["Method"] == "OPD" and row["Step"] == "100"
+            )
+            self.assertEqual(opd_csv_step["MATH-500"], "")
+            self.assertNotEqual(opd_csv_step["GPQA-Diamond"], "")
+
     def test_step_zero_aime_difference_is_not_a_validation_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

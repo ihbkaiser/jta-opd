@@ -188,11 +188,18 @@ def _read_eval_history(output: str | Path | None, method: str) -> list[dict]:
 
 
 def _shared_history_benchmarks(histories: dict[str, list[dict]]) -> tuple[str, ...]:
+    """Return benchmarks present in every method at least once.
+
+    A checkpoint evaluation can be partial (for example, a re-evaluation of
+    only GPQA/AMC) and therefore one history row may contain fewer benchmarks
+    than the other rows.  That must remove only the missing point, not the
+    entire benchmark from the comparison.
+    """
     shared: tuple[str, ...] | None = None
     for method, rows in histories.items():
-        available = set(BENCHMARK_ORDER)
+        available: set[str] = set()
         for row in rows:
-            available.intersection_update(row.get("benchmarks", {}))
+            available.update(row.get("benchmarks", {}))
         current = tuple(name for name in BENCHMARK_ORDER if name in available)
         if shared is None:
             shared = current
@@ -483,13 +490,23 @@ def _plot_single_method_accuracy(
     }
     fig, axis = plt.subplots(figsize=(9, 5.5))
     accuracy_values: list[float] = []
+    all_steps = sorted({int(row["step"]) for row in rows})
     for benchmark in benchmark_names:
-        available = [row for row in rows if benchmark in row.get("benchmarks", {})]
-        values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in available]
-        benchmark_steps = [int(row["step"]) for row in available]
-        if not values:
+        available = {
+            int(row["step"]): row
+            for row in rows
+            if benchmark in row.get("benchmarks", {})
+        }
+        if not available:
             continue
-        accuracy_values.extend(values)
+        benchmark_steps = all_steps
+        values = [
+            float(available[step]["benchmarks"][benchmark]["accuracy"])
+            if step in available
+            else float("nan")
+            for step in benchmark_steps
+        ]
+        accuracy_values.extend(value for value in values if np.isfinite(value))
         axis.plot(
             benchmark_steps,
             values,
@@ -534,6 +551,7 @@ def _write_training_history(
         )
     for method, rows in histories.items():
         for row in rows:
+            row_benchmarks = row.get("benchmarks", {})
             combined_rows.append(
                 {
                     "Method": method,
@@ -541,6 +559,7 @@ def _write_training_history(
                     **{
                         benchmark: float(row["benchmarks"][benchmark]["accuracy"])
                         for benchmark in benchmark_names
+                        if benchmark in row_benchmarks
                     },
                 }
             )
@@ -671,10 +690,32 @@ def plot_training_progress(
     for axis, benchmark in zip(axes, benchmark_names):
         maximum_step = 0
         benchmark_accuracy_values: list[float] = []
+        benchmark_steps = sorted(
+            {
+                int(row["step"])
+                for rows in histories_for_plot.values()
+                for row in rows
+            }
+        )
         for method, rows in histories_for_plot.items():
-            steps = [int(row["step"]) for row in rows]
-            values = [float(row["benchmarks"][benchmark]["accuracy"]) for row in rows]
-            benchmark_accuracy_values.extend(values)
+            available = {
+                int(row["step"]): row
+                for row in rows
+                if benchmark in row.get("benchmarks", {})
+            }
+            if not available:
+                continue
+            steps = benchmark_steps
+            values = [
+                (
+                    float(available[step]["benchmarks"][benchmark]["accuracy"])
+                    if step in available
+                    else float("nan")
+                )
+                for step in steps
+            ]
+            finite_values = [value for value in values if np.isfinite(value)]
+            benchmark_accuracy_values.extend(finite_values)
             maximum_step = max(maximum_step, max(steps))
             axis.plot(
                 steps,
@@ -685,7 +726,7 @@ def plot_training_progress(
                 label=method,
             )
             for step, value in zip(steps, values):
-                if step == 0:
+                if step == 0 or not np.isfinite(value):
                     continue
                 axis.annotate(
                     f"{value:.3f}",
@@ -712,10 +753,13 @@ def plot_training_progress(
         axis.set_ylim(*_accuracy_ylim(benchmark_accuracy_values))
         axis.grid(alpha=0.25)
     axes[0].set_ylabel(metric_name)
-    handles, labels = axes[-1].get_legend_handles_labels()
+    legend_by_label = {}
+    for axis in axes:
+        handles, labels = axis.get_legend_handles_labels()
+        legend_by_label.update(zip(labels, handles))
     fig.legend(
-        handles,
-        labels,
+        list(legend_by_label.values()),
+        list(legend_by_label),
         loc="upper center",
         ncol=len(selected_methods) + 1,
         frameon=False,
