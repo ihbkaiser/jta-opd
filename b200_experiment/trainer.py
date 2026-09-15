@@ -2420,7 +2420,11 @@ def _run_grpo_training(
                 old_student_log_probs=old_log_probs,
                 teacher_log_probs=old_log_probs.clone(),
                 student_weights=torch.ones_like(old_log_probs),
-                advantages=advantages.detach().clone().float().unsqueeze(-1),
+                # GRPO has one normalized outcome advantage per sampled
+                # trajectory.  Keep it explicitly trajectory-level so it
+                # broadcasts over every response token and the singleton
+                # candidate dimension in topk_candidate_ppo_loss.
+                advantages=advantages.detach().clone().float().reshape(-1, 1, 1),
                 support_mask=None,
             )
         checkpoints_by_step: dict[int, Path] = {}

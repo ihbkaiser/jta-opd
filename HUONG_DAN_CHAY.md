@@ -585,6 +585,65 @@ SMOOTHING_WINDOW=1 PLOT_METHODS="opd cmt" \
   bash scripts/plot_training_progress.sh --plot-name raw_opd_cmt
 ```
 
+### Histogram CMT theo token và learning value
+
+Trong lúc train CMT, logger compact ghi histogram/mean/quantile của các score trên
+toàn bộ response-token hợp lệ tại các rollout endpoint được cấu hình (mặc định:
+step 1, mỗi 50 step và step cuối). Không cần load checkpoint hay chạy GPU để vẽ
+các biểu đồ này. Chạy:
+
+```bash
+cd /mnt/hdd/nhatminh/OPD/BellmanOPD
+CMT_RUN_NAME="cmt_..." bash scripts/plot_cmt_scores.sh
+```
+
+Lệnh trên tạo một thư mục mới, không ghi đè các lần vẽ trước:
+
+```text
+outputs/<run-name>/cmt_opd/plots/cmt_scores_<run-name>_<timestamp>/
+```
+
+Trong đó có cả PNG và PDF:
+
+- `*_token_score_histograms`: histogram của `g_t` (`gain`),
+  `X_t` (`successor_excess`), `D_t` (`sequential_gain`), learning value
+  (`learning_value`) và supervision weight (`w`) tại snapshot đầu/giữa/cuối.
+- `*_token_score_histogram_heatmaps`: cùng năm histogram nhưng giữ **mọi** step
+  đã log (trục dọc là training step, trục ngang là score).
+- `*_learning_value_quantiles`: mean, median, q05--q95 và q25--q75 của learning
+  value theo training step.
+- `*_score_means`: mean của năm trường score theo training step.
+- `*_plot_manifest.json`: run, source, các step và tên trường được vẽ.
+
+Có thể chỉ định trực tiếp thư mục output hoặc tên file logic:
+
+```bash
+CMT_OUTPUT_DIR="/abs/path/to/outputs/cmt_xxx/cmt_opd" \
+CMT_SCORE_RUN_NAME="cmt_14b_4b_eps025" \
+  bash scripts/plot_cmt_scores.sh
+```
+
+Nếu muốn đặt tên thư mục plot cố định cho dễ tìm, dùng `CMT_SCORE_PLOT_NAME`.
+Khi tên đó đã tồn tại, script tự tạo hậu tố `_02`, `_03`, ... để không mất ảnh cũ:
+
+```bash
+CMT_RUN_NAME="cmt_..." CMT_SCORE_PLOT_NAME="epsilon_025" \
+  bash scripts/plot_cmt_scores.sh
+```
+
+Các file nguồn nằm trong `cmt_opd/token_score_stats/step-*.json`. Nếu thư mục này
+không tồn tại (ví dụ run cũ tắt logger), cần train lại với:
+
+```bash
+bash scripts/train_cmt_b200.sh \
+  --set logging.token_score_stats_enabled=true \
+  --set logging.token_score_interval=50
+```
+
+Hoặc truyền trực tiếp override tương ứng trong config. Các biểu đồ dùng histogram
+đã ghi sẵn, nên không thể khôi phục phân phối token-level của một run không lưu
+`token_score_stats`; dữ liệu compact này cũng không chứa token text/ID.
+
 Các biểu đồ accuracy tự động zoom trục Y theo miền giá trị quan sát (làm tròn theo
 5 điểm phần trăm và chừa 2 điểm phần trăm đệm), thay vì luôn hiển thị 0--100%.
 Step-0 của `Competition-MATH` và `MATH-500` được phép lệch tối đa 2 điểm phần trăm;

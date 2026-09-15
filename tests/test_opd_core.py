@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from b200_experiment.opd_core import (
+    TopKOPDReference,
     build_topk_opd_reference,
     gather_candidate_log_probs,
     topk_candidate_ppo_loss,
@@ -90,6 +91,25 @@ class TopKOPDCoreTests(unittest.TestCase):
         self.assertEqual(int(current.grad.ne(0).sum()), 16)
         expected = -reference.advantages.sum(dim=-1)
         self.assertTrue(torch.allclose(loss.detach(), expected, atol=1e-6))
+
+    def test_trajectory_advantages_broadcast_over_response_tokens(self):
+        """GRPO's one advantage per trajectory must cover every token."""
+        current = torch.zeros(2, 3, 1, requires_grad=True)
+        reference = TopKOPDReference(
+            candidate_ids=torch.zeros(2, 3, 1, dtype=torch.long),
+            old_student_log_probs=torch.zeros(2, 3, 1),
+            teacher_log_probs=torch.zeros(2, 3, 1),
+            student_weights=torch.ones(2, 3, 1),
+            advantages=torch.tensor([1.0, -1.0]),
+        )
+        loss = topk_candidate_ppo_loss(
+            current, reference, clip_low=0.2, clip_high=0.2, dual_clip=None
+        )
+        self.assertEqual(tuple(loss.shape), (2, 3))
+        self.assertTrue(torch.allclose(loss[0], torch.full((3,), -1.0)))
+        self.assertTrue(torch.allclose(loss[1], torch.full((3,), 1.0)))
+        loss.sum().backward()
+        self.assertIsNotNone(current.grad)
 
     def test_conditional_candidate_log_probs_match_executable_support(self):
         logits = torch.tensor([[[2.0, 1.0, 0.0, -1.0]]], requires_grad=True)

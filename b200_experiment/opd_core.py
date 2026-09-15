@@ -196,6 +196,45 @@ def topk_candidate_ppo_loss(
     )
     ratio = torch.exp(log_ratio)
     advantages = reference.advantages
+    # OPD/PGT references store candidate-wise advantages as [B,T,K], while
+    # GRPO naturally supplies one outcome advantage per sampled trajectory
+    # ([B]) or one value broadcast over the response ([B,1,1]).  PyTorch does
+    # not broadcast [B] against [B,T,K] as intended: it aligns the leading B
+    # with K and can produce the opaque ``B vs T`` error seen at the first
+    # GRPO optimizer step.  Canonicalize the trajectory-level forms here so
+    # the loss remains reusable and the invariant is enforced at the common
+    # objective boundary.
+    if advantages.ndim == 1:
+        if advantages.shape[0] != ratio.shape[0]:
+            raise ValueError(
+                "Trajectory advantages must have one value per PPO row"
+            )
+        advantages = advantages.reshape(
+            advantages.shape[0], *([1] * (ratio.ndim - 1))
+        )
+    elif advantages.ndim == 2 and advantages.shape == ratio.shape[:2]:
+        advantages = advantages.unsqueeze(-1)
+    elif (
+        advantages.ndim == 2
+        and advantages.shape[0] == ratio.shape[0]
+        and advantages.shape[1] == 1
+    ):
+        advantages = advantages.reshape(
+            advantages.shape[0], *([1] * (ratio.ndim - 1))
+        )
+    elif advantages.ndim != ratio.ndim:
+        raise ValueError(
+            "Advantages must be [B], [B,T], or candidate-wise [B,T,K]; "
+            f"got {tuple(advantages.shape)} for ratio {tuple(ratio.shape)}"
+        )
+    if advantages.shape != ratio.shape:
+        try:
+            torch.broadcast_shapes(advantages.shape, ratio.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                "Advantages are not broadcastable over candidate PPO ratios: "
+                f"{tuple(advantages.shape)} vs {tuple(ratio.shape)}"
+            ) from error
     loss_unclipped = -advantages * ratio
     loss_clipped = -advantages * ratio.clamp(
         1.0 - float(clip_low), 1.0 + float(clip_high)

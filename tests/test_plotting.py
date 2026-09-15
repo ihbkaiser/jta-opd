@@ -8,12 +8,85 @@ from pathlib import Path
 
 from b200_experiment.plotting import (
     _accuracy_ylim,
+    plot_cmt_score_distributions,
     plot_results,
     plot_training_progress,
 )
 
 
 class PlottingTests(unittest.TestCase):
+    @staticmethod
+    def _write_cmt_token_stats(output: Path) -> None:
+        """Write compact synthetic CMT score snapshots for plotting tests."""
+
+        stats = output / "token_score_stats"
+        stats.mkdir(parents=True)
+        required = {
+            "gain": (0.0, 2.0),
+            "successor_excess": (-1.0, 1.0),
+            "sequential_gain": (-1.0, 1.0),
+            "learning_value": (-1.0, 2.0),
+            "w": (0.0, 2.0),
+        }
+        for index, step in enumerate((50, 100, 150), start=1):
+            scores = {}
+            for field, (low, high) in required.items():
+                center = low + (high - low) * (0.25 + 0.1 * index)
+                scores[field] = {
+                    "count": 4,
+                    "mean": center,
+                    "min": low,
+                    "max": high,
+                    "quantiles": {
+                        "q05": low,
+                        "q25": center - 0.1,
+                        "q50": center,
+                        "q75": center + 0.1,
+                        "q95": high,
+                    },
+                    "histogram": {
+                        "edges": [low, (low + high) / 2.0, high],
+                        "counts": [2, 2],
+                        "underflow": 0,
+                        "overflow": 0,
+                    },
+                    "sample": [low, center, center, high],
+                }
+            (stats / f"step-{step:06d}.json").write_text(
+                json.dumps(
+                    {
+                        "step": step,
+                        "method": "cmt",
+                        "scope": "global_valid_response_tokens",
+                        "scores": scores,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+    def test_cmt_score_plots_include_histograms_quantiles_and_unique_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "cmt_opd"
+            self._write_cmt_token_stats(output)
+
+            first = plot_cmt_score_distributions(output, run_name="cmt_demo")
+            second = plot_cmt_score_distributions(
+                output, run_name="cmt_demo", plot_name="cmt_demo_scores"
+            )
+            third = plot_cmt_score_distributions(
+                output, run_name="cmt_demo", plot_name="cmt_demo_scores"
+            )
+
+            for result in (first, second, third):
+                self.assertTrue(Path(result["histograms"]).is_file())
+                self.assertTrue(Path(result["histogram_heatmaps"]).is_file())
+                self.assertTrue(Path(result["learning_value_quantiles"]).is_file())
+                self.assertTrue(Path(result["score_means"]).is_file())
+                self.assertTrue(Path(result["manifest"]).is_file())
+                self.assertEqual(result["logged_steps"], [50, 100, 150])
+            self.assertNotEqual(second["plot_directory"], third["plot_directory"])
+
     def test_single_response_history_is_labeled_accuracy(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

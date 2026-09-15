@@ -471,6 +471,267 @@ def _plot_token_score_distributions(
     return result
 
 
+# CMT keeps a richer set of token-score diagnostics than the legacy
+# comparison plot needs.  Keep this mapping explicit so the notation used in
+# the CMT derivation is visible in the generated figure and does not depend on
+# internal compatibility aliases (for example ``gain`` rather than ``g``).
+_CMT_SCORE_PLOT_SPECS = (
+    ("gain", r"$g_t$ (local PGT gain)"),
+    ("successor_excess", r"$X_t=R_{t+1}-g_tM_{t+1}$"),
+    ("sequential_gain", r"$D_t$ (sequential marginal gain)"),
+    ("learning_value", r"$L_t$ (CMT learning value)"),
+    ("w", r"$w_t$ (allocated supervision weight)"),
+)
+
+
+def _safe_plot_identifier(value: str) -> str:
+    """Turn a run name into a filesystem-safe plot identifier."""
+
+    normalized = "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in str(value)
+    ).strip("._-")
+    return normalized or "cmt_run"
+
+
+def _unique_diagnostic_plot_directory(
+    output_root: Path, requested_name: str
+) -> Path:
+    """Create a non-destructive, unique directory for a diagnostic render."""
+
+    if not requested_name.replace("-", "").replace(".", "").replace("_", "").isalnum():
+        raise ValueError(f"Invalid CMT diagnostic plot name: {requested_name!r}")
+    root = output_root.resolve() / "plots"
+    root.mkdir(parents=True, exist_ok=True)
+    candidate = root / requested_name
+    suffix = 2
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = root / f"{requested_name}_{suffix:02d}"
+            suffix += 1
+
+
+def _cmt_score_payload(row: dict, key: str) -> dict | None:
+    scores = row.get("scores", {})
+    value = scores.get(key)
+    if isinstance(value, dict) and isinstance(value.get("histogram"), dict):
+        return value
+    return None
+
+
+def plot_cmt_score_distributions(
+    cmt_output: str | Path,
+    *,
+    run_name: str | None = None,
+    plot_name: str | None = None,
+    output_root: str | Path | None = None,
+) -> dict[str, str | int | list[str]]:
+    """Plot CMT token-score distributions and learning-value evolution.
+
+    ``token_score_stats/step-*.json`` contains exact binned counts over all
+    valid tokens in the logged global rollout batch.  This function only
+    consumes those compact artifacts; it never reruns scoring or model
+    inference.  Every invocation gets a fresh ``plots/<name>`` directory,
+    even when the caller reuses ``plot_name``.
+    """
+
+    source = Path(cmt_output).expanduser().resolve()
+    rows = _read_token_stats(source)
+    if not rows:
+        raise FileNotFoundError(
+            "No CMT token-score statistics found under "
+            f"{source / 'token_score_stats'}; enable "
+            "logging.token_score_stats_enabled during training."
+        )
+
+    run_tag = _safe_plot_identifier(run_name or source.parent.name or source.name)
+    requested_name = plot_name or (
+        f"cmt_scores_{run_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    )
+    plots_dir = _unique_diagnostic_plot_directory(
+        Path(output_root).expanduser().resolve() if output_root is not None else source,
+        _safe_plot_identifier(requested_name),
+    )
+    prefix = f"cmt_{run_tag}"
+
+    missing = [
+        key
+        for key, _ in _CMT_SCORE_PLOT_SPECS
+        if not any(_cmt_score_payload(row, key) is not None for row in rows)
+    ]
+    if missing:
+        raise ValueError(
+            "CMT token-score statistics are missing required fields: "
+            + ", ".join(missing)
+        )
+
+    # One compact figure compares the distribution at the first, middle and
+    # final logged training snapshots.  Histogram counts already include the
+    # logger's underflow/overflow values through edge clipping; the explicit
+    # counters remain available in the JSON artifact for auditing.
+    snapshots = _snapshot_rows(rows)
+    figure, axes = plt.subplots(2, 3, figsize=(17, 9), squeeze=False)
+    axes_flat = axes.reshape(-1)
+    for axis, (key, label) in zip(axes_flat, _CMT_SCORE_PLOT_SPECS):
+        for row in snapshots:
+            payload = _cmt_score_payload(row, key)
+            if payload is None:
+                continue
+            histogram = payload["histogram"]
+            edges = np.asarray(histogram["edges"], dtype=float)
+            counts = np.asarray(histogram["counts"], dtype=float)
+            counts /= max(float(counts.sum()), 1.0)
+            axis.stairs(
+                counts,
+                edges,
+                linewidth=1.8,
+                label=f"step {int(row['step'])}",
+            )
+        axis.set_title(label)
+        axis.set_xlabel("Score")
+        axis.set_ylabel("Token fraction")
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize=8)
+    axes_flat[-1].axis("off")
+    figure.suptitle(f"CMT token-score distributions — {run_tag}")
+    figure.tight_layout()
+    histogram_path = plots_dir / f"{prefix}_token_score_histograms.png"
+    _save_figure(figure, histogram_path)
+    plt.close(figure)
+
+    # The snapshot figure is readable for a report, while this companion
+    # heatmap retains every logged training step.  Each row is normalized by
+    # its own token count, so a changing rollout length does not appear as a
+    # spurious score-density change.
+    figure, axes = plt.subplots(2, 3, figsize=(17, 9), squeeze=False)
+    axes_flat = axes.reshape(-1)
+    for axis, (key, label) in zip(axes_flat, _CMT_SCORE_PLOT_SPECS):
+        field_rows = [
+            (int(row["step"]), _cmt_score_payload(row, key)) for row in rows
+        ]
+        field_rows = [item for item in field_rows if item[1] is not None]
+        if not field_rows:
+            axis.axis("off")
+            continue
+        first_histogram = field_rows[0][1]["histogram"]
+        edges = np.asarray(first_histogram["edges"], dtype=float)
+        matrix = []
+        step_values = []
+        for step, payload in field_rows:
+            histogram = payload["histogram"]
+            current_edges = np.asarray(histogram["edges"], dtype=float)
+            counts = np.asarray(histogram["counts"], dtype=float)
+            # All artifacts produced by one logger share a range; fail loudly
+            # instead of silently drawing a misleading heatmap if a file was
+            # manually mixed from another configuration.
+            if current_edges.shape != edges.shape or not np.allclose(
+                current_edges, edges
+            ):
+                raise ValueError(
+                    f"Inconsistent histogram bins for CMT field {key!r}"
+                )
+            matrix.append(counts / max(float(counts.sum()), 1.0))
+            step_values.append(step)
+        image = axis.imshow(
+            np.asarray(matrix),
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            extent=(edges[0], edges[-1], step_values[0], step_values[-1]),
+        )
+        axis.set_title(label)
+        axis.set_xlabel("Score")
+        axis.set_ylabel("Logged optimizer step")
+        figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="Token fraction")
+    axes_flat[-1].axis("off")
+    figure.suptitle(f"CMT score histograms across training steps — {run_tag}")
+    figure.tight_layout()
+    heatmap_path = plots_dir / f"{prefix}_token_score_histogram_heatmaps.png"
+    _save_figure(figure, heatmap_path)
+    plt.close(figure)
+
+    # Learning-value trajectory: retain both central quantiles and the mean so
+    # a changing tail cannot be mistaken for a shift in the typical token.
+    learning_rows = [
+        (int(row["step"]), _cmt_score_payload(row, "learning_value"))
+        for row in rows
+    ]
+    learning_rows = [item for item in learning_rows if item[1] is not None]
+    steps = np.asarray([item[0] for item in learning_rows], dtype=float)
+    mean = np.asarray([float(item[1]["mean"]) for item in learning_rows])
+    q05 = np.asarray([float(item[1]["quantiles"]["q05"]) for item in learning_rows])
+    q25 = np.asarray([float(item[1]["quantiles"]["q25"]) for item in learning_rows])
+    q50 = np.asarray([float(item[1]["quantiles"]["q50"]) for item in learning_rows])
+    q75 = np.asarray([float(item[1]["quantiles"]["q75"]) for item in learning_rows])
+    q95 = np.asarray([float(item[1]["quantiles"]["q95"]) for item in learning_rows])
+    figure, axis = plt.subplots(figsize=(10, 5.8))
+    axis.fill_between(steps, q05, q95, alpha=0.16, label="q05–q95")
+    axis.fill_between(steps, q25, q75, alpha=0.28, label="q25–q75")
+    axis.plot(steps, mean, linewidth=2.2, marker="o", markersize=3.5, label="mean")
+    axis.plot(steps, q50, linewidth=1.5, linestyle="--", label="median (q50)")
+    axis.set_xlabel("Optimizer step (logged rollout endpoint)")
+    axis.set_ylabel("CMT learning value")
+    axis.set_title(f"CMT learning-value distribution over training — {run_tag}")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    figure.tight_layout()
+    learning_path = plots_dir / f"{prefix}_learning_value_quantiles.png"
+    _save_figure(figure, learning_path)
+    plt.close(figure)
+
+    # A scalar-mean companion makes it easy to compare the five logged fields
+    # without opening the JSON files individually.
+    figure, axis = plt.subplots(figsize=(10, 5.8))
+    for key, label in _CMT_SCORE_PLOT_SPECS:
+        values = []
+        score_steps = []
+        for row in rows:
+            payload = _cmt_score_payload(row, key)
+            if payload is not None:
+                score_steps.append(int(row["step"]))
+                values.append(float(payload["mean"]))
+        axis.plot(score_steps, values, marker="o", markersize=3, label=label)
+    axis.set_xlabel("Optimizer step (logged rollout endpoint)")
+    axis.set_ylabel("Mean over valid response tokens")
+    axis.set_title(f"CMT token-score means over training — {run_tag}")
+    axis.grid(alpha=0.25)
+    axis.legend(fontsize=8)
+    figure.tight_layout()
+    means_path = plots_dir / f"{prefix}_score_means.png"
+    _save_figure(figure, means_path)
+    plt.close(figure)
+
+    manifest = {
+        "run_name": run_tag,
+        "source": str(source),
+        "plot_directory": str(plots_dir),
+        "logged_steps": [int(row["step"]) for row in rows],
+        "score_fields": [key for key, _ in _CMT_SCORE_PLOT_SPECS],
+        "histograms": str(histogram_path),
+        "histogram_heatmaps": str(heatmap_path),
+        "learning_value_quantiles": str(learning_path),
+        "score_means": str(means_path),
+    }
+    manifest_path = plots_dir / f"{prefix}_plot_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "run_name": run_tag,
+        "plot_directory": str(plots_dir),
+        "histograms": str(histogram_path),
+        "histogram_heatmaps": str(heatmap_path),
+        "learning_value_quantiles": str(learning_path),
+        "score_means": str(means_path),
+        "manifest": str(manifest_path),
+        "logged_steps": manifest["logged_steps"],
+    }
+
+
 def _plot_single_method_accuracy(
     plots_dir: Path,
     method: str,

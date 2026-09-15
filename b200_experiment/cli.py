@@ -16,7 +16,11 @@ from .evaluation import (
     evaluate_suite,
 )
 from .evaluation_history import record_checkpoint_evaluation
-from .plotting import plot_results, plot_training_progress
+from .plotting import (
+    plot_cmt_score_distributions,
+    plot_results,
+    plot_training_progress,
+)
 from .preflight import run_preflight
 from .trainer import run_training
 
@@ -319,6 +323,28 @@ def build_parser() -> argparse.ArgumentParser:
     progress_plot.add_argument("--grpo-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
     progress_plot.add_argument("--plot-name")
+
+    cmt_scores = commands.add_parser(
+        "plot-cmt-scores",
+        help="Plot CMT token-score histograms and learning-value quantiles",
+    )
+    cmt_scores.add_argument(
+        "--cmt-output",
+        required=True,
+        help="CMT training output containing token_score_stats/",
+    )
+    cmt_scores.add_argument(
+        "--run-name",
+        help="Run label used in output directory and figure filenames",
+    )
+    cmt_scores.add_argument(
+        "--output-dir",
+        help="Optional base directory; a unique plots/<name> child is created",
+    )
+    cmt_scores.add_argument(
+        "--plot-name",
+        help="Optional plot directory name; an unused suffix is added on collision",
+    )
     return parser
 
 
@@ -383,6 +409,13 @@ def main(argv: list[str] | None = None) -> int:
             pgt_output=args.pgt_output,
             cmt_output=args.cmt_output,
             grpo_output=args.grpo_output,
+        )
+    elif args.command == "plot-cmt-scores":
+        result = plot_cmt_score_distributions(
+            args.cmt_output,
+            run_name=args.run_name,
+            plot_name=args.plot_name,
+            output_root=args.output_dir,
         )
     else:
         raise AssertionError(args.command)
