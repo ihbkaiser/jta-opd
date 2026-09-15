@@ -1,7 +1,8 @@
 # Hướng dẫn chạy BellmanOPD trên B200
 
 File này là runbook thực hành cho các method trong repository hiện tại: OPD thuần,
-TA-OPD, Bellman-RAC, PGT và CMT-OPD. Mọi lệnh đều chạy từ thư mục:
+TA-OPD, CMT-OPD và GRPO (các script Bellman-RAC/PGT legacy vẫn được giữ tương thích).
+Mọi lệnh đều chạy từ thư mục:
 
 ```bash
 cd /mnt/hdd/nhatminh/OPD/BellmanOPD
@@ -78,6 +79,8 @@ export TA_RUN_NAME="ta_${PAIR}"
 export RAC_RUN_NAME="rac_${PAIR}"
 export PGT_RUN_NAME="pgt_${PAIR}"
 export CMT_RUN_NAME="cmt_${PAIR}"
+# GRPO has no teacher--student pair; keep its label independent of PAIR.
+export GRPO_RUN_NAME="grpo_qwen3_1p7b_compmath_seed42_${PAIR}"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export DISTRIBUTED_STRATEGY=fsdp
@@ -143,6 +146,66 @@ RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
 
 TA hard-select fraction mặc định `TA_RHO=0.10`:
 
+### GRPO thuần (teacher-free)
+
+GRPO không tải hoặc dùng teacher. Mỗi prompt được rollout nhiều lần (mặc định `G=8`),
+reward outcome được chấm bằng `math_verify`/boxed-answer, chuẩn hoá theo group rồi tối ưu
+clipped PPO surrogate. Script riêng đặt mặc định eval và checkpoint mỗi 100 optimizer steps;
+`TRAIN_EVAL_NUM_RESPONSES` vẫn là số mẫu eval, độc lập với `GRPO_GROUP_SIZE`:
+
+`GRPO_RUN_NAME` chỉ là tên thư mục/nhãn thí nghiệm, không biểu diễn cặp teacher--student.
+Vì vậy dùng tên như `grpo_qwen3_1p7b_compmath_seed42`; tên cũ dạng `grpo_14b_4b` (nếu có)
+chỉ là nhãn đặt nhầm, không làm GRPO tải teacher 14B.
+
+`PPO_MINI_BATCH_SIZE` cũng là global, giống OPD/TA/CMT. Mặc định GRPO là `16`: 1 GPU nhận
+16 trajectory thực mỗi optimizer step, 2 GPU nhận 8+8, 4 GPU nhận 4+4+4+4. `MICRO_BATCH_SIZE_PER_GPU`
+chỉ điều khiển chia nhỏ local batch.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+GRPO_GROUP_SIZE=8 PPO_MINI_BATCH_SIZE=16 \
+GRPO_RUN_NAME="grpo_qwen3_1p7b_compmath_seed42" \
+bash scripts/train_grpo_b200.sh
+```
+
+Đổi group size (phải lớn hơn hoặc bằng 2), batch, số GPU hoặc giới hạn debug:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GRPO_GROUP_SIZE=4 BATCH_SIZE=16 PPO_MINI_BATCH_SIZE=16 \
+MAX_STEPS=10 RUN_NAME=grpo_debug bash scripts/train_grpo_b200.sh
+```
+
+GRPO dùng `rollout.temperature=1.0` để log-prob hành vi từ vLLM là đúng mẫu số PPO;
+không đặt `ROLLOUT_TEMPERATURE` khác 1.0.
+
+Trong workflow tuần tự, GRPO mặc định tắt để không vô tình phát sinh thêm GPU-hours;
+bật rõ ràng như sau:
+
+```bash
+RUN_GRPO_TRAIN=true GRPO_GROUP_SIZE=8 bash scripts/train_all_b200.sh
+```
+
+Resume GRPO trên topology khác (ví dụ chạy đầu bằng 1 GPU, tiếp tục bằng 4 GPU):
+
+```bash
+# Lần đầu
+CUDA_VISIBLE_DEVICES=0 \
+GRPO_RUN_NAME=grpo_qwen3_1p7b_compmath_seed42 \
+GRPO_GROUP_SIZE=8 PPO_MINI_BATCH_SIZE=16 \
+bash scripts/train_grpo_b200.sh
+
+# Tiếp tục cùng run; MAX_STEPS là tổng target cuối cùng
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+GRPO_RUN_NAME=grpo_qwen3_1p7b_compmath_seed42 RESUME=auto MAX_STEPS=750 \
+bash scripts/train_grpo_b200.sh
+```
+
+Checkpoint GRPO dùng cùng FSDP full-state/standard optimizer checkpoint và bộ chuyển đổi hai
+chiều của các baseline, nên 1↔N↔M GPU được hỗ trợ. Để resume đúng cùng objective, giữ nguyên
+student, dataset/order, seed, `GRPO_GROUP_SIZE`, global `BATCH_SIZE`, `PPO_MINI_BATCH_SIZE`,
+learning rate và các PPO setting; chỉ thay `CUDA_VISIBLE_DEVICES` và microbatch theo VRAM.
+
 ```bash
 TA_RHO=0.10 RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
 ```
@@ -154,7 +217,8 @@ RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 RUN_NAME="$PGT_RUN_NAME" bash scripts/train_pgt_b200.sh
 ```
 
-Các launcher dùng chung rollout, checkpoint, TensorBoard, teacher scoring và evaluation pipeline.
+Các launcher dùng chung rollout, checkpoint, TensorBoard và evaluation pipeline; teacher scoring
+chỉ áp dụng cho OPD/TA/CMT, không áp dụng cho GRPO.
 
 Training-time evaluation tự dùng toàn bộ GPU training khi `world_size>1`: mỗi rank chạy một
 vLLM replica độc lập với `tensor_parallel_size=1`, nhận shard deterministic của benchmark, rồi
@@ -218,6 +282,9 @@ RUN_NAME="$TA_RUN_NAME" RESUME=auto MAX_STEPS=200 \
 
 RUN_NAME="$CMT_RUN_NAME" RESUME=auto MAX_STEPS=200 \
   bash scripts/train_cmt_b200.sh
+
+RUN_NAME="$GRPO_RUN_NAME" RESUME=auto MAX_STEPS=200 \
+  bash scripts/train_grpo_b200.sh
 ```
 
 `MAX_STEPS=200` ở đây là target cuối cùng, không phải chạy thêm 200 steps.
@@ -257,7 +324,7 @@ CUDA_VISIBLE_DEVICES=0,1 RUN_NAME="$CMT_RUN_NAME" RESUME=auto MAX_STEPS=200 \
 
 ```bash
 tensorboard --logdir_spec \
-  "OPD:outputs/${OPD_RUN_NAME}/opd/tensorboard,TA:outputs/${TA_RUN_NAME}/ta_opd/tensorboard,CMT:outputs/${CMT_RUN_NAME}/cmt_opd/tensorboard,RAC:outputs/${RAC_RUN_NAME}/rac_opd/tensorboard" \
+  "OPD:outputs/${OPD_RUN_NAME}/opd/tensorboard,TA:outputs/${TA_RUN_NAME}/ta_opd/tensorboard,CMT:outputs/${CMT_RUN_NAME}/cmt_opd/tensorboard,GRPO:outputs/${GRPO_RUN_NAME}/grpo/tensorboard,RAC:outputs/${RAC_RUN_NAME}/rac_opd/tensorboard" \
   --bind_all --port 6006
 ```
 
@@ -473,6 +540,15 @@ OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" CMT_RUN_NAME="$CMT_RUN_N
   bash scripts/plot_training_progress.sh --plot-name opd_ta_cmt
 ```
 
+So sánh thêm GRPO (mỗi benchmark một panel, tổng cộng 6 panel khi history có đủ dữ liệu):
+
+```bash
+PLOT_METHODS="opd ta cmt grpo" \
+OPD_RUN_NAME="$OPD_RUN_NAME" TA_RUN_NAME="$TA_RUN_NAME" \
+CMT_RUN_NAME="$CMT_RUN_NAME" GRPO_RUN_NAME="$GRPO_RUN_NAME" \
+  bash scripts/plot_training_progress.sh --plot-name opd_ta_cmt_grpo
+```
+
 So sánh đầy đủ:
 
 ```bash
@@ -530,8 +606,37 @@ RESULTS_DIR="results/${OPD_RUN_NAME}_vs_${TA_RUN_NAME}_vs_${RAC_RUN_NAME}" \
 ```
 
 `plot_results.sh` là plot final aggregate; `plot_training_progress.sh` là plot diễn biến theo
-checkpoint. Nếu có CMT/PGT trong aggregate, cần truyền đúng output directory và đã chạy eval cho
+checkpoint. Nếu có CMT/GRPO/PGT trong aggregate, cần truyền đúng output directory và đã chạy eval cho
 method đó.
+Comparison chỉ gồm OPD/TA/CMT/GRPO cũng được; `plot_results.sh` tự bỏ qua RAC nếu
+`RAC_RUN_OUTPUT/metrics.jsonl` không tồn tại, còn `plot_training_progress.sh` là lựa chọn
+trực tiếp và rõ ràng nhất.
+
+### Eval và re-eval GRPO
+
+Eval checkpoint cuối (vẫn dùng đủ 6 benchmark mặc định):
+
+```bash
+GRPO_RUN_NAME="$GRPO_RUN_NAME" \
+  bash scripts/eval_grpo_b200.sh
+```
+
+Re-eval toàn bộ checkpoint, ghi/ghi đè đúng các row cùng `(step, method)` trong history GRPO:
+
+```bash
+REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=avg@8 \
+GRPO_RUN_NAME="$GRPO_RUN_NAME" \
+  bash scripts/reeval_method_checkpoints_b200.sh grpo
+```
+
+Chỉ chạy pass@8 trên subset benchmark mà không ảnh hưởng các dataset còn lại:
+
+```bash
+REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=pass@8 \
+GRPO_RUN_NAME="$GRPO_RUN_NAME" \
+  bash scripts/reeval_method_checkpoints_b200.sh grpo
+```
 
 ## 9. Một số override thường dùng
 

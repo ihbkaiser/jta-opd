@@ -7,10 +7,10 @@ usage() {
 Usage:
   bash scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]
 
-METHOD may be: opd, ta-opd (or ta), rac, pgt, or cmt.
+METHOD may be: opd, ta-opd (or ta), rac, pgt, cmt, or grpo.
 
 RUN_NAME is optional when the corresponding OPD_RUN_NAME, TA_RUN_NAME, RAC_RUN_NAME,
-PGT_RUN_NAME, or CMT_RUN_NAME environment variable is already set. To select an output directory
+PGT_RUN_NAME, CMT_RUN_NAME, or GRPO_RUN_NAME environment variable is already set. To select an output directory
 directly, omit RUN_NAME and set the matching *_OUTPUT_DIR variable.
 
 Examples:
@@ -48,6 +48,10 @@ case "${METHOD_INPUT,,}" in
   cmt|coupled-marginal-teachability|coupled_marginal_teachability)
     METHOD="cmt"
     if [[ -n "${RUN_NAME_INPUT}" ]]; then export CMT_RUN_NAME="${RUN_NAME_INPUT}"; fi
+    ;;
+  grpo|group-relative-policy-optimization|group_relative_policy_optimization)
+    METHOD="grpo"
+    if [[ -n "${RUN_NAME_INPUT}" ]]; then export GRPO_RUN_NAME="${RUN_NAME_INPUT}"; fi
     ;;
   *)
     echo "Unknown method: ${METHOD_INPUT}" >&2

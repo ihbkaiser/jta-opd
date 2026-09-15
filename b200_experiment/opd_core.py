@@ -184,12 +184,12 @@ def topk_candidate_ppo_loss(
     *,
     clip_low: float,
     clip_high: float,
-    dual_clip: float = 3.0,
+    dual_clip: float | None = 3.0,
 ) -> torch.Tensor:
     """Upstream candidate-wise PPO loss, summed over K to one loss per position."""
     if current_log_probs.shape != reference.old_student_log_probs.shape:
         raise ValueError("Current and frozen Top-K log-probabilities must match")
-    if dual_clip <= 1.0:
+    if dual_clip is not None and dual_clip <= 1.0:
         raise ValueError("dual_clip must be greater than 1")
     log_ratio = (current_log_probs - reference.old_student_log_probs).clamp(
         min=-20.0, max=20.0
@@ -201,8 +201,13 @@ def topk_candidate_ppo_loss(
         1.0 - float(clip_low), 1.0 + float(clip_high)
     )
     upper_clipped = torch.maximum(loss_unclipped, loss_clipped)
-    dual_clipped = torch.minimum(-advantages * float(dual_clip), upper_clipped)
-    candidate_loss = torch.where(advantages < 0, dual_clipped, upper_clipped)
+    if dual_clip is None:
+        # Canonical GRPO uses the clipped PPO surrogate without the optional
+        # dual-clip negative-advantage extension used by the OPD recipe.
+        candidate_loss = upper_clipped
+    else:
+        dual_clipped = torch.minimum(-advantages * float(dual_clip), upper_clipped)
+        candidate_loss = torch.where(advantages < 0, dual_clipped, upper_clipped)
     return candidate_loss.sum(dim=-1)
 
 

@@ -27,6 +27,7 @@ _PROGRESS_METHOD_ALIASES = {
     "bellman-rac": "rac",
     "pgt": "pgt",
     "cmt": "cmt",
+    "grpo": "grpo",
 }
 _PROGRESS_METHODS = {
     "opd": {
@@ -58,6 +59,12 @@ _PROGRESS_METHODS = {
         "slug": "cmt_opd",
         "color": "tab:purple",
         "output_argument": "--cmt-output",
+    },
+    "grpo": {
+        "label": "GRPO",
+        "slug": "grpo",
+        "color": "tab:brown",
+        "output_argument": "--grpo-output",
     },
 }
 
@@ -134,6 +141,9 @@ def _normalize_progress_methods(
     for item in requested:
         normalized = _normalize_progress_method(item)
         expanded = {
+            # Keep the historical ``all`` alias stable.  GRPO is opt-in via
+            # ``--methods ... grpo`` so old plotting commands do not suddenly
+            # require a GRPO run that may not exist.
             "all": ("opd", "ta", "rac", "pgt", "cmt"),
             "both": ("ta", "rac"),
         }.get(normalized, (normalized,))
@@ -195,19 +205,16 @@ def _shared_history_benchmarks(histories: dict[str, list[dict]]) -> tuple[str, .
     than the other rows.  That must remove only the missing point, not the
     entire benchmark from the comparison.
     """
-    shared: tuple[str, ...] | None = None
+    available_sets: list[set[str]] = []
     for method, rows in histories.items():
         available: set[str] = set()
         for row in rows:
             available.update(row.get("benchmarks", {}))
-        current = tuple(name for name in BENCHMARK_ORDER if name in available)
-        if shared is None:
-            shared = current
-        elif current != shared:
-            raise ValueError(
-                "Cannot compare histories with different benchmark sets: "
-                f"{shared} vs {current} for {method}"
-            )
+        if not available:
+            raise ValueError(f"{method} has no evaluation benchmarks")
+        available_sets.append(available)
+    common = set.intersection(*available_sets) if available_sets else set()
+    shared = tuple(name for name in BENCHMARK_ORDER if name in common)
     if not shared:
         raise ValueError("No common evaluation benchmarks were found")
     return shared
@@ -594,8 +601,9 @@ def plot_training_progress(
     methods: list[str] | tuple[str, ...] | None = None,
     pgt_output: str | Path | None = None,
     cmt_output: str | Path | None = None,
+    grpo_output: str | Path | None = None,
 ):
-    """Plot the configured evaluation metric for one, two, or three methods."""
+    """Plot the configured evaluation metric for any selected methods."""
     results_dir = Path(results_dir).resolve()
     plots_dir = _plots_dir or _plot_directory(results_dir, plot_name)
     selected_methods = _normalize_progress_methods(method, methods)
@@ -605,6 +613,7 @@ def plot_training_progress(
         "rac": rac_output,
         "pgt": pgt_output,
         "cmt": cmt_output,
+        "grpo": grpo_output,
     }
     histories = {
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
@@ -795,12 +804,13 @@ def plot_training_progress(
 def plot_results(
     results_dir: str | Path,
     ta_output: str | Path,
-    rac_output: str | Path,
+    rac_output: str | Path | None = None,
     smoothing_window: int = 10,
     plot_name: str | None = None,
     opd_output: str | Path | None = None,
     pgt_output: str | Path | None = None,
     cmt_output: str | Path | None = None,
+    grpo_output: str | Path | None = None,
 ):
     results_dir = Path(results_dir).resolve()
     plots_dir = _plot_directory(results_dir, plot_name)
@@ -875,14 +885,15 @@ def plot_results(
     _save_figure(fig, accuracy_path)
     plt.close(fig)
 
-    training_outputs: dict[str, str | Path] = {
-        "ta": ta_output,
-        "rac": rac_output,
-    }
+    training_outputs: dict[str, str | Path] = {"ta": ta_output}
+    if rac_output is not None:
+        training_outputs["rac"] = rac_output
     if pgt_output is not None:
         training_outputs["pgt"] = pgt_output
     if cmt_output is not None:
         training_outputs["cmt"] = cmt_output
+    if grpo_output is not None:
+        training_outputs["grpo"] = grpo_output
     if opd_output is not None:
         training_outputs = {"opd": opd_output, **training_outputs}
     loss_path = _plot_loss_comparison(plots_dir, training_outputs, smoothing_window)
@@ -897,7 +908,11 @@ def plot_results(
         else None
     )
     ta_history = Path(ta_output).resolve() / "eval_history.jsonl"
-    rac_history = Path(rac_output).resolve() / "eval_history.jsonl"
+    rac_history = (
+        Path(rac_output).resolve() / "eval_history.jsonl"
+        if rac_output is not None
+        else None
+    )
     pgt_history = (
         Path(pgt_output).resolve() / "eval_history.jsonl"
         if pgt_output is not None
@@ -908,14 +923,23 @@ def plot_results(
         if cmt_output is not None
         else None
     )
-    if ta_history.is_file() and rac_history.is_file():
-        progress_methods = ["ta", "rac"]
+    grpo_history = (
+        Path(grpo_output).resolve() / "eval_history.jsonl"
+        if grpo_output is not None
+        else None
+    )
+    if ta_history.is_file():
+        progress_methods = ["ta"]
+        if rac_history is not None and rac_history.is_file():
+            progress_methods.append("rac")
         if opd_history is not None and opd_history.is_file():
             progress_methods.insert(0, "opd")
         if pgt_history is not None and pgt_history.is_file():
             progress_methods.append("pgt")
         if cmt_history is not None and cmt_history.is_file():
             progress_methods.append("cmt")
+        if grpo_history is not None and grpo_history.is_file():
+            progress_methods.append("grpo")
         result.update(
             plot_training_progress(
                 results_dir,
@@ -927,6 +951,7 @@ def plot_results(
                 opd_output=opd_output,
                 pgt_output=pgt_output,
                 cmt_output=cmt_output,
+                grpo_output=grpo_output,
                 methods=progress_methods,
             )
         )

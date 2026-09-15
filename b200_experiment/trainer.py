@@ -51,6 +51,7 @@ from .evaluation import (
     configured_benchmark_names,
     evaluate_loaded_suite,
     evaluation_metric_name,
+    grade_evaluation_response,
     load_benchmark,
     render_evaluation_prompt,
 )
@@ -66,7 +67,12 @@ from .eval_schedule import (
     training_evaluation_steps,
 )
 from .metadata import collect_metadata, save_metadata
-from .models import load_models, load_student_tokenizer, validate_shared_tokenizer_protocol
+from .models import (
+    load_models,
+    load_student_model,
+    load_student_tokenizer,
+    validate_shared_tokenizer_protocol,
+)
 from .fsdp import (
     clip_grad_norm,
     distributed_strategy,
@@ -128,6 +134,7 @@ METHOD_DISPLAY_NAMES = {
     "rac": "Bellman-RAC",
     "pgt": "PGT",
     "cmt": "CMT-OPD",
+    "grpo": "GRPO",
 }
 
 
@@ -1500,7 +1507,13 @@ def _opd_train_step(
         float(training.get("ppo_clip_low", 0.2)),
         float(training.get("ppo_clip_high", 0.28)),
     )
-    dual_clip = float(training.get("ppo_dual_clip", 3.0))
+    # GRPO's standard clipped surrogate has no dual-clip term.  The existing
+    # OPD/TA/RAC/CMT recipe keeps its historical dual clipping unchanged.
+    dual_clip = (
+        None
+        if str(config.get("experiment", {}).get("method", "")).lower() == "grpo"
+        else float(training.get("ppo_dual_clip", 3.0))
+    )
     objective_valid = (
         rollout.valid_mask
         if objective_valid_mask is None
@@ -1993,6 +2006,650 @@ def _save_checkpoint(
     return checkpoint
 
 
+def _grpo_group_advantages(
+    rollout,
+    tokenizer,
+    batch_records: list[dict[str, Any]],
+    active_trajectories: torch.Tensor,
+    response_indices: list[int],
+    group_size: int,
+    device: torch.device,
+    *,
+    answer_key: str = "answer",
+    benchmark: str | None = None,
+    std_epsilon: float = 1.0e-8,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Return outcome rewards and within-prompt GRPO advantages."""
+    if group_size < 2:
+        raise ValueError("GRPO requires rollout.num_responses (group size) >= 2")
+    if len(batch_records) != rollout.response_ids.shape[0]:
+        raise ValueError("GRPO records and rollout rows do not align")
+    if len(response_indices) != len(batch_records):
+        raise ValueError("GRPO response indices and rollout rows do not align")
+    rewards = torch.zeros(
+        rollout.response_ids.shape[0], dtype=torch.float32, device=device
+    )
+    for row, (record, is_active) in enumerate(
+        zip(batch_records, active_trajectories.detach().bool().cpu().tolist())
+    ):
+        if not is_active:
+            continue
+        valid = rollout.valid_mask[row]
+        response = tokenizer.decode(
+            rollout.response_ids[row][valid].detach().cpu().tolist(),
+            skip_special_tokens=True,
+        )
+        if answer_key not in record:
+            raise KeyError(
+                f"GRPO reward answer field {answer_key!r} is missing from training row"
+            )
+        rewards[row] = float(
+            grade_evaluation_response(response, record, benchmark=benchmark)
+        )
+    if rewards.numel() % group_size:
+        raise ValueError("GRPO rollout rows are not divisible by the group size")
+    grouped = rewards.reshape(-1, group_size)
+    means = grouped.mean(dim=-1, keepdim=True)
+    # Use the population standard deviation for a finite group. This avoids a
+    # small-group Bessel amplification and keeps equal-reward groups at zero;
+    # the normalization convention is recorded in run metadata.
+    std = grouped.std(dim=-1, keepdim=True, unbiased=False)
+    safe_std = torch.where(std > float(std_epsilon), std, torch.ones_like(std))
+    advantages = ((grouped - means) / (safe_std + float(std_epsilon))).reshape(-1)
+    advantages = torch.where(
+        active_trajectories.bool(), advantages, torch.zeros_like(advantages)
+    )
+    active_rewards = rewards[active_trajectories.bool()]
+    active_advantages = advantages[active_trajectories.bool()]
+    return rewards, advantages, {
+        "reward_mean": float(active_rewards.mean().item()) if active_rewards.numel() else 0.0,
+        "reward_std": float(active_rewards.std(unbiased=False).item()) if active_rewards.numel() else 0.0,
+        "reward_min": float(active_rewards.min().item()) if active_rewards.numel() else 0.0,
+        "reward_max": float(active_rewards.max().item()) if active_rewards.numel() else 0.0,
+        "advantage_mean": float(active_advantages.mean().item()) if active_advantages.numel() else 0.0,
+        "advantage_std": float(active_advantages.std(unbiased=False).item()) if active_advantages.numel() else 0.0,
+        "active_groups": float(active_trajectories.reshape(-1, group_size).any(dim=-1).sum().item()),
+    }
+
+
+def _run_grpo_training(
+    config: dict[str, Any],
+    command_line: list[str] | None,
+    distributed: DistributedContext,
+    device: torch.device,
+    strategy: str,
+) -> dict[str, Any]:
+    """Teacher-free GRPO loop sharing production OPD infrastructure."""
+    experiment, training = config["experiment"], config["training"]
+    rollout_backend = str(config["rollout"].get("backend", "vllm")).lower()
+    if rollout_backend not in {"vllm", "hf"}:
+        raise ValueError("rollout.backend must be 'vllm' or 'hf'")
+    if strategy == "fsdp" and rollout_backend != "vllm":
+        raise RuntimeError("FSDP GRPO training requires rollout.backend=vllm")
+    if strategy == "fsdp" and str(config["models"].get("dtype", "bfloat16")).lower() not in {"bfloat16", "bf16"}:
+        raise ValueError("FSDP GRPO training requires models.dtype=bfloat16")
+    rollout_temperature = float(config["rollout"].get("temperature", 1.0))
+    if abs(rollout_temperature - 1.0) > 1.0e-6:
+        raise ValueError(
+            "GRPO requires rollout.temperature=1.0 because rollout_log_probs "
+            "are the untempered behavior-policy log-probabilities"
+        )
+    group_size = int(config["rollout"].get("num_responses", 1))
+    if group_size < 2:
+        raise ValueError("GRPO requires rollout.num_responses >= 2")
+    batch_size = int(config["rollout"]["batch_size"])
+    ppo_minibatch_size = _ppo_mini_batch_size(training, batch_size * group_size)
+    micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
+        training, distributed.world_size, ppo_minibatch_size
+    )
+    if distributed.is_main:
+        tqdm.write(
+            _format_batch_layout(
+                batch_layout(
+                    batch_size,
+                    group_size,
+                    distributed.world_size,
+                    micro_batch_size_per_gpu,
+                    ppo_minibatch_size,
+                ),
+                strategy,
+                config,
+            )
+        )
+    seed = int(experiment.get("seed", 1234))
+    seed_everything(seed)
+    resume_checkpoint = resolve_resume_checkpoint(
+        training.get("resume_from_checkpoint"), experiment.get("output_dir")
+    )
+    resume_config_validation = (
+        validate_resume_config(
+            resume_checkpoint,
+            config,
+            allow_mismatch=bool(training.get("resume_allow_config_mismatch", False)),
+        )
+        if resume_checkpoint is not None
+        else None
+    )
+    output_dir = Path(experiment["output_dir"]).resolve()
+    metrics_path = output_dir / "metrics.jsonl"
+    if resume_checkpoint is None and metrics_path.exists() and not bool(experiment.get("allow_existing_output", False)):
+        raise FileExistsError(f"Refusing to append to existing run: {metrics_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_config_path = output_dir / (
+        "resolved_config.yaml"
+        if resume_checkpoint is None
+        else f"resolved_config.resume-{resume_checkpoint.name}.yaml"
+    )
+    if distributed.is_main:
+        save_config(config, resolved_config_path)
+        canonical_config = output_dir / "resolved_config.yaml"
+        if resume_checkpoint is not None and not canonical_config.exists():
+            save_config(config, canonical_config)
+    distributed.barrier()
+
+    setup_progress = tqdm(
+        total=4,
+        desc="Setup GRPO",
+        unit="stage",
+        dynamic_ncols=True,
+        leave=False,
+        disable=not distributed.is_main,
+    )
+    setup_progress.set_postfix_str("stage=load-data", refresh=True)
+    records, data_files = read_records(
+        config["data"]["path"], split=config["data"].get("split")
+    )
+    if not records:
+        raise ValueError("Configured training dataset is empty")
+    validate_prompt_records(records, config["data"])
+    original_record_count = len(records)
+    prompt_tokenizer = load_student_tokenizer(config)
+    records, prompt_filter_summary = filter_overlong_prompt_records(
+        records, prompt_tokenizer, config["data"]
+    )
+    del prompt_tokenizer
+    if distributed.is_main:
+        tqdm.write(f"GRPO dataset examples: {prompt_filter_summary['kept_count']}")
+    setup_progress.update(1)
+    setup_progress.set_postfix_str(f"stage=start-rollout-{rollout_backend}", refresh=True)
+    rollout_engine: VLLMRolloutEngine | None = None
+    if rollout_backend == "vllm":
+        rollout_engine = VLLMRolloutEngine(
+            config,
+            output_dir,
+            local_rank=distributed.local_rank,
+            world_size=distributed.world_size,
+            port=unique_free_port(distributed),
+        )
+        rollout_engine.start()
+    setup_progress.update(1)
+    setup_progress.set_postfix_str("stage=load-student", refresh=True)
+    model_load_config = config
+    if resume_checkpoint is not None:
+        model_load_config = copy.deepcopy(config)
+        model_load_config["models"]["student_path"] = str(resume_checkpoint)
+    student, tokenizer, model_metadata = load_student_model(model_load_config, device)
+    training_student = student
+    if strategy == "fsdp":
+        training_student = wrap_fsdp_model(student, config, distributed, role="student")
+    elif strategy == "ddp":
+        training_student = DistributedDataParallel(
+            student,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=bool(config.get("distributed", {}).get("find_unused_parameters", False)),
+            gradient_as_bucket_view=bool(config.get("distributed", {}).get("gradient_as_bucket_view", True)),
+            static_graph=bool(config.get("distributed", {}).get("static_graph", True)),
+            bucket_cap_mb=float(config.get("distributed", {}).get("bucket_cap_mb", 100)),
+        )
+    setup_progress.update(1)
+    setup_progress.set_postfix_str("stage=optimizer", refresh=True)
+    optimizer, fused_optimizer = _make_optimizer(
+        [parameter for parameter in training_student.parameters() if parameter.requires_grad],
+        training,
+    )
+    resume_state = (
+        restore_optimizer(
+            optimizer,
+            resume_checkpoint,
+            device,
+            model=training_student,
+            distributed=distributed,
+        )
+        if resume_checkpoint is not None
+        else None
+    )
+    resume_step = resume_state.step if resume_state is not None else 0
+    resume_history = None
+    if resume_state is not None:
+        if distributed.is_main:
+            resume_history = validate_append_history(
+                output_dir, resume_step, resume_state.checkpoint
+            )
+        distributed.barrier()
+    if distributed.is_main:
+        metadata = collect_metadata(
+            Path(__file__).resolve().parents[1],
+            command_line or sys.argv,
+            model_metadata,
+            config["data"]["path"],
+            data_files,
+        )
+        metadata["method"] = "grpo"
+        metadata["data_schema"] = {
+            "rows": len(records),
+            "original_rows": original_record_count,
+            "prompt_filter": prompt_filter_summary,
+            "columns": sorted(records[0]),
+            "files": [str(path) for path in data_files],
+            "split": config["data"].get("split"),
+            "full_dataset": True,
+        }
+        metadata["distributed"] = {
+            "strategy": strategy,
+            "world_size": distributed.world_size,
+            "global_batch_preserved": True,
+            "teacher_used": False,
+            "student_sharding_strategy": "FULL_SHARD" if strategy == "fsdp" else None,
+        }
+        metadata["grpo"] = {
+            "group_size": group_size,
+            "reward": "math_verify_outcome_or_normalized_boxed_answer",
+            "critic": False,
+            "reference_model": False,
+            "loss": "clipped_sampled_action_ppo",
+            "advantage_normalization": "group_mean_population_std",
+            "temperature": rollout_temperature,
+        }
+        metadata["resume"] = (
+            {
+                "checkpoint": str(resume_state.checkpoint),
+                "optimizer_path": str(resume_state.optimizer_path),
+                "step": resume_state.step,
+                "history": resume_history,
+                "config_validation": resume_config_validation,
+            }
+            if resume_state is not None
+            else None
+        )
+        save_metadata(
+            metadata,
+            output_dir,
+            filename=(
+                "run_metadata.json"
+                if resume_state is None
+                else f"run_metadata.resume-step-{resume_step:06d}.json"
+            ),
+        )
+    setup_progress.update(1)
+    setup_progress.close()
+
+    rollout_batches_per_epoch = math.ceil(len(records) / batch_size)
+    optimizer_steps_per_epoch = _optimizer_steps_per_epoch(
+        len(records), batch_size, group_size, ppo_minibatch_size
+    )
+    configured_max_steps = training.get("max_steps")
+    max_steps = (
+        int(configured_max_steps)
+        if configured_max_steps is not None
+        else int(training.get("epochs", 1)) * optimizer_steps_per_epoch
+    )
+    if resume_step >= max_steps:
+        raise ValueError(
+            f"Checkpoint is already at step {resume_step}, but configured total max_steps is {max_steps}"
+        )
+    training_eval_settings = config.get("training_evaluation", {})
+    evaluation_steps = training_evaluation_steps(max_steps, training_eval_settings)
+    if distributed.is_main and evaluation_steps:
+        tqdm.write("Periodic evaluation (GRPO): " + ", ".join(map(str, evaluation_steps)))
+    tensorboard_logger = TensorBoardLogger(
+        output_dir,
+        dict(config.get("logging", {}).get("tensorboard", {})),
+        enabled=distributed.is_main,
+        resume_step=resume_step,
+    )
+    initial_evaluation = None
+    if resume_step == 0 and should_run_training_evaluation(0, max_steps, training_eval_settings):
+        initial_evaluation = _run_training_evaluation(
+            training_student,
+            tokenizer,
+            "grpo",
+            0,
+            max_steps,
+            config,
+            output_dir,
+            resolved_config_path,
+            distributed=distributed,
+        )
+        distributed.barrier()
+    progress = tqdm(
+        total=max_steps,
+        desc="GRPO B200",
+        unit="step",
+        dynamic_ncols=True,
+        leave=True,
+        disable=not distributed.is_main,
+        mininterval=0.5,
+        initial=resume_step,
+    )
+    optimizer_step = resume_step
+    rollout_index, ppo_minibatch_offset = _rollout_position_after_optimizer_steps(
+        optimizer_step, len(records), batch_size, group_size, ppo_minibatch_size
+    )
+    answer_key = str(config.get("grpo", {}).get("answer_key", "answer"))
+    reward_benchmark = config.get("grpo", {}).get("reward_benchmark")
+    final_metrics: dict[str, Any] = {}
+    while optimizer_step < max_steps:
+        step_started = time.perf_counter()
+        rollout_first_optimizer_step = optimizer_step + 1
+        global_indices = epoch_batch_indices(len(records), batch_size, rollout_index, seed)
+        rollout_ppo_minibatches = _ppo_minibatch_count(
+            len(global_indices) * group_size, ppo_minibatch_size
+        )
+        local_start, _ = contiguous_partition(
+            len(global_indices), distributed.rank, distributed.world_size
+        )
+        prompt_indices, active_prompts = padded_local_indices(
+            global_indices, distributed.rank, distributed.world_size
+        )
+        prompt_records = [records[index] for index in prompt_indices]
+        encoded, _ = tokenize_prompts(prompt_records, tokenizer, config["data"], device)
+        encoded, indices, response_indices = expand_prompt_batch(
+            encoded, prompt_indices, group_size
+        )
+        active_trajectories = torch.tensor(
+            [active for active in active_prompts for _ in range(group_size)],
+            dtype=torch.bool,
+            device=device,
+        )
+        batch_records = [records[index] for index in indices]
+        rollout_function = (
+            rollout_engine.generate if rollout_engine is not None else generate_on_policy
+        )
+        rollout, rollout_time = _timed(
+            device,
+            rollout_function,
+            training_student,
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            max_new_tokens=int(config["rollout"].get("max_new_tokens", 256)),
+            temperature=rollout_temperature,
+            top_p=float(config["rollout"].get("top_p", 1.0)),
+            eos_token_ids=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            seed=int(config["rollout"].get("seed", seed)),
+            sample_seed_offset=rollout_index * batch_size * group_size + local_start * group_size,
+        )
+        for field in (
+            "input_ids",
+            "attention_mask",
+            "response_ids",
+            "valid_mask",
+            "rollout_log_probs",
+        ):
+            setattr(rollout, field, getattr(rollout, field).clone())
+        objective_valid = rollout.valid_mask & active_trajectories.unsqueeze(1)
+        finite_or_raise("GRPO rollout log-probs", rollout.rollout_log_probs[objective_valid])
+        _, advantages, reward_stats = _grpo_group_advantages(
+            rollout,
+            tokenizer,
+            batch_records,
+            active_trajectories,
+            response_indices,
+            group_size,
+            device,
+            answer_key=answer_key,
+            benchmark=reward_benchmark,
+            std_epsilon=float(config.get("grpo", {}).get("advantage_epsilon", 1.0e-8)),
+        )
+        response_lengths = objective_valid.long().sum(dim=-1).clamp_min(1)
+        position_weights = torch.where(
+            objective_valid,
+            1.0 / response_lengths.unsqueeze(1).float(),
+            torch.zeros_like(rollout.valid_mask, dtype=torch.float32),
+        )
+        with torch.inference_mode(False):
+            old_log_probs = torch.where(
+                rollout.valid_mask,
+                rollout.rollout_log_probs,
+                torch.zeros_like(rollout.rollout_log_probs),
+            ).detach().clone().float().unsqueeze(-1)
+            reference = TopKOPDReference(
+                candidate_ids=rollout.response_ids.detach().clone().long().unsqueeze(-1),
+                old_student_log_probs=old_log_probs,
+                teacher_log_probs=old_log_probs.clone(),
+                student_weights=torch.ones_like(old_log_probs),
+                advantages=advantages.detach().clone().float().unsqueeze(-1),
+                support_mask=None,
+            )
+        checkpoints_by_step: dict[int, Path] = {}
+        evaluation_sources: dict[int, tuple[Path, bool]] = {}
+        save_checkpoints = bool(training.get("save_checkpoints", True))
+        save_interval = int(training.get("save_interval", 100))
+
+        def after_optimizer_step(current_step: int, _metrics: dict[str, float]) -> None:
+            should_evaluate = should_run_training_evaluation(
+                current_step, max_steps, training_eval_settings
+            )
+            should_save = save_checkpoints and (
+                current_step == max_steps
+                or (save_interval > 0 and current_step % save_interval == 0)
+            )
+            checkpoint_path = None
+            if should_save:
+                checkpoint_path = _save_checkpoint(
+                    training_student,
+                    tokenizer,
+                    optimizer,
+                    output_dir,
+                    current_step,
+                    current_step == max_steps,
+                    bool(training.get("save_optimizer", True)),
+                    distributed,
+                )
+                checkpoints_by_step[current_step] = checkpoint_path
+            if should_evaluate:
+                evaluation_path = checkpoint_path
+                temporary = False
+                if evaluation_path is None:
+                    evaluation_path = output_dir / ".evaluation_snapshots" / f"step-{current_step:06d}"
+                    if distributed.is_main and evaluation_path.exists():
+                        shutil.rmtree(evaluation_path)
+                    distributed.barrier()
+                    _save_inference_snapshot(
+                        training_student, tokenizer, evaluation_path, distributed
+                    )
+                    temporary = True
+                evaluation_sources[current_step] = (evaluation_path, temporary)
+            if distributed.is_main:
+                progress.update(1)
+
+        train_metrics = _opd_train_step(
+            training_student,
+            optimizer,
+            rollout,
+            position_weights,
+            reference,
+            config,
+            device,
+            distributed,
+            objective_valid_mask=objective_valid,
+            trajectory_active_mask=active_trajectories,
+            ppo_minibatch_offset=ppo_minibatch_offset,
+            max_optimizer_steps=max_steps - optimizer_step,
+            optimizer_step_start=optimizer_step,
+            on_optimizer_step=after_optimizer_step,
+        )
+        optimizer_steps_completed = int(train_metrics["optimizer_steps"])
+        optimizer_step += optimizer_steps_completed
+        step = optimizer_step
+        periodic_evaluations: dict[int, dict[str, Any]] = {}
+        for evaluation_step, (evaluation_checkpoint, temporary) in sorted(evaluation_sources.items()):
+            evaluation_result = _run_training_evaluation(
+                training_student,
+                tokenizer,
+                "grpo",
+                evaluation_step,
+                max_steps,
+                config,
+                output_dir,
+                resolved_config_path,
+                checkpoint=evaluation_checkpoint,
+                distributed=distributed,
+            )
+            if distributed.is_main:
+                periodic_evaluations[evaluation_step] = evaluation_result
+            distributed.barrier()
+            if distributed.is_main and temporary and evaluation_checkpoint.exists():
+                shutil.rmtree(evaluation_checkpoint)
+        valid_tokens = distributed.sum_int(int(objective_valid.sum().item()))
+        trajectory_count = distributed.sum_int(int(active_trajectories.sum().item()))
+        wall_time = distributed.max_float(time.perf_counter() - step_started)
+        local_peak_allocated = torch.cuda.max_memory_allocated(device)
+        local_peak_reserved = torch.cuda.max_memory_reserved(device)
+        final_metrics = {
+            "step": step,
+            "epoch": rollout_index // rollout_batches_per_epoch,
+            "step_in_epoch": rollout_index % rollout_batches_per_epoch,
+            "rollout_batch_index": rollout_index,
+            "rollout_first_optimizer_step": rollout_first_optimizer_step,
+            "rollout_last_optimizer_step": step,
+            "method": "grpo",
+            "resumed_from": str(resume_state.checkpoint) if resume_state is not None else None,
+            "resume_step": resume_step,
+            "batch_size": len(global_indices),
+            "prompt_batch_size": len(global_indices),
+            "global_prompt_batch_size": len(global_indices),
+            "local_prompt_batch_size": len(prompt_indices),
+            "num_responses_per_prompt": group_size,
+            "trajectory_batch_size": len(global_indices) * group_size,
+            "global_trajectory_batch_size": len(global_indices) * group_size,
+            "num_trajectories": trajectory_count,
+            "ppo_mini_batch_size": ppo_minibatch_size,
+            "local_ppo_mini_batch_size": (ppo_minibatch_size + distributed.world_size - 1) // distributed.world_size,
+            "ppo_minibatches_in_rollout": optimizer_steps_completed,
+            "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
+            "distributed_world_size": distributed.world_size,
+            "distributed_strategy": strategy,
+            "global_batch_preserved": True,
+            "token_allocation_policy": "grpo_group_normalized_outcome_advantage",
+            "objective_normalization": "global_sequence_mean",
+            "grpo_group_size": group_size,
+            "grpo_reward_mean": reward_stats["reward_mean"],
+            "grpo_reward_std": reward_stats["reward_std"],
+            "grpo_reward_min": reward_stats["reward_min"],
+            "grpo_reward_max": reward_stats["reward_max"],
+            "grpo_advantage_mean": reward_stats["advantage_mean"],
+            "grpo_advantage_std": reward_stats["advantage_std"],
+            "loss": train_metrics["loss"],
+            "train_loss": train_metrics["loss"],
+            "weighted_final_loss": train_metrics["weighted_final_loss"],
+            "grpo_clip_fraction": train_metrics["clip_fraction"],
+            "grpo_ratio_mean": train_metrics["ratio_mean"],
+            "grpo_ratio_min": train_metrics["ratio_min"],
+            "grpo_ratio_max": train_metrics["ratio_max"],
+            "gradient_norm": distributed.max_float(train_metrics["gradient_norm"]),
+            "grad_norm": distributed.max_float(train_metrics["gradient_norm"]),
+            "training_forward_time": distributed.max_float(train_metrics["training_forward_time"]),
+            "backward_time": distributed.max_float(train_metrics["backward_time"]),
+            "optimizer_time": distributed.max_float(train_metrics["optimizer_time"]),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "rollout_time": distributed.max_float(rollout_time),
+            "wall_clock_step_time": wall_time,
+            "tokens_per_second": valid_tokens / max(wall_time, 1e-12),
+            "generated_tokens_per_second": valid_tokens / max(distributed.max_float(rollout_time), 1e-12),
+            "num_valid_tokens": valid_tokens,
+            "mean_response_length": valid_tokens / max(trajectory_count, 1),
+            "peak_gpu_allocated_bytes": distributed.max_int(local_peak_allocated),
+            "peak_gpu_reserved_bytes": distributed.max_int(local_peak_reserved),
+            "peak_gpu_allocated_gb": distributed.max_int(local_peak_allocated) / 2**30,
+            "peak_gpu_reserved_gb": distributed.max_int(local_peak_reserved) / 2**30,
+            "checkpoint": str(checkpoints_by_step[step]) if step in checkpoints_by_step else None,
+            "rollout_token_sha256": _rollout_hash(rollout.response_ids, objective_valid, distributed),
+        }
+        training_events: list[dict[str, Any]] = []
+        for event_offset, minibatch_metric in enumerate(train_metrics["minibatches"]):
+            event_step = rollout_first_optimizer_step + event_offset
+            event = copy.deepcopy(final_metrics)
+            event.update(
+                {
+                    "step": event_step,
+                    "train_loss": minibatch_metric["loss"],
+                    "loss": minibatch_metric["loss"],
+                    "weighted_final_loss": minibatch_metric["weighted_final_loss"],
+                    "gradient_norm": distributed.max_float(minibatch_metric["gradient_norm"]),
+                    "grad_norm": distributed.max_float(minibatch_metric["gradient_norm"]),
+                    "grpo_clip_fraction": minibatch_metric["clip_fraction"],
+                    "grpo_ratio_mean": minibatch_metric["ratio_mean"],
+                    "grpo_ratio_min": minibatch_metric["ratio_min"],
+                    "grpo_ratio_max": minibatch_metric["ratio_max"],
+                    "ppo_minibatch_index": int(minibatch_metric["ppo_minibatch_index"]),
+                    "ppo_minibatch_trajectory_count": int(minibatch_metric["ppo_minibatch_trajectory_count"]),
+                    "checkpoint": str(checkpoints_by_step[event_step]) if event_step in checkpoints_by_step else None,
+                }
+            )
+            if event_step in periodic_evaluations:
+                periodic = periodic_evaluations[event_step]
+                event["periodic_evaluation"] = {
+                    "evaluation_time": periodic["evaluation_time"],
+                    "benchmarks": periodic["benchmarks"],
+                    "details": periodic["details"],
+                }
+            training_events.append(event)
+        final_metrics = training_events[-1]
+        if distributed.is_main:
+            for event in training_events:
+                _append_jsonl(metrics_path, event)
+                _append_train_metrics_csv(output_dir / "train_metrics.csv", event)
+                tensorboard_logger.write(event["step"], event, "grpo")
+            progress.set_postfix(
+                loss=f"{train_metrics['loss']:.4f}",
+                reward=f"{reward_stats['reward_mean']:.3f}",
+                refresh=True,
+            )
+        del encoded, rollout, objective_valid, active_trajectories, reference, position_weights
+        ppo_minibatch_offset += optimizer_steps_completed
+        if ppo_minibatch_offset >= rollout_ppo_minibatches:
+            rollout_index += 1
+            ppo_minibatch_offset = 0
+    progress.close()
+    tensorboard_logger.close()
+    if rollout_engine is not None:
+        rollout_engine.close()
+    distributed.barrier()
+    summary = {
+        "status": "ok",
+        "method": "grpo",
+        "steps": max_steps,
+        "epochs": training.get("epochs"),
+        "dataset_rows": len(records),
+        "original_dataset_rows": original_record_count,
+        "prompt_filter": prompt_filter_summary,
+        "full_dataset": True,
+        "ppo_mini_batch_size": ppo_minibatch_size,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+        "rollout_backend": rollout_backend,
+        "resumed_from": str(resume_state.checkpoint) if resume_state is not None else None,
+        "resume_step": resume_step,
+        "distributed_world_size": distributed.world_size,
+        "global_batch_preserved": True,
+        "last": final_metrics,
+        "student_path": model_metadata["student_path"],
+        "teacher_path": None,
+        "selector_score_dir": None,
+        "evaluation_history": str((output_dir / "eval_history.jsonl").resolve()) if bool(training_eval_settings.get("enabled", False)) else None,
+        "initial_evaluation": initial_evaluation,
+    }
+    if distributed.is_main:
+        with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)
+            handle.write("\n")
+    result = summary if distributed.is_main else {"status": "worker_ok", "rank": distributed.rank}
+    distributed.close()
+    return result
+
+
 def run_training(
     config: dict[str, Any], command_line: list[str] | None = None
 ) -> dict[str, Any]:
@@ -2011,10 +2668,12 @@ def run_training(
     experiment, training = config["experiment"], config["training"]
     strategy = distributed_strategy(config, distributed)
     method = str(experiment["method"]).lower()
-    if method not in {"opd", "ta", "rac", "pgt", "cmt"}:
+    if method not in {"opd", "ta", "rac", "pgt", "cmt", "grpo"}:
         raise ValueError(
-            f"Training method must be opd, ta, rac, pgt, or cmt, got {method!r}"
+            f"Training method must be opd, ta, rac, pgt, cmt, or grpo, got {method!r}"
         )
+    if method == "grpo":
+        return _run_grpo_training(config, command_line, distributed, device, strategy)
     if method == "cmt":
         rollout_temperature = float(config["rollout"].get("temperature", 1.0))
         rollout_top_p = float(config["rollout"].get("top_p", 1.0))

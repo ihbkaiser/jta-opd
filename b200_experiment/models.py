@@ -196,6 +196,82 @@ def load_models(config: dict[str, Any], device: torch.device):
     return student, teacher, tokenizer, assets
 
 
+def load_student_model(config: dict[str, Any], device: torch.device):
+    """Load only the trainable student for teacher-free baselines.
+
+    GRPO does not use a teacher or a reference network.  Keeping this loader
+    separate from ``load_models`` is important on B200: constructing an
+    otherwise-unused teacher would both change the memory/throughput baseline
+    and make GRPO fail for checkpoints where no teacher is available.
+    """
+    model_cfg = config["models"]
+    student_path = Path(model_cfg["student_path"]).resolve()
+    if not (student_path / "config.json").is_file():
+        raise FileNotFoundError(
+            f"student checkpoint is missing config.json: {student_path}"
+        )
+    student_config = AutoConfig.from_pretrained(student_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(student_path, local_files_only=True)
+    dtype = _dtype(model_cfg.get("dtype", "bfloat16"))
+    attention = choose_attention_implementation(
+        model_cfg.get("attention_implementation", "auto")
+    )
+    common = {
+        "local_files_only": True,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": attention,
+        **model_dtype_kwargs(dtype),
+    }
+    student = AutoModelForCausalLM.from_pretrained(student_path, **common).to(device)
+    training = config.get("training", {})
+    if training.get("use_lora", False):
+        from peft import LoraConfig, get_peft_model
+
+        lora = training.get("lora", {})
+        student = get_peft_model(
+            student,
+            LoraConfig(
+                r=int(lora.get("rank", 8)),
+                lora_alpha=int(lora.get("alpha", 16)),
+                lora_dropout=float(lora.get("dropout", 0.0)),
+                target_modules=list(lora.get("target_modules", ["q_proj", "v_proj"])),
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+    if training.get("gradient_checkpointing", False):
+        student.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(student, "enable_input_require_grads"):
+            student.enable_input_require_grads()
+    student.config.use_cache = False
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    metadata = {
+        "student_path": str(student_path),
+        "teacher_path": None,
+        "student_model_type": student_config.model_type,
+        "teacher_model_type": None,
+        "student_parameters_declared": getattr(student_config, "num_parameters", None),
+        "teacher_parameters_declared": None,
+        "compatibility": None,
+        "tokenizer_protocol": {
+            "tokenizer_source": "student",
+            "teacher_used": False,
+        },
+        "attention_implementation": attention,
+        "dtype": str(dtype),
+        "trainable_parameters": sum(
+            p.numel() for p in student.parameters() if p.requires_grad
+        ),
+        "student_parameters": sum(p.numel() for p in student.parameters()),
+        "teacher_parameters": 0,
+    }
+    return student, tokenizer, metadata
+
+
 def load_student_tokenizer(config: dict[str, Any]):
     """Load the sole runtime tokenizer without materializing either model.
 

@@ -96,6 +96,17 @@ CMT_TAGS = {
     "cmt/weight_max": ("w", "max"),
 }
 
+GRPO_TAGS = {
+    "grpo/reward_mean": ("grpo_reward_mean",),
+    "grpo/reward_std": ("grpo_reward_std",),
+    "grpo/reward_min": ("grpo_reward_min",),
+    "grpo/reward_max": ("grpo_reward_max",),
+    "grpo/advantage_mean": ("grpo_advantage_mean",),
+    "grpo/advantage_std": ("grpo_advantage_std",),
+    "grpo/group_size": ("grpo_group_size",),
+    "grpo/clip_fraction": ("grpo_clip_fraction",),
+}
+
 
 def _selector_value(selector: dict[str, Any], path: tuple[str, ...]) -> float:
     value: Any = selector
@@ -108,7 +119,11 @@ def production_tensorboard_metrics(
     metrics: dict[str, Any], method: str
 ) -> dict[str, float]:
     """Select globally reduced production diagnostics for TensorBoard."""
-    selected = {tag: float(metrics[field]) for tag, field in BASE_TAGS.items()}
+    selected = {
+        tag: float(metrics[field])
+        for tag, field in BASE_TAGS.items()
+        if field in metrics and metrics[field] is not None
+    }
     selector = metrics.get("selector", {})
     if method == "ta":
         selected["ta/selected_token_fraction"] = float(selector["selected_fraction"])
@@ -148,6 +163,14 @@ def production_tensorboard_metrics(
             {
                 tag: _selector_value(selector, path)
                 for tag, path in CMT_TAGS.items()
+            }
+        )
+    elif method == "grpo":
+        selected.update(
+            {
+                tag: _selector_value(metrics, path)
+                for tag, path in GRPO_TAGS.items()
+                if all(key in metrics for key in path)
             }
         )
     sanity = metrics.get("vllm_logprob_sanity", {})

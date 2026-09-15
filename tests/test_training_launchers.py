@@ -14,6 +14,7 @@ TRAIN_SCRIPTS = (
     "train_ta_b200.sh",
     "train_rac_b200.sh",
     "train_cmt_b200.sh",
+    "train_grpo_b200.sh",
 )
 
 

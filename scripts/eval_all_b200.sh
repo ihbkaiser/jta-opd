@@ -11,13 +11,16 @@ TA_EVAL_OUTPUT="${TA_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/ta_opd}"
 RAC_EVAL_OUTPUT="${RAC_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/rac}"
 PGT_EVAL_OUTPUT="${PGT_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/pgt_opd}"
 CMT_EVAL_OUTPUT="${CMT_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/cmt_opd}"
+GRPO_EVAL_OUTPUT="${GRPO_EVAL_OUTPUT:-${RUN_RESULTS_DIR}/eval/grpo}"
 OPD_CHECKPOINT="${OPD_CHECKPOINT:-${OPD_RUN_OUTPUT}/final}"
 TA_CHECKPOINT="${TA_CHECKPOINT:-${TA_RUN_OUTPUT}/final}"
 RAC_CHECKPOINT="${RAC_CHECKPOINT:-${RAC_RUN_OUTPUT}/final}"
 PGT_CHECKPOINT="${PGT_CHECKPOINT:-${PGT_RUN_OUTPUT}/final}"
 CMT_CHECKPOINT="${CMT_CHECKPOINT:-${CMT_RUN_OUTPUT}/final}"
+GRPO_CHECKPOINT="${GRPO_CHECKPOINT:-${GRPO_RUN_OUTPUT}/final}"
 RUN_PGT_EVAL="${RUN_PGT_EVAL:-false}"
 RUN_CMT_EVAL="${RUN_CMT_EVAL:-false}"
+RUN_GRPO_EVAL="${RUN_GRPO_EVAL:-false}"
 
 echo "Evaluating OPD ${OPD_RUN_NAME}, TA ${TA_RUN_NAME}, and RAC ${RAC_RUN_NAME}"
 if [[ "${RUN_PGT_EVAL}" == "true" ]]; then
@@ -25,6 +28,9 @@ if [[ "${RUN_PGT_EVAL}" == "true" ]]; then
 fi
 if [[ "${RUN_CMT_EVAL}" == "true" ]]; then
   echo "CMT evaluation enabled: ${CMT_RUN_NAME}"
+fi
+if [[ "${RUN_GRPO_EVAL}" == "true" ]]; then
+  echo "GRPO evaluation enabled: ${GRPO_RUN_NAME}"
 fi
 echo "Comparison name: ${COMPARISON_NAME}"
 echo "OPD checkpoint: ${OPD_CHECKPOINT}"
@@ -60,6 +66,12 @@ if [[ "${RUN_CMT_EVAL}" == "true" ]]; then
     CMT_EVAL_OUTPUT="${CMT_EVAL_OUTPUT}" \
     bash "${SCRIPT_DIR}/eval_cmt_b200.sh"
 fi
+if [[ "${RUN_GRPO_EVAL}" == "true" ]]; then
+  RUN_NAME="${RUN_NAME}" RESULTS_DIR="${RUN_RESULTS_DIR}" \
+    GRPO_OUTPUT_DIR="${GRPO_RUN_OUTPUT}" GRPO_CHECKPOINT="${GRPO_CHECKPOINT}" \
+    GRPO_EVAL_OUTPUT="${GRPO_EVAL_OUTPUT}" \
+    bash "${SCRIPT_DIR}/eval_grpo_b200.sh"
+fi
 AGGREGATE_ARGS=(
   --base-dir "${BASE_EVAL_OUTPUT}"
   --opd-dir "${OPD_EVAL_OUTPUT}"
@@ -73,6 +85,9 @@ fi
 if [[ "${RUN_CMT_EVAL}" == "true" ]]; then
   AGGREGATE_ARGS+=(--cmt-dir "${CMT_EVAL_OUTPUT}")
 fi
+if [[ "${RUN_GRPO_EVAL}" == "true" ]]; then
+  AGGREGATE_ARGS+=(--grpo-dir "${GRPO_EVAL_OUTPUT}")
+fi
 "${PYTHON_BIN}" -m b200_experiment.cli aggregate-eval \
   "${AGGREGATE_ARGS[@]}"
 RUN_NAME="${RUN_NAME}" RESULTS_DIR="${RUN_RESULTS_DIR}" \
@@ -80,4 +95,5 @@ RUN_NAME="${RUN_NAME}" RESULTS_DIR="${RUN_RESULTS_DIR}" \
   RAC_OUTPUT_DIR="${RAC_RUN_OUTPUT}" \
   PGT_OUTPUT_DIR="${PGT_RUN_OUTPUT}" \
   CMT_OUTPUT_DIR="${CMT_RUN_OUTPUT}" \
+  GRPO_OUTPUT_DIR="${GRPO_RUN_OUTPUT}" \
   bash "${SCRIPT_DIR}/plot_results.sh"

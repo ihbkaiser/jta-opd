@@ -79,6 +79,7 @@ TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 PGT_CONFIG="${REPO_DIR}/configs/qwen3_b200_pgt.yaml"
 CMT_CONFIG="${REPO_DIR}/configs/qwen3_b200_cmt.yaml"
+GRPO_CONFIG="${REPO_DIR}/configs/qwen3_b200_grpo.yaml"
 
 storage_asset_path() {
   if [[ "$1" == /* ]]; then
@@ -137,10 +138,16 @@ ASSET_CONFIG_ARGS=(
 )
 
 print_asset_selection() {
-  echo "Teacher model: ${TEACHER_MODEL_ABS}"
+  if [[ "${B200_METHOD:-}" == "grpo" ]]; then
+    echo "Teacher model: none (teacher-free GRPO)"
+  else
+    echo "Teacher model: ${TEACHER_MODEL_ABS}"
+  fi
   echo "Student model/tokenizer: ${STUDENT_MODEL_ABS}"
   echo "Training dataset: preset=${TRAIN_DATASET}, path=${TRAIN_DATA_ABS}, split=${TRAIN_DATA_SPLIT}, prompt_key=${TRAIN_PROMPT_KEY}"
-  echo "Teacher protocol: no-think, shared student token IDs, no teacher re-tokenization"
+  if [[ "${B200_METHOD:-}" != "grpo" ]]; then
+    echo "Teacher protocol: no-think, shared student token IDs, no teacher re-tokenization"
+  fi
   echo "Asset fingerprint: ${ASSET_FINGERPRINT}"
   echo "Preflight report: ${PREFLIGHT_REPORT}"
   echo "Validation topology: ${VALIDATION_WORLD_SIZE} GPU(s)"
@@ -154,6 +161,7 @@ resolve_run_paths() {
   local rac_name="${RAC_RUN_NAME:-${RUN_NAME}}"
   local pgt_name="${PGT_RUN_NAME:-${RUN_NAME}}"
   local cmt_name="${CMT_RUN_NAME:-${RUN_NAME}}"
+  local grpo_name="${GRPO_RUN_NAME:-${RUN_NAME}}"
   if [[ -n "${COMPARISON_NAME:-}" ]]; then
     COMPARISON_NAME="${COMPARISON_NAME}"
   elif [[ -n "${OPD_RUN_NAME:-}" ]]; then
@@ -163,7 +171,7 @@ resolve_run_paths() {
   else
     COMPARISON_NAME="${RUN_NAME}"
   fi
-  for name in "${RUN_NAME}" "${opd_name}" "${ta_name}" "${rac_name}" "${pgt_name}" "${cmt_name}" "${COMPARISON_NAME}"; do
+  for name in "${RUN_NAME}" "${opd_name}" "${ta_name}" "${rac_name}" "${pgt_name}" "${cmt_name}" "${grpo_name}" "${COMPARISON_NAME}"; do
     if ! [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       echo "Run names may contain only letters, numbers, dot, underscore, and dash: ${name}" >&2
       return 1
@@ -174,12 +182,14 @@ resolve_run_paths() {
   RAC_RUN_NAME="${rac_name}"
   PGT_RUN_NAME="${pgt_name}"
   CMT_RUN_NAME="${cmt_name}"
+  GRPO_RUN_NAME="${grpo_name}"
   OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
   OPD_RUN_OUTPUT="${OPD_OUTPUT_DIR:-${OUTPUT_ROOT}/${OPD_RUN_NAME}/opd}"
   TA_RUN_OUTPUT="${TA_OUTPUT_DIR:-${OUTPUT_ROOT}/${TA_RUN_NAME}/ta_opd}"
   RAC_RUN_OUTPUT="${RAC_OUTPUT_DIR:-${OUTPUT_ROOT}/${RAC_RUN_NAME}/rac_opd}"
   PGT_RUN_OUTPUT="${PGT_OUTPUT_DIR:-${OUTPUT_ROOT}/${PGT_RUN_NAME}/pgt_opd}"
   CMT_RUN_OUTPUT="${CMT_OUTPUT_DIR:-${OUTPUT_ROOT}/${CMT_RUN_NAME}/cmt_opd}"
+  GRPO_RUN_OUTPUT="${GRPO_OUTPUT_DIR:-${OUTPUT_ROOT}/${GRPO_RUN_NAME}/grpo}"
   RUN_RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/results/${COMPARISON_NAME}}"
 }
 
@@ -373,6 +383,7 @@ build_training_args() {
     --set "rollout.vllm.performance_mode=${ROLLOUT_VLLM_PERFORMANCE_MODE:-throughput}"
     --set "rollout.vllm.async_scheduling=${ROLLOUT_VLLM_ASYNC_SCHEDULING:-true}"
     --set "rollout.vllm.logprob_sanity.enabled=${VLLM_LOGPROB_SANITY_ENABLED:-false}"
+    --set "rollout.vllm.return_log_probs=${VLLM_RETURN_LOG_PROBS:-false}"
     --set "rollout.vllm.logprob_sanity.max_tokens_per_rank=${VLLM_LOGPROB_SANITY_TOKENS:-32}"
     --set "rollout.vllm.logprob_sanity.tolerance=${VLLM_LOGPROB_SANITY_TOLERANCE:-0.05}"
     --set "rollout.vllm.logprob_sanity.fail_on_mismatch=${VLLM_LOGPROB_SANITY_FAIL:-false}"
@@ -393,6 +404,9 @@ build_training_args() {
     --set "selector.cmt_gamma=${CMT_GAMMA:-1.0}"
     --set "selector.cmt_successor_lambda=${CMT_SUCCESSOR_LAMBDA:-1.0}"
     --set "selector.cmt_full_vocab_diagnostics=${CMT_FULL_VOCAB_DIAGNOSTICS:-false}"
+    --set "grpo.answer_key=${GRPO_ANSWER_KEY:-answer}"
+    --set "grpo.reward_benchmark=${GRPO_REWARD_BENCHMARK:-Competition-MATH}"
+    --set "grpo.advantage_epsilon=${GRPO_ADVANTAGE_EPSILON:-1.0e-8}"
     --set "logging.token_score_interval=${TOKEN_SCORE_INTERVAL:-${EVAL_INTERVAL:-50}}"
     --set "logging.log_interval=${LOG_INTERVAL:-1}"
     --set "logging.tensorboard.enabled=${TENSORBOARD_ENABLED:-true}"

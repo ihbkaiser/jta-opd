@@ -20,12 +20,14 @@ export TA_RUN_NAME="${TA_RUN_NAME:-ta_${RUN_TIMESTAMP}}"
 export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_${RUN_TIMESTAMP}}"
 export PGT_RUN_NAME="${PGT_RUN_NAME:-pgt_${RUN_TIMESTAMP}}"
 export CMT_RUN_NAME="${CMT_RUN_NAME:-cmt_${RUN_TIMESTAMP}}"
+export GRPO_RUN_NAME="${GRPO_RUN_NAME:-grpo_${RUN_TIMESTAMP}}"
 export RUN_NAME="${RUN_NAME:-comparison_${RUN_TIMESTAMP}}"
 # Shared GLOBAL rollout/micro-batch for all methods. Changing the visible GPU
 # count changes only the per-GPU shard; it does not change optimizer semantics.
 export GLOBAL_BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE:-64}}}"
 export BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 export NUM_RESPONSES="${NUM_RESPONSES:-1}"
+export GRPO_GROUP_SIZE="${GRPO_GROUP_SIZE:-8}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-16}}}"
 export DDP_BUCKET_CAP_MB="${DDP_BUCKET_CAP_MB:-100}"
@@ -37,6 +39,7 @@ export TA_RHO="${TA_RHO:-${RHO:-0.10}}"
 export PGT_RHO="${PGT_RHO:-${RHO:-0.10}}"
 export RUN_PGT_TRAIN="${RUN_PGT_TRAIN:-false}"
 export RUN_CMT_TRAIN="${RUN_CMT_TRAIN:-false}"
+export RUN_GRPO_TRAIN="${RUN_GRPO_TRAIN:-false}"
 export CMT_ALLOCATION_KL="${CMT_ALLOCATION_KL:-0.5}"
 export CMT_GAMMA="${CMT_GAMMA:-1.0}"
 export CMT_SUCCESSOR_LAMBDA="${CMT_SUCCESSOR_LAMBDA:-1.0}"
@@ -125,5 +128,13 @@ if [[ "${RUN_CMT_TRAIN}" == "true" ]]; then
     RESUME_FROM_CHECKPOINT="${CMT_RESUME_FROM_CHECKPOINT:-}" \
     bash "${SCRIPT_DIR}/train_cmt_b200.sh"
 fi
-echo "Baseline runs finished. PGT trained: ${RUN_PGT_TRAIN}; CMT trained: ${RUN_CMT_TRAIN}. Plot explicitly with:"
-echo "PLOT_METHODS='opd ta rac pgt cmt' bash scripts/plot_training_progress.sh"
+if [[ "${RUN_GRPO_TRAIN}" == "true" ]]; then
+  RUN_NAME="${GRPO_RUN_NAME}" OUTPUT_DIR="${GRPO_RUN_OUTPUT}" \
+    NUM_RESPONSES="${GRPO_GROUP_SIZE}" \
+    STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
+    TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
+    RESUME_FROM_CHECKPOINT="${GRPO_RESUME_FROM_CHECKPOINT:-}" \
+    bash "${SCRIPT_DIR}/train_grpo_b200.sh"
+fi
+echo "Baseline runs finished. PGT trained: ${RUN_PGT_TRAIN}; CMT trained: ${RUN_CMT_TRAIN}; GRPO trained: ${RUN_GRPO_TRAIN}. Plot explicitly with:"
+echo "PLOT_METHODS='opd ta cmt grpo' bash scripts/plot_training_progress.sh"

@@ -443,8 +443,12 @@ class VLLMRolloutEngine:
         workers = min(
             len(prompts), int(self.settings.get("max_concurrent_requests", 128))
         )
+        # GRPO needs the behavior-policy log-probability for every sampled
+        # action.  Keep the historical sanity switch, but allow a method to
+        # request these values without enabling a diagnostic failure policy.
         return_log_probs = bool(
-            self.settings.get("logprob_sanity", {}).get("enabled", False)
+            self.settings.get("return_log_probs", False)
+            or self.settings.get("logprob_sanity", {}).get("enabled", False)
         )
         try:
             with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:

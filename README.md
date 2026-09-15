@@ -1,6 +1,6 @@
-# Pure OPD vs TA-OPD vs Bellman-RAC vs PGT vs CMT trên NVIDIA B200
+# Pure OPD vs TA-OPD vs CMT vs GRPO trên NVIDIA B200
 
-Project độc lập này huấn luyện cùng student Qwen3-1.7B-Base từ teacher Qwen3-8B bằng năm phương pháp:
+Project độc lập này hỗ trợ bốn baseline chính trên cùng student Qwen3-1.7B-Base:
 
 - **OPD thuần**: mọi valid response token có uniform weight `1`.
 - **TA-OPD gốc**: local teachability và hard top-`rho` token budget.
@@ -16,9 +16,14 @@ Project độc lập này huấn luyện cùng student Qwen3-1.7B-Base từ teac
   weight bằng global KL-constrained allocation. CMT
   không claim là causal task value hay teacher-policy value; xem
   [`CMT_REFINEMENT_DECISION.md`](CMT_REFINEMENT_DECISION.md) cho formulation hiện hành.
+- **GRPO thuần (Group Relative Policy Optimization)**: teacher-free; mỗi prompt sinh `G` response,
+  chấm outcome reward, chuẩn hoá advantage trong group và tối ưu clipped PPO surrogate. GRPO chỉ
+  tải student, không tải teacher/reference model. Bellman-RAC/PGT vẫn còn trong code để đọc và
+  tái lập các run legacy.
 
-Các phương pháp dùng chung data order, vLLM rollout, teacher scoring, **Top-K OPD core**, optimizer,
-checkpoint và evaluation. Chỉ cơ chế phân bổ loss qua response position khác nhau. Core được port
+OPD/TA/CMT dùng chung data order, vLLM rollout, teacher scoring, **Top-K OPD core**, optimizer,
+checkpoint và evaluation; GRPO dùng data order, rollout, optimizer, checkpoint và evaluation chung
+nhưng không có teacher/Top-K distillation core. Core được port
 từ [`thunlp/OPD`](https://github.com/thunlp/OPD) tại commit
 `ac26e38d6f1572eb027597b48a9f4e01f6915ef8`.
 Xem lệnh đầy đủ từ shell mới trong [`RUN_B200.md`](RUN_B200.md), hoặc runbook tiếng Việt có lệnh

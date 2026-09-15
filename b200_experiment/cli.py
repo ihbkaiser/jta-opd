@@ -189,7 +189,7 @@ def _evaluate_checkpoint(args) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Standalone B200 OPD, TA-OPD, Bellman-RAC, and PGT experiment"
+        description="Standalone B200 OPD, TA-OPD, CMT-OPD, GRPO, and legacy baselines"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -228,7 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--name",
         required=True,
-        choices=("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD"),
+        choices=("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD", "GRPO"),
     )
     evaluate.add_argument("--model", required=True)
     evaluate.add_argument("--output", required=True)
@@ -266,18 +266,20 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--base-dir", required=True)
     aggregate.add_argument("--opd-dir")
     aggregate.add_argument("--ta-dir", required=True)
-    aggregate.add_argument("--rac-dir", required=True)
+    aggregate.add_argument("--rac-dir")
     aggregate.add_argument("--pgt-dir")
     aggregate.add_argument("--cmt-dir")
+    aggregate.add_argument("--grpo-dir")
     aggregate.add_argument("--output", required=True)
 
     plot = commands.add_parser("plot")
     plot.add_argument("--results", required=True)
     plot.add_argument("--opd-output")
     plot.add_argument("--ta-output", required=True)
-    plot.add_argument("--rac-output", required=True)
+    plot.add_argument("--rac-output")
     plot.add_argument("--pgt-output")
     plot.add_argument("--cmt-output")
+    plot.add_argument("--grpo-output")
     plot.add_argument("--smoothing-window", type=int, default=10)
     plot.add_argument("--plot-name")
 
@@ -297,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
             "bellman-rac",
             "pgt",
             "cmt",
+            "grpo",
         ),
         help="Legacy single selector: all, both=TA+RAC, or one method",
     )
@@ -304,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--methods",
         nargs="+",
         choices=(
-            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt"
+            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt", "grpo"
         ),
         help="One or more methods to plot in the requested order",
     )
@@ -313,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     progress_plot.add_argument("--rac-output")
     progress_plot.add_argument("--pgt-output")
     progress_plot.add_argument("--cmt-output")
+    progress_plot.add_argument("--grpo-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
     progress_plot.add_argument("--plot-name")
     return parser
@@ -341,11 +345,15 @@ def main(argv: list[str] | None = None) -> int:
         model_dirs = {"Base": args.base_dir}
         if args.opd_dir:
             model_dirs["OPD"] = args.opd_dir
-        model_dirs.update({"TA-OPD": args.ta_dir, "RAC": args.rac_dir})
+        model_dirs["TA-OPD"] = args.ta_dir
+        if args.rac_dir:
+            model_dirs["RAC"] = args.rac_dir
         if args.pgt_dir:
             model_dirs["PGT"] = args.pgt_dir
         if args.cmt_dir:
             model_dirs["CMT-OPD"] = args.cmt_dir
+        if args.grpo_dir:
+            model_dirs["GRPO"] = args.grpo_dir
         result = aggregate_evaluations(
             model_dirs,
             args.output,
@@ -360,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             opd_output=args.opd_output,
             pgt_output=args.pgt_output,
             cmt_output=args.cmt_output,
+            grpo_output=args.grpo_output,
         )
     elif args.command == "plot-training-progress":
         result = plot_training_progress(
@@ -373,6 +382,7 @@ def main(argv: list[str] | None = None) -> int:
             methods=args.methods,
             pgt_output=args.pgt_output,
             cmt_output=args.cmt_output,
+            grpo_output=args.grpo_output,
         )
     else:
         raise AssertionError(args.command)

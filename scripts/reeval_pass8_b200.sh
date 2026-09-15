@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if (( $# < 1 || $# > 2 )); then
   echo "Usage: bash scripts/reeval_pass8_b200.sh METHOD [RUN_NAME]" >&2
-  echo "METHOD: opd, ta, rac, pgt, or cmt" >&2
+  echo "METHOD: opd, ta, rac, pgt, cmt, or grpo" >&2
   exit 2
 fi
 
