@@ -159,7 +159,10 @@ chỉ là nhãn đặt nhầm, không làm GRPO tải teacher 14B.
 
 `PPO_MINI_BATCH_SIZE` cũng là global, giống OPD/TA/CMT. Mặc định GRPO là `16`: 1 GPU nhận
 16 trajectory thực mỗi optimizer step, 2 GPU nhận 8+8, 4 GPU nhận 4+4+4+4. `MICRO_BATCH_SIZE_PER_GPU`
-chỉ điều khiển chia nhỏ local batch.
+chỉ điều khiển chia nhỏ local batch. Vì GRPO giữ nhiều response dài trong graph của
+backward, launcher GRPO mặc định `MICRO_BATCH_SIZE_PER_GPU=1`; đây chỉ là gradient
+accumulation và không đổi objective/effective PPO minibatch. Chỉ tăng lên `2`, `4`, ...
+sau khi đã kiểm tra peak VRAM với đúng model và `MAX_RESPONSE_LEN`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
@@ -178,6 +181,74 @@ MAX_STEPS=10 RUN_NAME=grpo_debug bash scripts/train_grpo_b200.sh
 
 GRPO dùng `rollout.temperature=1.0` để log-prob hành vi từ vLLM là đúng mẫu số PPO;
 không đặt `ROLLOUT_TEMPERATURE` khác 1.0.
+
+#### Giữ cùng số rollout/step với các baseline
+
+Nếu `BATCH_SIZE=64`, `GRPO_GROUP_SIZE=4` thì mỗi rollout tạo
+`64 * 4 = 256` trajectory. Số optimizer step trong một rollout là:
+
+```text
+ceil(256 / PPO_MINI_BATCH_SIZE)
+```
+
+Đây là lý do cấu hình tương đương với CMT phải là:
+
+```text
+CMT : ceil(64 * 1 / 16) = 4 step/rollout
+GRPO: ceil(64 * 4 / 64) = 4 step/rollout
+```
+
+Nếu GRPO dùng `PPO_MINI_BATCH_SIZE=16` mặc định thì sẽ có
+`ceil(64 * 4 / 16)=16` step/rollout, tức khoảng 4 lần nhiều step (gần 3,000
+thay vì 750). Vì vậy hãy dùng `PPO_MINI_BATCH_SIZE=64` để giữ cùng số step một
+epoch với OPD/TA/CMT:
+
+```bash
+# Competition-MATH: target 750 optimizer steps
+CUDA_VISIBLE_DEVICES=0,1 \
+TRAIN_DATASET=competition_math \
+BATCH_SIZE=64 GLOBAL_BATCH_SIZE=64 \
+GRPO_GROUP_SIZE=4 PPO_MINI_BATCH_SIZE=64 \
+MICRO_BATCH_SIZE_PER_GPU=1 MAX_STEPS=750 \
+GRPO_RUN_NAME=grpo_compmath_g4_rolloutstep_seed42 \
+bash scripts/train_grpo_b200.sh
+
+# DAPO-Math: target 1087 optimizer steps
+CUDA_VISIBLE_DEVICES=0,1 \
+TRAIN_DATASET=dapo_math \
+BATCH_SIZE=64 GLOBAL_BATCH_SIZE=64 \
+GRPO_GROUP_SIZE=4 PPO_MINI_BATCH_SIZE=64 \
+MICRO_BATCH_SIZE_PER_GPU=1 MAX_STEPS=1087 \
+GRPO_ANSWER_KEY=solution \
+GRPO_RUN_NAME=grpo_dapo_g4_rolloutstep_seed42 \
+bash scripts/train_grpo_b200.sh
+```
+
+`PPO_MINI_BATCH_SIZE=64` không làm GRPO có cùng số trajectory trong một optimizer
+update với CMT; nó chỉ làm số update trên mỗi rollout (và vì thế số step trong
+một epoch) trùng nhau. Nếu cần so sánh theo số trajectory/optimizer update, hãy
+giữ `PPO_MINI_BATCH_SIZE=16` cho tất cả method và vẽ theo
+`rollout_batch_index`, `num_valid_tokens` hoặc số prompt đã thấy.
+
+#### Chẩn đoán OOM GRPO
+
+OOM tại `loss.backward()` với thông báo PyTorch đã cấp phát khoảng 165--171 GiB
+không phải do vLLM eval/rollout giữ toàn bộ GPU: rollout server được khởi tạo với
+`--enable-sleep-mode` và ngủ trước backward; trong log lỗi, tiến trình vLLM phụ chỉ
+dùng khoảng 1.5 GiB. Nguyên nhân là activation của các response dài trong một
+micro-batch lớn. Giữ nguyên global batch, PPO minibatch và `MAX_RESPONSE_LEN`, rồi
+giảm micro-batch:
+
+```bash
+MICRO_BATCH_SIZE_PER_GPU=1 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+... bash scripts/train_grpo_b200.sh
+```
+
+`expandable_segments` chỉ hỗ trợ phân mảnh allocator; nó không thay thế việc giảm
+micro-batch. Nếu vẫn OOM với micro-batch 1, giảm `MAX_RESPONSE_LEN`/`MAX_NEW_TOKENS`
+theo cùng protocol cho cả các baseline, hoặc dùng student nhỏ hơn; không giảm
+`PPO_MINI_BATCH_SIZE` để chữa lỗi vì điều đó làm thay đổi số optimizer step.
 
 Với `TRAIN_DATASET=dapo_math`, DAPO-Math-17k dùng trường đáp án `solution`
 (và bản sao `reward_model.ground_truth`), không dùng `answer`. Launcher GRPO tự

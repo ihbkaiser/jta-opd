@@ -57,7 +57,15 @@ export GRPO_REWARD_BENCHMARK="${GRPO_REWARD_BENCHMARK:-Competition-MATH}"
 # OPD/TA/CMT shared configuration block.
 export NUM_RESPONSES="${GRPO_GROUP_SIZE}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-8}}}"
+# GRPO keeps the whole sampled response (often up to 7,168 tokens) in the
+# differentiable forward/backward pass.  Unlike OPD/TA/CMT, one prompt expands
+# into G trajectories, so the old default of 8 trajectories per backward pass
+# can exhaust a B200 even though the vLLM rollout server is asleep.  A local
+# micro-batch only changes gradient accumulation; it does not change the
+# global PPO minibatch, optimizer-step count, or objective.  Use the
+# conservative default of one trajectory and opt into a larger value only
+# after measuring peak memory for the exact model/response length.
+export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-1}}}"
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-auto}"
 export NUM_EPOCHS="${NUM_EPOCHS:-${EPOCHS:-1}}"
 export MAX_STEPS="${MAX_STEPS:--1}"

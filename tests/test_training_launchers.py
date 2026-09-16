@@ -65,6 +65,22 @@ class TrainingLauncherTests(unittest.TestCase):
                 ):
                     self.assertIn(f"export {variable}=", content)
 
+    def test_grpo_launcher_uses_memory_safe_default_microbatch(self):
+        content = (REPO_ROOT / "scripts" / "train_grpo_b200.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BATCH_SIZE:-1}',
+            content,
+        )
+        self.assertIn("micro-batch only changes gradient accumulation", content)
+
+    def test_training_progress_launcher_dispatches_grpo(self):
+        content = (REPO_ROOT / "scripts" / "plot_training_progress.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("grpo) add_plot_method grpo ;;", content)
+
     def test_common_config_accepts_new_model_and_data_aliases(self):
         environment = dict(os.environ)
         environment.update(

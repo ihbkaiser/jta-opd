@@ -40,6 +40,7 @@ for requested in "${REQUESTED_METHODS[@]}"; do
     rac|bellman-rac) add_plot_method rac ;;
     pgt|projected-gradient-teachability) add_plot_method pgt ;;
     cmt|coupled-marginal-teachability) add_plot_method cmt ;;
+    grpo) add_plot_method grpo ;;
     *)
       echo "Unknown plot method: ${requested}" >&2
       echo "Use PLOT_METHODS='opd ta cmt grpo' (legacy rac/pgt also supported)." >&2
