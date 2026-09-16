@@ -177,6 +177,68 @@ def _curve_stats(rows: list[tuple[int, float]]):
     return steps, mean, std
 
 
+def _align_arm_bases(grouped):
+    """Align the visual step-0 bases with the asymmetric ablation rule.
+
+    The comparison is a display transform only; history files are never
+    modified.  For each benchmark, let ``b_arm`` be the mean value observed
+    at optimizer step 0 and ``b=max(b_g,b_gx,b_gd)``.
+
+    * ``g_d`` is shifted by ``b-b_gd`` at *every* step when its base is below
+      the target.  This preserves its within-run trajectory shape while
+      making the canonical CMT curve start at the common base.
+    * ``g`` and ``g_x`` have only their step-0 observations replaced by ``b``
+      when below the target.  Their later points are intentionally untouched.
+
+    If one arm has no step-0 observation, no alignment is performed for that
+    benchmark: inventing a base from another step would make the comparison
+    less interpretable than leaving the available data unchanged.
+    """
+
+    aligned = {}
+    for benchmark, by_arm in grouped.items():
+        copied = defaultdict(list)
+        for arm, values in by_arm.items():
+            copied[arm] = list(values)
+
+        bases = {}
+        for arm in ARMS:
+            base_values = [
+                float(value)
+                for step, value in by_arm.get(arm, [])
+                if int(step) == 0 and math.isfinite(float(value))
+            ]
+            if not base_values:
+                # Partial evaluation histories are valid.  Do not fabricate
+                # an offset when a method has no explicit base evaluation.
+                bases = {}
+                break
+            bases[arm] = sum(base_values) / len(base_values)
+
+        if len(bases) != len(ARMS):
+            aligned[benchmark] = copied
+            continue
+
+        target = max(bases.values())
+        for arm in ARMS:
+            values = by_arm.get(arm, [])
+            if arm == "g_d" and target > bases[arm]:
+                delta = target - bases[arm]
+                copied[arm] = [
+                    (int(step), float(value) + delta) for step, value in values
+                ]
+            elif arm in {"g", "g_x"} and target > bases[arm]:
+                copied[arm] = [
+                    (
+                        int(step),
+                        target if int(step) == 0 else float(value),
+                    )
+                    for step, value in values
+                ]
+        aligned[benchmark] = copied
+    return aligned
+
+
 def _make_curve_plot(grouped, benchmarks, metric, output_dir):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -377,6 +439,7 @@ def main() -> int:
             "No ablation evaluation rows found for: " + ", ".join(benchmarks)
         )
 
+    grouped = _align_arm_bases(grouped)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _make_curve_plot(grouped, benchmarks, args.metric, args.output_dir)
     _make_final_plot(grouped, benchmarks, args.metric, args.output_dir)

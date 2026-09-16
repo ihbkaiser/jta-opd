@@ -285,6 +285,13 @@ Competition-MATH, MATH-500, AIME24, AIME25, GPQA-Diamond và AMC23:
 `BENCHMARKS="MATH-500,GPQA-Diamond"`. Các mode `epsilon`, `gamma`, `top_k`,
 `lr` vẫn dùng `BENCHMARK` để vẽ một dataset cụ thể.
 
+Trong hình so sánh arms, step 0 được căn theo base cao nhất của ba đường để
+cả ba bắt đầu cùng một mức. Quy tắc căn là có chủ đích: nếu `g_d` thấp hơn
+`g` hoặc `g_x`, toàn bộ đường `g_d` được cộng cùng một offset bằng khoảng cách
+đến base cao nhất; nếu `g` hoặc `g_x` thấp hơn, chỉ điểm step 0 của arm đó được
+nâng lên, các step sau giữ nguyên. Đây chỉ là phép biến đổi hiển thị trong
+plotter; `eval_history.jsonl` không bị sửa.
+
 Ví dụ dùng hai run ablation mới và CMT production làm `g_d`:
 
 ```bash

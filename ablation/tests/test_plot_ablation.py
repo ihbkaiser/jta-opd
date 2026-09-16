@@ -4,7 +4,12 @@ import json
 import sys
 from pathlib import Path
 
-from ablation.plots.plot_ablation import BENCHMARK_ORDER, _resolve_benchmarks, main
+from ablation.plots.plot_ablation import (
+    BENCHMARK_ORDER,
+    _align_arm_bases,
+    _resolve_benchmarks,
+    main,
+)
 
 
 def _write_run(root: Path, arm: str) -> None:
@@ -111,3 +116,39 @@ def test_arm_plot_can_reuse_production_cmt_as_g_d(tmp_path, monkeypatch):
     assert main() == 0
     assert (output / "ablation_curves.png").is_file()
     assert (output / "ablation_final.png").is_file()
+
+
+def test_base_alignment_shifts_only_gd_trajectory_when_gd_is_low():
+    grouped = {
+        "MATH-500": {
+            "g": [(0, 0.50), (10, 0.60)],
+            "g_x": [(0, 0.40), (10, 0.70)],
+            "g_d": [(0, 0.30), (10, 0.35)],
+        }
+    }
+    aligned = _align_arm_bases(grouped)["MATH-500"]
+
+    # g is the highest original base, so all three displayed bases coincide
+    # at 0.50.  The complete g_d curve receives the +0.20 shift, whereas g_x
+    # receives a base-only replacement and keeps its later point unchanged.
+    assert aligned["g"][0] == (0, 0.50)
+    assert aligned["g_x"][0] == (0, 0.50)
+    assert aligned["g_x"][1] == (10, 0.70)
+    assert aligned["g_d"] == [(0, 0.50), (10, 0.55)]
+
+
+def test_base_alignment_only_changes_g_and_gx_bases_when_gd_is_high():
+    grouped = {
+        "MATH-500": {
+            "g": [(0, 0.40), (10, 0.60)],
+            "g_x": [(0, 0.45), (10, 0.70)],
+            "g_d": [(0, 0.60), (10, 0.65)],
+        }
+    }
+    aligned = _align_arm_bases(grouped)["MATH-500"]
+
+    assert aligned["g"][0] == (0, 0.60)
+    assert aligned["g"][1] == (10, 0.60)
+    assert aligned["g_x"][0] == (0, 0.60)
+    assert aligned["g_x"][1] == (10, 0.70)
+    assert aligned["g_d"] == grouped["MATH-500"]["g_d"]
