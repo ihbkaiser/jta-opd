@@ -8,8 +8,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
 export TEACHER_MODEL="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-models/Qwen3-8B}}"
 export TRAIN_DATASET="${TRAIN_DATASET:-competition_math}"
-export TRAIN_DATA="${TRAIN_DATA:-${TRAIN_DATA_PATH:-nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet}}"
-export PROMPT_KEY="${PROMPT_KEY:-${TRAIN_PROMPT_KEY:-problem}}"
+case "${TRAIN_DATASET,,}" in
+  dapo_math|dapo-math|dapo)
+    _DEFAULT_TRAIN_DATA="nlp/minhpn19/data/DAPO-Math-17k-Processed"
+    _DEFAULT_PROMPT_KEY="prompt"
+    _DEFAULT_TRAIN_SPLIT="all"
+    ;;
+  competition_math|competition-math|math)
+    _DEFAULT_TRAIN_DATA="nlp/minhpn19/data/competition_math/data/train-00000-of-00001.parquet"
+    _DEFAULT_PROMPT_KEY="problem"
+    _DEFAULT_TRAIN_SPLIT="null"
+    ;;
+  custom)
+    if [[ -z "${TRAIN_DATA_PATH:-}" || -z "${TRAIN_PROMPT_KEY:-}" ]]; then
+      echo "TRAIN_DATASET=custom requires TRAIN_DATA_PATH and TRAIN_PROMPT_KEY" >&2
+      exit 2
+    fi
+    _DEFAULT_TRAIN_DATA="${TRAIN_DATA_PATH}"
+    _DEFAULT_PROMPT_KEY="${TRAIN_PROMPT_KEY}"
+    _DEFAULT_TRAIN_SPLIT="${TRAIN_DATA_SPLIT:-null}"
+    ;;
+  *)
+    echo "Unknown TRAIN_DATASET=${TRAIN_DATASET}; use competition_math, dapo_math, or custom" >&2
+    exit 2
+    ;;
+esac
+export TRAIN_DATA="${TRAIN_DATA:-${TRAIN_DATA_PATH:-${_DEFAULT_TRAIN_DATA}}}"
+export PROMPT_KEY="${PROMPT_KEY:-${TRAIN_PROMPT_KEY:-${_DEFAULT_PROMPT_KEY}}}"
+export TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-${_DEFAULT_TRAIN_SPLIT}}"
 export RUN_NAME="${RUN_NAME:-${IW_RUN_NAME:-iw_$(date +%Y%m%d_%H%M%S_%N)}}"
 export IW_RUN_NAME="${RUN_NAME}"
 export STORAGE_ROOT="${STORAGE_ROOT:-/workspace/storage-shared}"
@@ -20,7 +46,7 @@ export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 export BATCH_SIZE="${BATCH_SIZE:-${GLOBAL_BATCH_SIZE}}"
 export NUM_RESPONSES="${NUM_RESPONSES:-1}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-export MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-1}"
+export MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-8}"
 export NUM_EPOCHS="${NUM_EPOCHS:-1}"
 export MAX_STEPS="${MAX_STEPS:--1}"
 export LR="${LR:-${LEARNING_RATE:-5e-6}}"
@@ -36,7 +62,7 @@ export LOG_INTERVAL="${LOG_INTERVAL:-1}"
 export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 export VLLM_RETURN_LOG_PROBS="${VLLM_RETURN_LOG_PROBS:-true}"
 export ROLLOUT_VLLM_MAX_MODEL_LEN="${ROLLOUT_VLLM_MAX_MODEL_LEN:-5120}"
-export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
+export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"
 export TRAIN_EVAL_INTERVAL="${TRAIN_EVAL_INTERVAL:-100}"
@@ -65,7 +91,8 @@ fi
 build_training_args "${OUTPUT_DIR}"
 echo "IW-OPD run: ${RUN_NAME}"
 echo "IW-OPD output: ${OUTPUT_DIR}"
-echo "IW-OPD settings: weight_max=${IW_OPD_WEIGHT_MAX}, use_abs=${IW_OPD_WEIGHT_USE_ABS}, max_new_tokens=${MAX_RESPONSE_LEN}, lr=${LR}, global_batch=${BATCH_SIZE}, ppo_batch=${PPO_MINI_BATCH_SIZE}"
+echo "IW-OPD settings: dataset=${TRAIN_DATASET}, data=${TRAIN_DATA}, split=${TRAIN_DATA_SPLIT}, prompt_key=${PROMPT_KEY}"
+echo "IW-OPD settings: weight_max=${IW_OPD_WEIGHT_MAX}, use_abs=${IW_OPD_WEIGHT_USE_ABS}, max_new_tokens=${MAX_RESPONSE_LEN}, lr=${LR}, global_batch=${BATCH_SIZE}, ppo_batch=${PPO_MINI_BATCH_SIZE}, micro/GPU=${MICRO_BATCH_SIZE_PER_GPU}, rollout_vllm_util=${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION}"
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   echo "Resume checkpoint: ${RESUME_FROM_CHECKPOINT}"
 fi

@@ -76,6 +76,18 @@ class TrainingLauncherTests(unittest.TestCase):
         )
         self.assertIn("micro-batch only changes gradient accumulation", content)
 
+    def test_iw_launcher_has_shared_dataset_presets_and_requested_defaults(self):
+        content = (REPO_ROOT / "scripts" / "train_iw_b200.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("dapo_math|dapo-math|dapo)", content)
+        self.assertIn("competition_math|competition-math|math)", content)
+        self.assertIn('MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-8}"', content)
+        self.assertIn(
+            'ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION="${ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION:-0.60}"',
+            content,
+        )
+
     def test_training_progress_launcher_dispatches_grpo(self):
         content = (REPO_ROOT / "scripts" / "plot_training_progress.sh").read_text(
             encoding="utf-8"

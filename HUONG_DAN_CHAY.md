@@ -309,13 +309,27 @@ IW dùng singleton sampled-action support trong loss để khớp objective chí
 không đi qua nhánh này.
 
 Launcher IW mặc định công bằng theo yêu cầu: `BATCH_SIZE=64`, `PPO_MINI_BATCH_SIZE=16`,
-`LR=5e-6`, `MAX_RESPONSE_LEN=4096`, eval/checkpoint mỗi 100 step, FSDP và vLLM đa GPU.
+`LR=5e-6`, `MAX_RESPONSE_LEN=4096`, `MICRO_BATCH_SIZE_PER_GPU=8`,
+`ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.6`, eval/checkpoint mỗi 100 step, FSDP và vLLM đa GPU.
+IW hỗ trợ cùng preset dữ liệu với các method khác: `competition_math` (mặc định) và
+`dapo_math`/`dapo` (DAPO-Math-17k-Processed). Có thể dùng `TRAIN_DATASET=custom` cùng
+`TRAIN_DATA_PATH`, `TRAIN_PROMPT_KEY` và tùy chọn `TRAIN_DATA_SPLIT` cho dữ liệu riêng.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
 IW_RUN_NAME="${IW_RUN_NAME}" \
-BATCH_SIZE=64 PPO_MINI_BATCH_SIZE=16 MICRO_BATCH_SIZE_PER_GPU=1 \
-LR=5e-6 MAX_RESPONSE_LEN=4096 \
+BATCH_SIZE=64 PPO_MINI_BATCH_SIZE=16 MICRO_BATCH_SIZE_PER_GPU=8 \
+LR=5e-6 MAX_RESPONSE_LEN=4096 ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.6 \
+bash scripts/train_iw_b200.sh
+```
+
+Chạy IW trên DAPO-Math:
+
+```bash
+TRAIN_DATASET=dapo_math CUDA_VISIBLE_DEVICES=0,1 \
+IW_RUN_NAME="iw_qwen3_1p7b_8b_dapo_seed42_$(date +%Y%m%d_%H%M%S)" \
+BATCH_SIZE=64 PPO_MINI_BATCH_SIZE=16 MICRO_BATCH_SIZE_PER_GPU=8 \
+LR=5e-6 MAX_RESPONSE_LEN=4096 ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.6 \
 bash scripts/train_iw_b200.sh
 ```
 
