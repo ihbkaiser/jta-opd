@@ -191,6 +191,11 @@ class TokenScoreStatsLogger:
             self.ranges = {key: (0.0, 1.0) for key in ("g", "alignment", "V", "z", "w")}
         elif method == "opd":
             self.ranges = {"w": (0.0, 1.0)}
+        elif method == "iw":
+            self.ranges = {
+                "w": (0.0, 1.0),
+                "iw_weight": (1.0, 1.5),
+            }
         elif method == "pgt":
             self.ranges = {
                 "s_PGT": (0.0, 10.0),

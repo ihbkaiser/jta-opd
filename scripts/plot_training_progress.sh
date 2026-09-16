@@ -41,9 +41,10 @@ for requested in "${REQUESTED_METHODS[@]}"; do
     pgt|projected-gradient-teachability) add_plot_method pgt ;;
     cmt|coupled-marginal-teachability) add_plot_method cmt ;;
     grpo) add_plot_method grpo ;;
+    iw|iw-opd) add_plot_method iw ;;
     *)
       echo "Unknown plot method: ${requested}" >&2
-      echo "Use PLOT_METHODS='opd ta cmt grpo' (legacy rac/pgt also supported)." >&2
+      echo "Use PLOT_METHODS='opd ta cmt grpo iw' (legacy rac/pgt also supported)." >&2
       exit 2
       ;;
   esac
@@ -110,6 +111,15 @@ for selected in "${SELECTED_METHODS[@]}"; do
       METHOD_LABELS+=("GRPO")
       if [[ "${#SELECTED_METHODS[@]}" -gt 1 ]]; then
         require_file "${GRPO_RUN_OUTPUT}/metrics.jsonl"
+      fi
+      ;;
+    iw)
+      require_file "${IW_RUN_OUTPUT}/eval_history.jsonl"
+      PLOT_ARGS+=(--iw-output "${IW_RUN_OUTPUT}")
+      RUN_NAMES+=("${IW_RUN_NAME}")
+      METHOD_LABELS+=("IW-OPD")
+      if [[ "${#SELECTED_METHODS[@]}" -gt 1 ]]; then
+        require_file "${IW_RUN_OUTPUT}/metrics.jsonl"
       fi
       ;;
   esac

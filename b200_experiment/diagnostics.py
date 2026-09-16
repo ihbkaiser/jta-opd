@@ -93,6 +93,8 @@ def selector_summary(
         )
     elif method == "opd":
         keys = ("w",)
+    elif method == "iw":
+        keys = ("w", "iw_weight")
     elif method == "pgt":
         keys = (
             "gain",

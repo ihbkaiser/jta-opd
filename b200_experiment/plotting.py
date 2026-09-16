@@ -28,6 +28,8 @@ _PROGRESS_METHOD_ALIASES = {
     "pgt": "pgt",
     "cmt": "cmt",
     "grpo": "grpo",
+    "iw": "iw",
+    "iw-opd": "iw",
 }
 _PROGRESS_METHODS = {
     "opd": {
@@ -65,6 +67,12 @@ _PROGRESS_METHODS = {
         "slug": "grpo",
         "color": "tab:brown",
         "output_argument": "--grpo-output",
+    },
+    "iw": {
+        "label": "IW-OPD",
+        "slug": "iw_opd",
+        "color": "tab:cyan",
+        "output_argument": "--iw-output",
     },
 }
 
@@ -863,6 +871,7 @@ def plot_training_progress(
     pgt_output: str | Path | None = None,
     cmt_output: str | Path | None = None,
     grpo_output: str | Path | None = None,
+    iw_output: str | Path | None = None,
 ):
     """Plot the configured evaluation metric for any selected methods."""
     results_dir = Path(results_dir).resolve()
@@ -875,6 +884,7 @@ def plot_training_progress(
         "pgt": pgt_output,
         "cmt": cmt_output,
         "grpo": grpo_output,
+        "iw": iw_output,
     }
     histories = {
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
@@ -1072,6 +1082,7 @@ def plot_results(
     pgt_output: str | Path | None = None,
     cmt_output: str | Path | None = None,
     grpo_output: str | Path | None = None,
+    iw_output: str | Path | None = None,
 ):
     results_dir = Path(results_dir).resolve()
     plots_dir = _plot_directory(results_dir, plot_name)
@@ -1155,6 +1166,8 @@ def plot_results(
         training_outputs["cmt"] = cmt_output
     if grpo_output is not None:
         training_outputs["grpo"] = grpo_output
+    if iw_output is not None:
+        training_outputs["iw"] = iw_output
     if opd_output is not None:
         training_outputs = {"opd": opd_output, **training_outputs}
     loss_path = _plot_loss_comparison(plots_dir, training_outputs, smoothing_window)
@@ -1189,6 +1202,11 @@ def plot_results(
         if grpo_output is not None
         else None
     )
+    iw_history = (
+        Path(iw_output).resolve() / "eval_history.jsonl"
+        if iw_output is not None
+        else None
+    )
     if ta_history.is_file():
         progress_methods = ["ta"]
         if rac_history is not None and rac_history.is_file():
@@ -1201,6 +1219,8 @@ def plot_results(
             progress_methods.append("cmt")
         if grpo_history is not None and grpo_history.is_file():
             progress_methods.append("grpo")
+        if iw_history is not None and iw_history.is_file():
+            progress_methods.append("iw")
         result.update(
             plot_training_progress(
                 results_dir,
@@ -1213,6 +1233,7 @@ def plot_results(
                 pgt_output=pgt_output,
                 cmt_output=cmt_output,
                 grpo_output=grpo_output,
+                iw_output=iw_output,
                 methods=progress_methods,
             )
         )

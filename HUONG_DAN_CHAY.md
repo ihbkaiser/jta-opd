@@ -1,7 +1,7 @@
 # Hướng dẫn chạy BellmanOPD trên B200
 
 File này là runbook thực hành cho các method trong repository hiện tại: OPD thuần,
-TA-OPD, CMT-OPD và GRPO (các script Bellman-RAC/PGT legacy vẫn được giữ tương thích).
+TA-OPD, CMT-OPD, GRPO và IW-OPD (các script Bellman-RAC/PGT legacy vẫn được giữ tương thích).
 Mọi lệnh đều chạy từ thư mục:
 
 ```bash
@@ -81,6 +81,7 @@ export PGT_RUN_NAME="pgt_${PAIR}"
 export CMT_RUN_NAME="cmt_${PAIR}"
 # GRPO has no teacher--student pair; keep its label independent of PAIR.
 export GRPO_RUN_NAME="grpo_qwen3_1p7b_compmath_seed42_${PAIR}"
+export IW_RUN_NAME="iw_qwen3_1p7b_8b_compmath_seed42_${PAIR}"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export DISTRIBUTED_STRATEGY=fsdp
@@ -297,6 +298,56 @@ learning rate và các PPO setting; chỉ thay `CUDA_VISIBLE_DEVICES` và microb
 TA_RHO=0.10 RUN_NAME="$TA_RUN_NAME" bash scripts/train_ta_b200.sh
 ```
 
+### IW-OPD (Importance-Weighted On-Policy Distillation)
+
+IW-OPD là baseline teacher-based độc lập, không phải GRPO. Bản cài đặt dùng đúng
+thuật toán chính chủ: với mỗi sampled response token, advantage OPD là
+`log p_teacher - log p_student`; `d_t=abs(advantage)` (mặc định), rồi nhân advantage
+bằng prefix remaining-discrepancy weight với `weight_max=1.5`. Weight được stop-gradient,
+không thêm critic/counterfactual rollout và PPO clipping vẫn được áp dụng sau khi nhân weight.
+IW dùng singleton sampled-action support trong loss để khớp objective chính chủ; các method cũ
+không đi qua nhánh này.
+
+Launcher IW mặc định công bằng theo yêu cầu: `BATCH_SIZE=64`, `PPO_MINI_BATCH_SIZE=16`,
+`LR=5e-6`, `MAX_RESPONSE_LEN=4096`, eval/checkpoint mỗi 100 step, FSDP và vLLM đa GPU.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+IW_RUN_NAME="${IW_RUN_NAME}" \
+BATCH_SIZE=64 PPO_MINI_BATCH_SIZE=16 MICRO_BATCH_SIZE_PER_GPU=1 \
+LR=5e-6 MAX_RESPONSE_LEN=4096 \
+bash scripts/train_iw_b200.sh
+```
+
+Có thể đổi cặp model/data bằng các biến shared ở mục 1. `IW_OPD_WEIGHT_MAX=1.5` và
+`IW_OPD_WEIGHT_USE_ABS=true` là giá trị chính chủ; chỉ đổi khi làm ablation.
+
+Resume cùng hoặc khác số GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+IW_RUN_NAME="${IW_RUN_NAME}" RESUME=auto MAX_STEPS=750 \
+bash scripts/train_iw_b200.sh
+```
+
+Đánh giá checkpoint hoặc re-eval toàn bộ checkpoint:
+
+```bash
+IW_RUN_NAME="${IW_RUN_NAME}" bash scripts/eval_iw_b200.sh
+REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=avg@8 \
+  bash scripts/reeval_method_checkpoints_b200.sh iw "${IW_RUN_NAME}"
+```
+
+Vẽ IW cùng các baseline:
+
+```bash
+PLOT_METHODS="opd ta cmt grpo iw" \
+OPD_RUN_NAME="${OPD_RUN_NAME}" TA_RUN_NAME="${TA_RUN_NAME}" \
+CMT_RUN_NAME="${CMT_RUN_NAME}" GRPO_RUN_NAME="${GRPO_RUN_NAME}" \
+IW_RUN_NAME="${IW_RUN_NAME}" \
+bash scripts/plot_training_progress.sh --plot-name opd_ta_cmt_grpo_iw
+```
+
 ### Bellman-RAC và PGT (nếu cần baseline đầy đủ)
 
 ```bash
@@ -341,6 +392,7 @@ outputs/<run-name>/ta_opd/
 outputs/<run-name>/rac_opd/
 outputs/<run-name>/pgt_opd/
 outputs/<run-name>/cmt_opd/
+outputs/<run-name>/iw/
 ```
 
 ### Chạy ngắn để kiểm tra launch/config
@@ -417,7 +469,7 @@ CUDA_VISIBLE_DEVICES=0,1 RUN_NAME="$CMT_RUN_NAME" RESUME=auto MAX_STEPS=200 \
 
 ```bash
 tensorboard --logdir_spec \
-  "OPD:outputs/${OPD_RUN_NAME}/opd/tensorboard,TA:outputs/${TA_RUN_NAME}/ta_opd/tensorboard,CMT:outputs/${CMT_RUN_NAME}/cmt_opd/tensorboard,GRPO:outputs/${GRPO_RUN_NAME}/grpo/tensorboard,RAC:outputs/${RAC_RUN_NAME}/rac_opd/tensorboard" \
+  "OPD:outputs/${OPD_RUN_NAME}/opd/tensorboard,TA:outputs/${TA_RUN_NAME}/ta_opd/tensorboard,CMT:outputs/${CMT_RUN_NAME}/cmt_opd/tensorboard,GRPO:outputs/${GRPO_RUN_NAME}/grpo/tensorboard,IW:outputs/${IW_RUN_NAME}/iw/tensorboard,RAC:outputs/${RAC_RUN_NAME}/rac_opd/tensorboard" \
   --bind_all --port 6006
 ```
 
@@ -443,6 +495,7 @@ transition weight, `R`, `M`, `H`, successor excess và sequential gain.
 OPD_RUN_NAME="$OPD_RUN_NAME" bash scripts/eval_opd_b200.sh
 TA_RUN_NAME="$TA_RUN_NAME" bash scripts/eval_ta_b200.sh
 CMT_RUN_NAME="$CMT_RUN_NAME" bash scripts/eval_cmt_b200.sh
+IW_RUN_NAME="$IW_RUN_NAME" bash scripts/eval_iw_b200.sh
 ```
 
 Đánh giá accuracy một response:

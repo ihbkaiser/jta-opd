@@ -22,7 +22,8 @@ case "${METHOD}" in
   rac) METHOD_CONFIG="${RAC_CONFIG}" ;;
   pgt) METHOD_CONFIG="${PGT_CONFIG}" ;;
   cmt) METHOD_CONFIG="${CMT_CONFIG}" ;;
-  *) echo "METHOD must be opd, ta, rac, pgt, or cmt" >&2; exit 1 ;;
+  iw) METHOD_CONFIG="${IW_CONFIG}" ;;
+  *) echo "METHOD must be opd, ta, rac, pgt, cmt, or iw" >&2; exit 1 ;;
 esac
 
 SMOKE_OUTPUT="${SMOKE_OUTPUT:-${REPO_DIR}/outputs/fsdp_smoke_${METHOD}_${TRAIN_NPROC_PER_NODE}gpu_$(date +%Y%m%d_%H%M%S_%N)}"
@@ -71,7 +72,7 @@ import sys
 from pathlib import Path
 
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-from b200_experiment.tensorboard_logging import BASE_TAGS, CMT_TAGS, PGT_TAGS, RAC_TAGS, TA_TAGS
+from b200_experiment.tensorboard_logging import BASE_TAGS, CMT_TAGS, IW_TAGS, PGT_TAGS, RAC_TAGS, TA_TAGS
 
 root = Path(sys.argv[1]).resolve()
 method = sys.argv[2]
@@ -124,6 +125,7 @@ extra |= (
     else set()
 )
 extra |= set(CMT_TAGS) if method == "cmt" else set()
+extra |= set(IW_TAGS) if method == "iw" else set()
 if tags != base | extra:
     raise SystemExit(f"Unexpected TensorBoard tags: {sorted(tags)}")
 print(f"Validated {expected_world_size}-GPU FSDP smoke output: {root}")

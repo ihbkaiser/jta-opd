@@ -20,6 +20,9 @@ fi
 if [[ -f "${GRPO_RUN_OUTPUT}/metrics.jsonl" ]]; then
   PLOT_ARGS+=(--grpo-output "${GRPO_RUN_OUTPUT}")
 fi
+if [[ -f "${IW_RUN_OUTPUT}/metrics.jsonl" ]]; then
+  PLOT_ARGS+=(--iw-output "${IW_RUN_OUTPUT}")
+fi
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli plot \
   --results "${RUN_RESULTS_DIR}" \

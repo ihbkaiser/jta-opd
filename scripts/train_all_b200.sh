@@ -38,6 +38,7 @@ export RAC_RUN_NAME="${RAC_RUN_NAME:-rac_${RUN_TIMESTAMP}}"
 export PGT_RUN_NAME="${PGT_RUN_NAME:-pgt_${RUN_TIMESTAMP}}"
 export CMT_RUN_NAME="${CMT_RUN_NAME:-cmt_${RUN_TIMESTAMP}}"
 export GRPO_RUN_NAME="${GRPO_RUN_NAME:-grpo_${RUN_TIMESTAMP}}"
+export IW_RUN_NAME="${IW_RUN_NAME:-iw_${RUN_TIMESTAMP}}"
 export RUN_NAME="${RUN_NAME:-comparison_${RUN_TIMESTAMP}}"
 # Shared GLOBAL rollout/micro-batch for all methods. Changing the visible GPU
 # count changes only the per-GPU shard; it does not change optimizer semantics.
@@ -57,6 +58,7 @@ export PGT_RHO="${PGT_RHO:-${RHO:-0.10}}"
 export RUN_PGT_TRAIN="${RUN_PGT_TRAIN:-false}"
 export RUN_CMT_TRAIN="${RUN_CMT_TRAIN:-false}"
 export RUN_GRPO_TRAIN="${RUN_GRPO_TRAIN:-false}"
+export RUN_IW_TRAIN="${RUN_IW_TRAIN:-false}"
 export CMT_ALLOCATION_KL="${CMT_ALLOCATION_KL:-0.5}"
 export CMT_GAMMA="${CMT_GAMMA:-1.0}"
 export CMT_SUCCESSOR_LAMBDA="${CMT_SUCCESSOR_LAMBDA:-1.0}"
@@ -153,5 +155,16 @@ if [[ "${RUN_GRPO_TRAIN}" == "true" ]]; then
     RESUME_FROM_CHECKPOINT="${GRPO_RESUME_FROM_CHECKPOINT:-}" \
     bash "${SCRIPT_DIR}/train_grpo_b200.sh"
 fi
-echo "Baseline runs finished. PGT trained: ${RUN_PGT_TRAIN}; CMT trained: ${RUN_CMT_TRAIN}; GRPO trained: ${RUN_GRPO_TRAIN}. Plot explicitly with:"
-echo "PLOT_METHODS='opd ta cmt grpo' bash scripts/plot_training_progress.sh"
+if [[ "${RUN_IW_TRAIN}" == "true" ]]; then
+  RUN_NAME="${IW_RUN_NAME}" OUTPUT_DIR="${IW_RUN_OUTPUT}" \
+    STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
+    TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
+    LR="${IW_LR:-5e-6}" MAX_RESPONSE_LEN="${IW_MAX_RESPONSE_LEN:-4096}" \
+    PPO_MINI_BATCH_SIZE="${IW_PPO_MINI_BATCH_SIZE:-16}" \
+    MICRO_BATCH_SIZE_PER_GPU="${IW_MICRO_BATCH_SIZE_PER_GPU:-1}" \
+    TRAIN_EVAL_MAX_NEW_TOKENS="${IW_TRAIN_EVAL_MAX_NEW_TOKENS:-4096}" \
+    RESUME_FROM_CHECKPOINT="${IW_RESUME_FROM_CHECKPOINT:-}" \
+    bash "${SCRIPT_DIR}/train_iw_b200.sh"
+fi
+echo "Baseline runs finished. PGT trained: ${RUN_PGT_TRAIN}; CMT trained: ${RUN_CMT_TRAIN}; GRPO trained: ${RUN_GRPO_TRAIN}; IW trained: ${RUN_IW_TRAIN}. Plot explicitly with:"
+echo "PLOT_METHODS='opd ta cmt grpo iw' bash scripts/plot_training_progress.sh"

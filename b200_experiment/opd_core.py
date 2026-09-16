@@ -14,6 +14,98 @@ UPSTREAM_ADV_ESTIMATOR = "token_reward_direct"
 UPSTREAM_LOSS_AGG_MODE = "token-mean"
 
 
+def compute_iw_opd_weights(
+    teacher_sampled_log_probs: torch.Tensor,
+    student_sampled_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    weight_max: float = 1.5,
+    use_abs: bool = True,
+    eps: float = 1.0e-8,
+) -> torch.Tensor:
+    """Compute the official IW-OPD prefix remaining-mass multiplier.
+
+    The returned tensor is detached and has the same ``[B, T]`` shape as the
+    sampled-token log-probabilities.  It is *not* an allocator: valid tokens
+    retain the ordinary OPD token mean, while this multiplier is applied to
+    the sampled-token OPD advantage before the PPO clipping operation.  This
+    is the ``adv_mass_weights`` construction in YannX1e/IW-OPD
+    (https://github.com/YannX1e/Importance-Weighted-On-Policy-Distillation).
+    """
+    if teacher_sampled_log_probs.shape != student_sampled_log_probs.shape:
+        raise ValueError("IW teacher and student sampled log-probs must match")
+    if teacher_sampled_log_probs.shape != valid_mask.shape:
+        raise ValueError("IW sampled log-probs must align with valid_mask")
+    if teacher_sampled_log_probs.ndim != 2:
+        raise ValueError("IW sampled log-probs must have shape [batch, time]")
+    if float(weight_max) < 1.0:
+        raise ValueError("iw_opd.weight_max must be at least 1")
+    if float(eps) <= 0.0:
+        raise ValueError("iw_opd.eps must be positive")
+    with torch.no_grad():
+        mask = valid_mask.to(dtype=torch.float32)
+        gap = teacher_sampled_log_probs.float() - student_sampled_log_probs.float()
+        discrepancy = gap.abs() if use_abs else gap
+        discrepancy = discrepancy * mask
+        total_mass = discrepancy.sum(dim=-1, keepdim=True)
+        prefix_mass = torch.cumsum(discrepancy, dim=-1) - discrepancy
+        fraction_before = prefix_mass / (total_mass + float(eps))
+        remaining_mass = (1.0 - fraction_before).clamp(0.0, 1.0) * mask
+        weights = 1.0 + (float(weight_max) - 1.0) * remaining_mass
+        return weights.detach()
+
+
+def build_iw_opd_reference(
+    sampled_ids: torch.Tensor,
+    student_sampled_log_probs: torch.Tensor,
+    teacher_sampled_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    weight_max: float = 1.5,
+    use_abs: bool = True,
+    eps: float = 1.0e-8,
+) -> tuple[TopKOPDReference, torch.Tensor]:
+    """Build a sampled-action (K=1) reference matching official IW-OPD.
+
+    Unlike the historical Top-K OPD objective, IW-OPD's advantage is defined
+    only for the actually sampled response token.  Keeping a singleton
+    candidate support makes the existing differentiable PPO path execute the
+    same clipped surrogate without changing any other method.
+    """
+    if sampled_ids.shape != valid_mask.shape:
+        raise ValueError("IW sampled token IDs must align with valid_mask")
+    weights = compute_iw_opd_weights(
+        teacher_sampled_log_probs,
+        student_sampled_log_probs,
+        valid_mask,
+        weight_max=weight_max,
+        use_abs=use_abs,
+        eps=eps,
+    )
+    with torch.inference_mode(False):
+        ids = sampled_ids.detach().clone().long().unsqueeze(-1)
+        student = student_sampled_log_probs.detach().clone().float().unsqueeze(-1)
+        teacher = teacher_sampled_log_probs.detach().clone().float().unsqueeze(-1)
+        valid = valid_mask.detach().clone().bool()
+        advantages = ((teacher - student) * weights.unsqueeze(-1)).where(
+            valid.unsqueeze(-1), torch.zeros_like(teacher)
+        )
+        reference = TopKOPDReference(
+            candidate_ids=ids,
+            old_student_log_probs=student,
+            teacher_log_probs=teacher,
+            student_weights=valid.unsqueeze(-1).float(),
+            advantages=advantages,
+            # ``None`` is deliberate: the singleton candidate identifies the
+            # sampled action, but the PPO log-prob must still be normalized over
+            # the full model vocabulary.  Conditionalizing on K=1 would make
+            # every current sampled log-prob equal to zero and change the
+            # official PPO ratio.
+            support_mask=None,
+        )
+    return reference, weights
+
+
 @dataclass(frozen=True)
 class TopKOPDReference:
     """Frozen on-policy Top-K support and rewards for one rollout batch."""

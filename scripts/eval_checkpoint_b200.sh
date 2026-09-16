@@ -8,7 +8,7 @@ usage() {
 Usage:
   bash scripts/eval_checkpoint_b200.sh METHOD CHECKPOINT [OUTPUT_DIR] [extra CLI args]
 
-METHOD may be: opd, ta-opd (or ta), rac, pgt, cmt, or grpo.
+METHOD may be: opd, ta-opd (or ta), rac, pgt, cmt, grpo, or iw.
 
 Examples:
   bash scripts/eval_checkpoint_b200.sh opd outputs/run01/opd/checkpoint-000050
@@ -66,6 +66,12 @@ case "${METHOD_INPUT,,}" in
     HISTORY_METHOD="grpo"
     MODEL_NAME="GRPO"
     METHOD_CONFIG="${GRPO_CONFIG}"
+    ;;
+  iw|iw-opd|importance-weighted-opd|importance_weighted_opd)
+    METHOD_SLUG="iw"
+    HISTORY_METHOD="iw"
+    MODEL_NAME="IW-OPD"
+    METHOD_CONFIG="${IW_CONFIG}"
     ;;
   *)
     echo "Unknown method: ${METHOD_INPUT}" >&2

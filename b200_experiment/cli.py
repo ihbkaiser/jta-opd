@@ -106,6 +106,7 @@ def _default_history_method(name: str, config: dict) -> str:
         "RAC": "rac",
         "PGT": "pgt",
         "CMT-OPD": "cmt",
+        "IW-OPD": "iw",
     }.get(name, name.lower().replace("-", "_"))
 
 
@@ -193,7 +194,7 @@ def _evaluate_checkpoint(args) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Standalone B200 OPD, TA-OPD, CMT-OPD, GRPO, and legacy baselines"
+        description="Standalone B200 OPD, TA-OPD, CMT-OPD, GRPO, IW-OPD, and legacy baselines"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -232,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--name",
         required=True,
-        choices=("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD", "GRPO"),
+        choices=("Base", "OPD", "TA-OPD", "RAC", "PGT", "CMT-OPD", "GRPO", "IW-OPD"),
     )
     evaluate.add_argument("--model", required=True)
     evaluate.add_argument("--output", required=True)
@@ -274,6 +275,7 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--pgt-dir")
     aggregate.add_argument("--cmt-dir")
     aggregate.add_argument("--grpo-dir")
+    aggregate.add_argument("--iw-dir")
     aggregate.add_argument("--output", required=True)
 
     plot = commands.add_parser("plot")
@@ -284,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--pgt-output")
     plot.add_argument("--cmt-output")
     plot.add_argument("--grpo-output")
+    plot.add_argument("--iw-output")
     plot.add_argument("--smoothing-window", type=int, default=10)
     plot.add_argument("--plot-name")
 
@@ -304,6 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
             "pgt",
             "cmt",
             "grpo",
+            "iw",
+            "iw-opd",
         ),
         help="Legacy single selector: all, both=TA+RAC, or one method",
     )
@@ -311,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--methods",
         nargs="+",
         choices=(
-            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt", "grpo"
+            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt", "grpo", "iw", "iw-opd"
         ),
         help="One or more methods to plot in the requested order",
     )
@@ -321,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     progress_plot.add_argument("--pgt-output")
     progress_plot.add_argument("--cmt-output")
     progress_plot.add_argument("--grpo-output")
+    progress_plot.add_argument("--iw-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
     progress_plot.add_argument("--plot-name")
 
@@ -380,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
             model_dirs["CMT-OPD"] = args.cmt_dir
         if args.grpo_dir:
             model_dirs["GRPO"] = args.grpo_dir
+        if args.iw_dir:
+            model_dirs["IW-OPD"] = args.iw_dir
         result = aggregate_evaluations(
             model_dirs,
             args.output,
@@ -395,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
             pgt_output=args.pgt_output,
             cmt_output=args.cmt_output,
             grpo_output=args.grpo_output,
+            iw_output=args.iw_output,
         )
     elif args.command == "plot-training-progress":
         result = plot_training_progress(
@@ -409,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
             pgt_output=args.pgt_output,
             cmt_output=args.cmt_output,
             grpo_output=args.grpo_output,
+            iw_output=args.iw_output,
         )
     elif args.command == "plot-cmt-scores":
         result = plot_cmt_score_distributions(

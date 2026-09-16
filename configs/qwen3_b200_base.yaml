@@ -8,7 +8,7 @@ experiment:
   allow_existing_output: false
   verbose_metrics: false
 
-# scripts/train_{opd,ta,rac,cmt,grpo}_b200.sh launches one FSDP rank per visible GPU.
+# scripts/train_{opd,ta,rac,cmt,grpo,iw}_b200.sh launches one FSDP rank per visible GPU.
 # rollout.batch_size is global; micro_batch_size_per_gpu is explicitly local.
 distributed:
   strategy: fsdp

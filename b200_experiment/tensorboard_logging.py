@@ -107,6 +107,13 @@ GRPO_TAGS = {
     "grpo/clip_fraction": ("grpo_clip_fraction",),
 }
 
+IW_TAGS = {
+    "iw/weight_mean": ("iw_weight_mean",),
+    "iw/weight_std": ("iw_weight_std",),
+    "iw/weight_min": ("iw_weight_min",),
+    "iw/weight_max": ("iw_weight_max",),
+}
+
 
 def _selector_value(selector: dict[str, Any], path: tuple[str, ...]) -> float:
     value: Any = selector
@@ -171,6 +178,14 @@ def production_tensorboard_metrics(
                 tag: _selector_value(metrics, path)
                 for tag, path in GRPO_TAGS.items()
                 if all(key in metrics for key in path)
+            }
+        )
+    elif method == "iw":
+        selected.update(
+            {
+                tag: _selector_value(metrics, path)
+                for tag, path in IW_TAGS.items()
+                if all(key in metrics and metrics[key] is not None for key in path)
             }
         )
     sanity = metrics.get("vllm_logprob_sanity", {})

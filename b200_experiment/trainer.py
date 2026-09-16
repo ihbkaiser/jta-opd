@@ -88,6 +88,7 @@ from .opd_core import (
     UPSTREAM_REWARD_WEIGHT_MODE,
     UPSTREAM_TOP_K_STRATEGY,
     TopKOPDReference,
+    build_iw_opd_reference,
     build_topk_opd_reference,
     gather_candidate_log_probs,
     topk_candidate_ppo_loss,
@@ -135,6 +136,7 @@ METHOD_DISPLAY_NAMES = {
     "pgt": "PGT",
     "cmt": "CMT-OPD",
     "grpo": "GRPO",
+    "iw": "IW-OPD",
 }
 
 
@@ -600,7 +602,7 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "support_common_mass", "conditional_support_common_mass",
         "transition_weight", "support_coverage", "coverage_correction",
         "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
-        "successor_excess", "sequential_gain", "learning_value", "s_CMT",
+        "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
     ):
         for statistic, value in selector.get(score, {}).items():
             row[f"{score}_{statistic}"] = value
@@ -637,6 +639,10 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "opd_advantage_abs_mean",
         "opd_advantage_min",
         "opd_advantage_max",
+        "iw_weight_mean",
+        "iw_weight_std",
+        "iw_weight_min",
+        "iw_weight_max",
         "grad_norm",
         "num_valid_tokens",
         "mean_response_length",
@@ -674,7 +680,7 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
             "support_common_mass", "conditional_support_common_mass",
             "transition_weight", "support_coverage", "coverage_correction",
             "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
-            "successor_excess", "sequential_gain", "learning_value", "s_CMT",
+            "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
         )
         for statistic in (
             "mean",
@@ -1511,7 +1517,8 @@ def _opd_train_step(
     # OPD/TA/RAC/CMT recipe keeps its historical dual clipping unchanged.
     dual_clip = (
         None
-        if str(config.get("experiment", {}).get("method", "")).lower() == "grpo"
+        if str(config.get("experiment", {}).get("method", "")).lower()
+        in {"grpo", "iw"}
         else float(training.get("ppo_dual_clip", 3.0))
     )
     objective_valid = (
@@ -2728,9 +2735,10 @@ def run_training(
     experiment, training = config["experiment"], config["training"]
     strategy = distributed_strategy(config, distributed)
     method = str(experiment["method"]).lower()
-    if method not in {"opd", "ta", "rac", "pgt", "cmt", "grpo"}:
+    if method not in {"opd", "ta", "rac", "pgt", "cmt", "grpo", "iw"}:
         raise ValueError(
-            f"Training method must be opd, ta, rac, pgt, cmt, or grpo, got {method!r}"
+            "Training method must be opd, ta, rac, pgt, cmt, grpo, or iw, "
+            f"got {method!r}"
         )
     if method == "grpo":
         return _run_grpo_training(config, command_line, distributed, device, strategy)
@@ -3430,13 +3438,32 @@ def run_training(
                     if value is not None:
                         finite_or_raise(f"CMT diagnostic {field}", value[valid])
                         cmt_raw.diagnostics[field] = value.detach().float()
-        opd_reference = build_topk_opd_reference(
-            reference_candidate_ids,
-            reference_student_log_probs,
-            reference_teacher_log_probs,
-            valid,
-            support_mask=reference_support_mask,
-        )
+        iw_weights: torch.Tensor | None = None
+        iw_weight_stats: dict[str, float] | None = None
+        if method == "iw":
+            # Official IW-OPD uses the sampled response action (not a
+            # candidate-wise Top-K reward) and applies a stop-gradient prefix
+            # remaining-discrepancy multiplier to that OPD advantage.
+            opd_reference, iw_weights = build_iw_opd_reference(
+                rollout.response_ids,
+                student_scores.sampled_log_probs,
+                teacher_scores.sampled_log_probs,
+                valid,
+                weight_max=float(
+                    config.get("iw_opd", {}).get("weight_max", 1.5)
+                ),
+                use_abs=bool(config.get("iw_opd", {}).get("use_abs", True)),
+                eps=float(config.get("iw_opd", {}).get("eps", 1.0e-8)),
+            )
+            iw_weight_stats = _global_tensor_stats(iw_weights[valid], distributed)
+        else:
+            opd_reference = build_topk_opd_reference(
+                reference_candidate_ids,
+                reference_student_log_probs,
+                reference_teacher_log_probs,
+                valid,
+                support_mask=reference_support_mask,
+            )
         finite_or_raise("Top-K OPD advantages", opd_reference.advantages[valid])
         advantage_stats = _global_tensor_stats(
             opd_reference.advantages[valid], distributed
@@ -3525,7 +3552,40 @@ def run_training(
         global_pgt_diagnostics: dict[str, torch.Tensor] = {}
         global_cmt_diagnostics: dict[str, torch.Tensor] = {}
         student_cross_score_time = 0.0
-        if method == "opd":
+        if method == "iw":
+            if distributed.is_main:
+                progress.set_postfix_str(
+                    "stage=selector-IW-OPD-prefix-remaining-mass", refresh=True
+                )
+            # IW-OPD supervises every valid sampled response token.  The
+            # importance weight lives in the frozen PPO advantage above, not
+            # in the token allocator; this preserves the official token-mean
+            # objective and avoids double-weighting the loss denominator.
+            iw_position_weights = valid.float()
+            primary = SelectorOutput(
+                iw_position_weights,
+                {"w": iw_position_weights, "iw_weight": iw_weights},
+            )
+            iw_globalized, iw_gather_time = _timed(
+                device,
+                _globalize_opd_output,
+                primary,
+                valid,
+                distributed,
+            )
+            primary, global_primary_diagnostics, primary_start, primary_end = (
+                iw_globalized
+            )
+            if iw_weights is not None:
+                global_iw_weights, iw_start, iw_end, _iw_lengths = (
+                    distributed.all_gather_variable_1d(iw_weights[valid])
+                )
+                if (iw_start, iw_end) != (primary_start, primary_end):
+                    raise AssertionError("IW distributed token layouts differ")
+                global_primary_diagnostics["iw_weight"] = global_iw_weights
+            ta_time = bellman_scan_time = 0.0
+            selector_time = iw_gather_time
+        elif method == "opd":
             if distributed.is_main:
                 progress.set_postfix_str("stage=selector-OPD-uniform", refresh=True)
             opd_raw, opd_selector_time = _timed(
@@ -3937,25 +3997,34 @@ def run_training(
             "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method in {"ta", "pgt"},
             "uniform_full_response_mask": method == "opd",
-            "all_response_tokens_supervised": method in {"opd", "rac", "cmt"},
+            "all_response_tokens_supervised": method in {"opd", "rac", "cmt", "iw"},
             "token_allocation_policy": {
                 "opd": "uniform_all_valid_response_tokens",
                 "ta": "hard_global_top_rho",
                 "rac": "bellman_soft_all_valid_response_tokens",
                 "pgt": "hard_global_top_rho_projected_gradient_gain",
                 "cmt": "kl_constrained_global_coupled_marginal_teachability",
+                "iw": "official_prefix_remaining_discrepancy_advantage_weight",
             }[method],
             "objective_normalization": "global_weighted_token_mean",
             "opd_upstream_commit": UPSTREAM_OPD_COMMIT,
             "opd_candidate_support": (
-                "student_teacher_top_k_union"
-                if method in {"pgt", "cmt"}
-                else "student_top_k"
+                "sampled_response_action"
+                if method == "iw"
+                else (
+                    "student_teacher_top_k_union"
+                    if method in {"pgt", "cmt"}
+                    else "student_top_k"
+                )
             ),
             "opd_support_geometry": (
-                "conditional_student_teacher_union"
-                if method in {"pgt", "cmt"}
-                else "legacy_global_log_probability_support"
+                "sampled_action_singleton"
+                if method == "iw"
+                else (
+                    "conditional_student_teacher_union"
+                    if method in {"pgt", "cmt"}
+                    else "legacy_global_log_probability_support"
+                )
             ),
             "opd_top_k": top_k,
             "opd_top_k_strategy": top_k_strategy,
@@ -3967,6 +4036,18 @@ def run_training(
             "opd_advantage_min": advantage_stats["min"],
             "opd_advantage_max": advantage_stats["max"],
             "opd_teacher_student_logprob_gap": (opd_teacher_student_logprob_gap),
+            "iw_weight_mean": (
+                iw_weight_stats["mean"] if iw_weight_stats is not None else None
+            ),
+            "iw_weight_std": (
+                iw_weight_stats["std"] if iw_weight_stats is not None else None
+            ),
+            "iw_weight_min": (
+                iw_weight_stats["min"] if iw_weight_stats is not None else None
+            ),
+            "iw_weight_max": (
+                iw_weight_stats["max"] if iw_weight_stats is not None else None
+            ),
             "fused_optimizer": fused_optimizer,
             "lr": float(optimizer.param_groups[0]["lr"]),
             **aggregated_train_metrics,
