@@ -20,6 +20,14 @@ Project độc lập này hỗ trợ bốn baseline chính trên cùng student Q
   chấm outcome reward, chuẩn hoá advantage trong group và tối ưu clipped PPO surrogate. GRPO chỉ
   tải student, không tải teacher/reference model. Bellman-RAC/PGT vẫn còn trong code để đọc và
   tái lập các run legacy.
+- **JTA-OPD**: giữ nguyên Top-K OPD objective, active-batch leave-one-prompt-out reference,
+  budget/KL/simplex theo từng prompt và PPO path. Backend mặc định
+  `topk_context_tensorsketch` tạo `c_i[v] = sum_k(-A_i,k)` trên sparse candidate IDs rồi
+  TensorSketch `c_i ⊗ h_i` bằng hai CountSketch độc lập và FFT circular convolution. `h_i` là
+  detached causal final hidden state feeding đúng logits candidate; chỉ giữ hidden sketch/compressed
+  statistics, không tạo `V × d_h` outer product hoặc full-parameter gradient. Dense softmax-tail term
+  bị bỏ qua nên đây là Top-K output-gradient/context proxy. `epsilon=0` khôi phục đúng vanilla OPD
+  loss và gradient. Backend `topk_logprob_countsketch` chỉ dùng khi chọn explicit cho ablation.
 
 OPD/TA/CMT dùng chung data order, vLLM rollout, teacher scoring, **Top-K OPD core**, optimizer,
 checkpoint và evaluation; GRPO dùng data order, rollout, optimizer, checkpoint và evaluation chung
@@ -177,6 +185,9 @@ cảnh báo và không áp dụng importance correction không hợp lệ.
   GPU; RAC, PGT và CMT không yêu cầu counterfactual generation.
 - TA top-K/KL, actual-token log-prob ratio, global quantiles, RAC weights và loss weighting đều là
   tensor operations trên GPU, với BF16 model forward và FP32 cho logsumexp/score/reduction nhạy số.
+- JTA stream final hidden states từ cùng forward causal với candidate logits thành `CS_hidden(h_i)`;
+  allocator chỉ giữ compressed sketches theo chunk, dùng default `sketch_dim=512`,
+  `epsilon=0.1`, vocabulary hash seed `42`, hidden hash seed `1729`.
 - Bellman mặc định dùng associative affine suffix scan O(log T), vector hóa theo batch. Backend
   `reference` chứa recurrence rõ ràng để debug/cross-check.
 - Student và frozen teacher đều dùng FSDP `FULL_SHARD`, Qwen3 decoder-layer auto wrap,
@@ -198,6 +209,7 @@ configs/qwen3_b200_ta.yaml
 configs/qwen3_b200_rac.yaml
 configs/qwen3_b200_pgt.yaml
 configs/qwen3_b200_cmt.yaml
+configs/qwen3_b200_jta.yaml
 ```
 
 Các method config chỉ override `experiment.method` và `experiment.output_dir`; toàn bộ model, data,
@@ -253,7 +265,7 @@ Dùng checkpoint cụ thể hoặc `RESUME=auto` cùng tên run cũ.
 
 Eval thủ công một checkpoint bất kỳ dùng
 `scripts/eval_checkpoint_b200.sh METHOD CHECKPOINT [OUTPUT_DIR]`, trong đó `METHOD` là `opd`,
-`ta-opd`, `rac`, `pgt` hoặc `cmt`. Với checkpoint nằm dưới `outputs/<run>/<method>/` và bỏ qua
+`ta-opd`, `rac`, `pgt`, `cmt` hoặc `jta-opd`. Với checkpoint nằm dưới `outputs/<run>/<method>/` và bỏ qua
 `OUTPUT_DIR`, artifact chi tiết được ghi dưới `<method-output>/checkpoint_eval/` và kết quả được
 upsert vào `<method-output>/eval_history.jsonl` (cập nhật cùng row `(step, method)` khi chạy lại),
 đồng thời cập nhật `eval_metrics.csv`. Ngoài summary và prediction theo từng dataset, evaluator
@@ -267,7 +279,7 @@ histogram/quantile và bounded scalar sample vẫn luôn đủ cho plots. Có th
 Plot launch tạo một folder timestamp mới `results/.../plots/plot_YYYYMMDD_HHMMSS/`, sinh PNG và PDF
 cho avg@8, loss, TA score distribution, Bellman-RAC `g/V/w`, CMT support/excess diagnostics,
 và mean alignment/V/weight. `plot_training_progress.sh` hỗ trợ
-`PLOT_METHODS='opd ta rac pgt cmt'` với một hoặc nhiều method.
+`PLOT_METHODS='opd ta rac pgt cmt jta'` với một hoặc nhiều method.
 Một method tạo sáu đường benchmark (thêm GPQA-Diamond và AMC23); từ hai method trở lên tạo sáu subplot benchmark,
 mỗi subplot có một đường cho từng method. `PLOT_METHOD=both` vẫn tương thích và có nghĩa TA+RAC.
 

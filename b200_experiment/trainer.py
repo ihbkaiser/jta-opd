@@ -41,6 +41,7 @@ from .distributed import (
     batch_layout,
     contiguous_partition,
     distributed_ppo_minibatch_partition,
+    distributed_prompt_group_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
@@ -109,9 +110,10 @@ from .scoring import (
     score_student_teacher_rollout,
     supports_response_only_logits,
 )
-from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
+from .selector_logging import JTADebugLogger, SelectedTokenLogger, TokenScoreStatsLogger
 from .selectors import (
     CMTSelector,
+    JTASelector,
     OPDSelector,
     PGTSelector,
     RACSelector,
@@ -137,6 +139,7 @@ METHOD_DISPLAY_NAMES = {
     "cmt": "CMT-OPD",
     "grpo": "GRPO",
     "iw": "IW-OPD",
+    "jta": "JTA-OPD",
 }
 
 
@@ -353,6 +356,47 @@ def _globalize_opd_output(
         local.diagnostics, valid_mask, ("w",), distributed
     )
     return local, gathered, start, end
+
+
+def _globalize_jta_output(
+    local: SelectorOutput,
+    valid_mask: torch.Tensor,
+    distributed: DistributedContext,
+) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
+    """Gather JTA token diagnostics after its single reference collective."""
+    keys = (
+        "utility",
+        "redundancy",
+        "marginal_score",
+        "embedding_norm",
+        "tensorsketch_embedding_norm",
+        "coefficient_norm",
+        "hidden_state_norm",
+        "w_probability",
+        "w",
+    )
+    gathered, start, end = _gather_selector_diagnostics(
+        local.diagnostics, valid_mask, keys, distributed
+    )
+    diagnostics = dict(local.diagnostics)
+    for key in keys:
+        if key in gathered:
+            diagnostics[key] = scatter_valid(gathered[key][start:end], valid_mask)
+    prompt_summaries = []
+    for rank_summaries in distributed.all_gather_objects(
+        local.diagnostics.get("prompt_summaries", [])
+    ):
+        prompt_summaries.extend(rank_summaries)
+    gathered["prompt_summaries"] = prompt_summaries
+    gathered["reference_norm"] = local.diagnostics["reference_norm"]
+    gathered["prompt_token_counts"] = local.diagnostics["prompt_token_counts"]
+    gathered["reference_fallback_count"] = sum(
+        bool(value)
+        for value in distributed.all_gather_objects(
+            local.diagnostics.get("reference_fallback", False)
+        )
+    )
+    return SelectorOutput(diagnostics["w"], diagnostics), gathered, start, end
 
 
 def _globalize_pgt_output(
@@ -603,6 +647,8 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "transition_weight", "support_coverage", "coverage_correction",
         "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
         "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+        "embedding_norm", "coefficient_norm", "hidden_state_norm",
+        "tensorsketch_embedding_norm",
     ):
         for statistic, value in selector.get(score, {}).items():
             row[f"{score}_{statistic}"] = value
@@ -670,6 +716,11 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "effective_sample_size",
         "ppo_minibatch_trajectory_count",
         "local_ppo_minibatch_trajectory_count",
+        "jta_embedding_backend",
+        "jta_sketch_dim",
+        "jta_vocab_hash_seed",
+        "jta_hidden_hash_seed",
+        "jta_embedding_description",
     )
     statistics = tuple(
         f"{score}_{statistic}"
@@ -681,6 +732,8 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
             "transition_weight", "support_coverage", "coverage_correction",
             "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
             "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+            "embedding_norm", "coefficient_norm", "hidden_state_norm",
+            "tensorsketch_embedding_norm",
         )
         for statistic in (
             "mean",
@@ -1504,6 +1557,7 @@ def _opd_train_step(
     max_optimizer_steps: int | None = None,
     optimizer_step_start: int = 0,
     on_optimizer_step: Callable[[int, dict[str, float]], None] | None = None,
+    prompt_group_size: int | None = None,
 ):
     training = config["training"]
     local_batch_size = rollout.input_ids.shape[0]
@@ -1556,6 +1610,24 @@ def _opd_train_step(
             "training.ppo_mini_batch_size must be at least world size so every "
             "rank can receive a real trajectory in a complete PPO minibatch"
         )
+    method = str(config.get("experiment", {}).get("method", "")).lower()
+    grouped_jta = method in {"jta", "jta-opd"}
+    group_size = int(prompt_group_size or 1)
+    if grouped_jta:
+        if group_size <= 0:
+            raise ValueError("JTA prompt_group_size must be positive")
+        if local_real_count % group_size != 0:
+            raise ValueError(
+                "JTA active local trajectories must contain complete prompt groups"
+            )
+        if ppo_size % group_size != 0:
+            raise ValueError(
+                "JTA ppo_mini_batch_size must be divisible by num_responses"
+            )
+        if ppo_size // group_size < distributed.world_size:
+            raise ValueError(
+                "JTA prompts per PPO minibatch must be at least world_size"
+            )
     micro_batch = _micro_batch_size_per_gpu(
         training, distributed.world_size, ppo_size
     )
@@ -1581,15 +1653,26 @@ def _opd_train_step(
     )
     minibatch_metrics: list[dict[str, float]] = []
     for ppo_index in range(offset, min(ppo_count, offset + remaining_limit)):
-        # PPO_MINI_BATCH_SIZE is global.  Rank-interleaving the locally owned
-        # rollout rows makes every complete global minibatch data-parallel;
-        # rank-major contiguous slicing would put whole minibatches on one rank.
-        local_indices, global_minibatch_count = distributed_ppo_minibatch_partition(
-            counts,
-            distributed.rank,
-            ppo_size,
-            ppo_index,
-        )
+        # PPO_MINI_BATCH_SIZE is global.  JTA uses the same rank interleave but
+        # expands selected prompt positions as complete R-row groups.
+        if grouped_jta:
+            prompt_counts = tuple(int(value // group_size) for value in counts)
+            local_indices, global_minibatch_count = (
+                distributed_prompt_group_minibatch_partition(
+                    prompt_counts,
+                    distributed.rank,
+                    group_size,
+                    ppo_size,
+                    ppo_index,
+                )
+            )
+        else:
+            local_indices, global_minibatch_count = distributed_ppo_minibatch_partition(
+                counts,
+                distributed.rank,
+                ppo_size,
+                ppo_index,
+            )
         local_minibatch_count = len(local_indices)
         if distributed.any(local_minibatch_count == 0):
             raise ValueError(
@@ -2547,6 +2630,7 @@ def _run_grpo_training(
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
             on_optimizer_step=after_optimizer_step,
+            prompt_group_size=(num_responses if method == "jta" else None),
         )
         optimizer_steps_completed = int(train_metrics["optimizer_steps"])
         optimizer_step += optimizer_steps_completed
@@ -2735,9 +2819,12 @@ def run_training(
     experiment, training = config["experiment"], config["training"]
     strategy = distributed_strategy(config, distributed)
     method = str(experiment["method"]).lower()
-    if method not in {"opd", "ta", "rac", "pgt", "cmt", "grpo", "iw"}:
+    if method == "jta-opd":
+        method = "jta"
+        experiment["method"] = method
+    if method not in {"opd", "ta", "rac", "pgt", "cmt", "grpo", "iw", "jta"}:
         raise ValueError(
-            "Training method must be opd, ta, rac, pgt, cmt, grpo, or iw, "
+            "Training method must be opd, ta, rac, pgt, cmt, grpo, iw, or jta, "
             f"got {method!r}"
         )
     if method == "grpo":
@@ -2768,6 +2855,37 @@ def run_training(
     ppo_mini_batch_size = _ppo_mini_batch_size(
         training, global_prompt_batch_size * num_responses
     )
+    if method == "jta":
+        jta_config = config.get("jta", {})
+        if global_prompt_batch_size < 2:
+            raise ValueError("JTA rollout.batch_size must allow at least two prompts")
+        if num_responses < 1:
+            raise ValueError("JTA rollout.num_responses must be at least 1")
+        if ppo_mini_batch_size % num_responses != 0:
+            raise ValueError(
+                "JTA training.ppo_mini_batch_size must be divisible by "
+                "rollout.num_responses"
+            )
+        if ppo_mini_batch_size // num_responses < distributed.world_size:
+            raise ValueError(
+                "JTA PPO prompts per minibatch must be at least distributed world_size"
+            )
+        if float(jta_config.get("epsilon", 0.1)) < 0.0:
+            raise ValueError("jta.epsilon must be non-negative")
+        if int(jta_config.get("sketch_dim", 512)) <= 0:
+            raise ValueError("jta.sketch_dim must be positive")
+        backend = str(
+            jta_config.get("embedding_backend", "topk_context_tensorsketch")
+        )
+        if backend not in {"topk_context_tensorsketch", "topk_logprob_countsketch"}:
+            raise ValueError(f"Unsupported jta.embedding_backend: {backend!r}")
+        for key in ("fw_max_iterations", "kl_bisection_iterations", "token_chunk_size"):
+            if int(jta_config.get(key, {"fw_max_iterations": 20, "kl_bisection_iterations": 50, "token_chunk_size": 4096}[key])) <= 0:
+                raise ValueError(f"jta.{key} must be positive")
+        if float(jta_config.get("fw_gap_tolerance", 1.0e-5)) < 0.0:
+            raise ValueError("jta.fw_gap_tolerance must be non-negative")
+        if float(jta_config.get("constraint_tolerance", 1.0e-6)) < 0.0:
+            raise ValueError("jta.constraint_tolerance must be non-negative")
     micro_batch_size_per_gpu = _micro_batch_size_per_gpu(
         training, distributed.world_size, ppo_mini_batch_size
     )
@@ -3026,6 +3144,7 @@ def run_training(
             "global_token_budget": method in {"ta", "pgt"},
             "global_rac_weight_normalization": method == "rac",
             "global_cmt_kl_allocation": method == "cmt",
+            "global_jta_reference": method == "jta",
             "uniform_full_response_mask": method == "opd",
             "student_sharding_strategy": ("FULL_SHARD" if strategy == "fsdp" else None),
             "teacher_sharding_strategy": (
@@ -3107,6 +3226,21 @@ def run_training(
         successor_lambda=float(selector_cfg.get("cmt_successor_lambda", 1.0)),
         ablation_arm=str(selector_cfg.get("cmt_ablation_arm", "canonical")),
     )
+    jta_cfg = config.get("jta", {})
+    jta_selector = JTASelector(
+        epsilon=float(jta_cfg.get("epsilon", 0.1)),
+        sketch_dim=int(jta_cfg.get("sketch_dim", 512)),
+        sketch_seed=int(jta_cfg.get("sketch_seed", 42)),
+        hidden_sketch_seed=int(jta_cfg.get("hidden_sketch_seed", 1729)),
+        embedding_backend=str(
+            jta_cfg.get("embedding_backend", "topk_context_tensorsketch")
+        ),
+        fw_max_iterations=int(jta_cfg.get("fw_max_iterations", 20)),
+        fw_gap_tolerance=float(jta_cfg.get("fw_gap_tolerance", 1.0e-5)),
+        kl_bisection_iterations=int(jta_cfg.get("kl_bisection_iterations", 50)),
+        constraint_tolerance=float(jta_cfg.get("constraint_tolerance", 1.0e-6)),
+        token_chunk_size=int(jta_cfg.get("token_chunk_size", 4096)),
+    )
     batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:
         raise ValueError("Prompt batch size and rollout.num_responses must be positive")
@@ -3147,6 +3281,21 @@ def run_training(
         ),
         enabled=distributed.is_main
         and bool(config.get("logging", {}).get("token_score_stats_enabled", True)),
+    )
+    jta_debug_logger = JTADebugLogger(
+        output_dir,
+        tokenizer,
+        enabled=method == "jta"
+        and bool(config.get("logging", {}).get("jta_debug_enabled", False)),
+        interval=int(config.get("logging", {}).get("jta_debug_interval", 50)),
+        prompts_per_rank=int(
+            config.get("logging", {}).get("jta_debug_prompts_per_rank", 2)
+        ),
+        tokens_per_prompt=int(
+            config.get("logging", {}).get("jta_debug_tokens_per_prompt", 32)
+        ),
+        rank=distributed.rank,
+        world_size=distributed.world_size,
     )
     tensorboard_logger = TensorBoardLogger(
         output_dir,
@@ -3348,6 +3497,14 @@ def run_training(
                 False,
                 int(selector_cfg.get("score_chunk_steps", 128)),
                 retain_response_logits=False,
+                retain_response_hidden_sketch=method == "jta"
+                and jta_selector.embedding_backend == "topk_context_tensorsketch",
+                hidden_sketch_operator=(
+                    jta_selector.tensor_operator
+                    if method == "jta"
+                    and jta_selector.embedding_backend == "topk_context_tensorsketch"
+                    else None
+                ),
                 top_k=top_k,
                 temperature=float(config["rollout"].get("temperature", 1.0)),
                 micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
@@ -3358,6 +3515,14 @@ def run_training(
             raise AssertionError(
                 "Student scoring did not produce the common Top-K support"
             )
+        if method == "jta" and jta_selector.embedding_backend == "topk_context_tensorsketch":
+            if (
+                student_scores.response_hidden_sketch is None
+                or student_scores.response_hidden_norm is None
+            ):
+                raise AssertionError(
+                    "JTA TensorSketch scoring did not retain aligned hidden sketches"
+                )
         if not use_joint_scoring:
             if distributed.is_main:
                 progress.set_postfix_str("stage=score-teacher", refresh=True)
@@ -3649,6 +3814,44 @@ def run_training(
             bellman_scan_time = cmt_score_time
             selector_time = pgt_score_time + cmt_score_time + cmt_gather_time
             global_primary_diagnostics = global_cmt_diagnostics
+        elif method == "jta":
+            if distributed.is_main:
+                progress.set_postfix_str("stage=selector-JTA-OPD", refresh=True)
+            jta_raw, jta_selector_time = _timed(
+                device,
+                jta_selector.allocate,
+                opd_reference,
+                objective_valid,
+                torch.tensor(active_prompts, dtype=torch.bool, device=device),
+                num_responses,
+                distributed,
+                hidden_sketches=(
+                    student_scores.response_hidden_sketch
+                    if jta_selector.embedding_backend
+                    == "topk_context_tensorsketch"
+                    else None
+                ),
+                hidden_state_norm=(
+                    student_scores.response_hidden_norm
+                    if jta_selector.embedding_backend
+                    == "topk_context_tensorsketch"
+                    else None
+                ),
+            )
+            jta_local = SelectorOutput(jta_raw.weights, jta_raw.diagnostics)
+            jta_globalized, global_jta_diagnostics, primary_start, primary_end = (
+                _timed(
+                    device,
+                    _globalize_jta_output,
+                    jta_local,
+                    valid,
+                    distributed,
+                )[0]
+            )
+            primary = jta_globalized
+            global_primary_diagnostics = global_jta_diagnostics
+            ta_time = bellman_scan_time = 0.0
+            selector_time = jta_selector_time
         else:
             if use_joint_scoring:
                 student_on_teacher = student_scores
@@ -3797,6 +4000,19 @@ def run_training(
             if method in {"ta", "pgt"}
             else 0
         )
+        if method == "jta":
+            jta_debug_logger.write(
+                step=rollout_last_optimizer_step,
+                final_step=max_steps,
+                dataset_indices=indices,
+                sample_ids=sample_ids,
+                response_ids=rollout.response_ids,
+                valid_mask=objective_valid,
+                diagnostics=primary.diagnostics,
+                num_responses=num_responses,
+                response_indices=response_indices,
+                batch_index_offset=local_start * num_responses,
+            )
         global_logged_selected = distributed.sum_int(logged_selected)
         if (
             bool(config.get("logging", {}).get("selected_tokens_enabled", True))
@@ -3997,7 +4213,7 @@ def run_training(
             "global_ta_normalization": method in {"ta", "rac"},
             "global_token_budget": method in {"ta", "pgt"},
             "uniform_full_response_mask": method == "opd",
-            "all_response_tokens_supervised": method in {"opd", "rac", "cmt", "iw"},
+            "all_response_tokens_supervised": method in {"opd", "rac", "cmt", "iw", "jta"},
             "token_allocation_policy": {
                 "opd": "uniform_all_valid_response_tokens",
                 "ta": "hard_global_top_rho",
@@ -4005,6 +4221,7 @@ def run_training(
                 "pgt": "hard_global_top_rho_projected_gradient_gain",
                 "cmt": "kl_constrained_global_coupled_marginal_teachability",
                 "iw": "official_prefix_remaining_discrepancy_advantage_weight",
+                "jta": "prompt_local_kl_constrained_topk_context_tensorsketch_fw_allocation",
             }[method],
             "objective_normalization": "global_weighted_token_mean",
             "opd_upstream_commit": UPSTREAM_OPD_COMMIT,
@@ -4031,6 +4248,36 @@ def run_training(
             "opd_reward_weight_mode": reward_weight_mode,
             "opd_adv_estimator": advantage_estimator,
             "opd_loss_agg_mode": loss_aggregation,
+            "jta_reference_scope": (
+                "active_batch_leave_one_prompt_out" if method == "jta" else None
+            ),
+            "jta_allocation_scope": (
+                "independent_within_prompt" if method == "jta" else None
+            ),
+            "jta_candidate_scope": (
+                "all_rollouts_of_prompt" if method == "jta" else None
+            ),
+            "jta_prior": (
+                "uniform_valid_tokens_within_prompt" if method == "jta" else None
+            ),
+            "jta_embedding_backend": (
+                jta_selector.embedding_backend if method == "jta" else None
+            ),
+            "jta_sketch_dim": jta_selector.sketch_dim if method == "jta" else None,
+            "jta_sketch_seed": jta_selector.sketch_seed if method == "jta" else None,
+            "jta_vocab_hash_seed": (
+                jta_selector.sketch_seed if method == "jta" else None
+            ),
+            "jta_hidden_hash_seed": (
+                jta_selector.hidden_sketch_seed if method == "jta" else None
+            ),
+            "jta_embedding_description": (
+                "sparse_topk_output_gradient_context_tensorsketch_dense_softmax_tail_omitted"
+                if method == "jta"
+                else None
+            ),
+            "jta_fixed_lambda": 1.0 if method == "jta" else None,
+            "jta_all_response_tokens_supervised": method == "jta",
             "opd_advantage_abs_mean": opd_advantage_abs_mean,
             "opd_advantage_mean": advantage_stats["mean"],
             "opd_advantage_min": advantage_stats["min"],
@@ -4098,6 +4345,9 @@ def run_training(
             "ta_local_score_time_sec": distributed.max_float(ta_time),
             "cmt_score_time_sec": distributed.max_float(cmt_score_time),
             "selector_time": distributed.max_float(selector_time),
+            "jta_allocation_time": (
+                distributed.max_float(selector_time) if method == "jta" else None
+            ),
             "bellman_scan_time_sec": distributed.max_float(bellman_scan_time),
             "forward_backward_time_sec": distributed.max_float(
                 train_metrics["training_forward_time"] + train_metrics["backward_time"]

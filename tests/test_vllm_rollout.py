@@ -35,6 +35,12 @@ def _config(max_model_len: int = 1024):
     }
 
 
+def _config_with_attention_backend(backend: str):
+    config = _config()
+    config["rollout"]["vllm"]["attention_backend"] = backend
+    return config
+
+
 class VLLMRolloutTests(unittest.TestCase):
     def test_rollout_requests_log_probs_only_for_enabled_sanity_check(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +182,20 @@ class VLLMRolloutTests(unittest.TestCase):
         self.assertIn("--async-scheduling", command)
         self.assertIn("--performance-mode throughput", joined)
         self.assertIn("--gpu-memory-utilization 0.25", joined)
+
+    def test_server_command_can_select_attention_backend(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            engine = VLLMRolloutEngine(
+                _config_with_attention_backend("TRITON_ATTN"), Path(temporary)
+            )
+            with patch(
+                "b200_experiment.vllm_rollout.shutil.which",
+                return_value="/venv/bin/vllm",
+            ):
+                command = engine._server_command()
+            engine.close()
+        self.assertIn("--attention-backend", command)
+        self.assertEqual(command[command.index("--attention-backend") + 1], "TRITON_ATTN")
 
     def test_server_rejects_context_smaller_than_prompt_plus_response(self):
         with tempfile.TemporaryDirectory() as temporary:

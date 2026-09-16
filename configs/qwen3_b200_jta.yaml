@@ -1,0 +1,24 @@
+_base_: qwen3_b200_base.yaml
+
+experiment:
+  method: jta
+  output_dir: outputs/jta_opd
+
+rollout:
+  batch_size: 64
+  num_responses: 1
+
+training:
+  ppo_mini_batch_size: 16
+
+jta:
+  epsilon: 0.1
+  sketch_dim: 512
+  sketch_seed: 42
+  hidden_sketch_seed: 1729
+  embedding_backend: topk_context_tensorsketch
+  fw_max_iterations: 20
+  fw_gap_tolerance: 1.0e-5
+  kl_bisection_iterations: 50
+  constraint_tolerance: 1.0e-6
+  token_chunk_size: 4096

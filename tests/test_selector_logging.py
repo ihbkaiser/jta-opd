@@ -8,7 +8,11 @@ from pathlib import Path
 
 import torch
 
-from b200_experiment.selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
+from b200_experiment.selector_logging import (
+    JTADebugLogger,
+    SelectedTokenLogger,
+    TokenScoreStatsLogger,
+)
 
 
 class FakeTokenizer:
@@ -149,6 +153,48 @@ class SelectorLoggingTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(set(payload["scores"]), set(keys))
             self.assertEqual(payload["scores"]["learning_value"]["count"], 9)
+
+    def test_jta_debug_logger_is_bounded_and_includes_rollout_coordinates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logger = JTADebugLogger(
+                temporary,
+                FakeTokenizer(),
+                enabled=True,
+                interval=10,
+                prompts_per_rank=1,
+                tokens_per_prompt=1,
+            )
+            diagnostics = {
+                key: torch.tensor([[0.1, 0.9], [0.2, 0.8]])
+                for key in (
+                    "utility",
+                    "redundancy",
+                    "marginal_score",
+                    "w_probability",
+                    "w",
+                    "coefficient_norm",
+                    "hidden_state_norm",
+                    "tensorsketch_embedding_norm",
+                )
+            }
+            count = logger.write(
+                step=1,
+                final_step=10,
+                dataset_indices=[4, 4],
+                sample_ids=["p-r0", "p-r1"],
+                response_ids=torch.tensor([[7, 8], [9, 10]]),
+                valid_mask=torch.ones(2, 2, dtype=torch.bool),
+                diagnostics=diagnostics,
+                num_responses=2,
+                response_indices=[0, 1],
+            )
+            self.assertEqual(count, 2)
+            path = next((Path(temporary) / "jta_debug").glob("step-*.jsonl"))
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertIn("rollout_index", rows[0])
+            self.assertIn("prior", rows[0])
+            self.assertEqual(rows[0]["token_text"], "tok-8")
 
 
 if __name__ == "__main__":

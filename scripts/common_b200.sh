@@ -81,6 +81,7 @@ PGT_CONFIG="${REPO_DIR}/configs/qwen3_b200_pgt.yaml"
 CMT_CONFIG="${REPO_DIR}/configs/qwen3_b200_cmt.yaml"
 GRPO_CONFIG="${REPO_DIR}/configs/qwen3_b200_grpo.yaml"
 IW_CONFIG="${REPO_DIR}/configs/qwen3_b200_iw.yaml"
+JTA_CONFIG="${REPO_DIR}/configs/qwen3_b200_jta.yaml"
 
 storage_asset_path() {
   if [[ "$1" == /* ]]; then
@@ -164,6 +165,7 @@ resolve_run_paths() {
   local cmt_name="${CMT_RUN_NAME:-${RUN_NAME}}"
   local grpo_name="${GRPO_RUN_NAME:-${RUN_NAME}}"
   local iw_name="${IW_RUN_NAME:-${RUN_NAME}}"
+  local jta_name="${JTA_RUN_NAME:-${RUN_NAME}}"
   if [[ -n "${COMPARISON_NAME:-}" ]]; then
     COMPARISON_NAME="${COMPARISON_NAME}"
   elif [[ -n "${OPD_RUN_NAME:-}" ]]; then
@@ -173,7 +175,7 @@ resolve_run_paths() {
   else
     COMPARISON_NAME="${RUN_NAME}"
   fi
-  for name in "${RUN_NAME}" "${opd_name}" "${ta_name}" "${rac_name}" "${pgt_name}" "${cmt_name}" "${grpo_name}" "${iw_name}" "${COMPARISON_NAME}"; do
+  for name in "${RUN_NAME}" "${opd_name}" "${ta_name}" "${rac_name}" "${pgt_name}" "${cmt_name}" "${grpo_name}" "${iw_name}" "${jta_name}" "${COMPARISON_NAME}"; do
     if ! [[ "${name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
       echo "Run names may contain only letters, numbers, dot, underscore, and dash: ${name}" >&2
       return 1
@@ -186,6 +188,7 @@ resolve_run_paths() {
   CMT_RUN_NAME="${cmt_name}"
   GRPO_RUN_NAME="${grpo_name}"
   IW_RUN_NAME="${iw_name}"
+  JTA_RUN_NAME="${jta_name}"
   OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/outputs}"
   OPD_RUN_OUTPUT="${OPD_OUTPUT_DIR:-${OUTPUT_ROOT}/${OPD_RUN_NAME}/opd}"
   TA_RUN_OUTPUT="${TA_OUTPUT_DIR:-${OUTPUT_ROOT}/${TA_RUN_NAME}/ta_opd}"
@@ -194,6 +197,7 @@ resolve_run_paths() {
   CMT_RUN_OUTPUT="${CMT_OUTPUT_DIR:-${OUTPUT_ROOT}/${CMT_RUN_NAME}/cmt_opd}"
   GRPO_RUN_OUTPUT="${GRPO_OUTPUT_DIR:-${OUTPUT_ROOT}/${GRPO_RUN_NAME}/grpo}"
   IW_RUN_OUTPUT="${IW_OUTPUT_DIR:-${OUTPUT_ROOT}/${IW_RUN_NAME}/iw}"
+  JTA_RUN_OUTPUT="${JTA_OUTPUT_DIR:-${OUTPUT_ROOT}/${JTA_RUN_NAME}/jta_opd}"
   RUN_RESULTS_DIR="${RESULTS_DIR:-${REPO_DIR}/results/${COMPARISON_NAME}}"
 }
 
@@ -408,6 +412,16 @@ build_training_args() {
     --set "selector.cmt_gamma=${CMT_GAMMA:-1.0}"
     --set "selector.cmt_successor_lambda=${CMT_SUCCESSOR_LAMBDA:-1.0}"
     --set "selector.cmt_full_vocab_diagnostics=${CMT_FULL_VOCAB_DIAGNOSTICS:-false}"
+    --set "jta.epsilon=${JTA_EPSILON:-0.1}"
+    --set "jta.sketch_dim=${JTA_SKETCH_DIM:-512}"
+    --set "jta.sketch_seed=${JTA_SKETCH_SEED:-42}"
+    --set "jta.hidden_sketch_seed=${JTA_HIDDEN_SKETCH_SEED:-1729}"
+    --set "jta.embedding_backend=${JTA_EMBEDDING_BACKEND:-topk_context_tensorsketch}"
+    --set "jta.fw_max_iterations=${JTA_FW_MAX_ITERATIONS:-20}"
+    --set "jta.fw_gap_tolerance=${JTA_FW_GAP_TOLERANCE:-1.0e-5}"
+    --set "jta.kl_bisection_iterations=${JTA_KL_BISECTION_ITERATIONS:-50}"
+    --set "jta.constraint_tolerance=${JTA_CONSTRAINT_TOLERANCE:-1.0e-6}"
+    --set "jta.token_chunk_size=${JTA_TOKEN_CHUNK_SIZE:-4096}"
     --set "grpo.answer_key=${GRPO_ANSWER_KEY:-answer}"
     --set "grpo.reward_benchmark=${GRPO_REWARD_BENCHMARK:-Competition-MATH}"
     --set "grpo.advantage_epsilon=${GRPO_ADVANTAGE_EPSILON:-1.0e-8}"

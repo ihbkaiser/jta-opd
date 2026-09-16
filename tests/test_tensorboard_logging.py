@@ -7,6 +7,7 @@ from b200_experiment.tensorboard_logging import (
     BASE_TAGS,
     RAC_TAGS,
     CMT_TAGS,
+    JTA_TAGS,
     TA_TAGS,
     TensorBoardLogger,
     production_tensorboard_metrics,
@@ -53,6 +54,31 @@ def _cmt_metrics() -> dict:
     return values
 
 
+def _jta_metrics() -> dict:
+    values = _metrics()
+    values.update(jta_allocation_time=0.125)
+    values["selector"].update(
+        objective_improvement_mean=0.4,
+        linear_term_mean=0.7,
+        quadratic_term_mean=0.3,
+        final_gap_mean=0.001,
+        fw_iterations_mean=5.0,
+        fw_converged_fraction=0.9,
+        achieved_kl_mean=0.2,
+        achieved_kl_max=0.25,
+        coefficient_norm={"mean": 1.1},
+        hidden_state_norm={"mean": 2.2},
+        tensorsketch_embedding_norm={"mean": 3.3},
+        ess_ratio_mean=0.75,
+        max_to_mean_weight_ratio_mean=1.8,
+        matching_residual_mean=0.002,
+        effective_token_fraction=0.8,
+        reference_fallback_count=0.0,
+        w={"std": 0.2, "max": 1.7},
+    )
+    return values
+
+
 class TensorBoardMetricTests(unittest.TestCase):
     def test_opd_writes_all_common_diagnostic_tags(self):
         selected = production_tensorboard_metrics(_metrics(), "opd")
@@ -94,6 +120,15 @@ class TensorBoardMetricTests(unittest.TestCase):
             set(BASE_TAGS) | set(CMT_TAGS) | {"cmt/effective_token_fraction"},
         )
         self.assertEqual(selected["cmt/common_mass_mean"], 0.8)
+
+    def test_jta_writes_allocation_and_solver_diagnostics(self):
+        selected = production_tensorboard_metrics(_jta_metrics(), "jta")
+        self.assertEqual(
+            set(selected),
+            set(BASE_TAGS) | set(JTA_TAGS) | {"system/jta_allocation_time"},
+        )
+        self.assertEqual(selected["jta/objective_improvement_mean"], 0.4)
+        self.assertEqual(selected["jta/weight_max"], 1.7)
 
     def test_tensorboard_writer_receives_expanded_metrics(self):
         logger = object.__new__(TensorBoardLogger)

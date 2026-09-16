@@ -137,6 +137,18 @@ def selector_summary(
             "full_log_ratio_variance",
             "full_common_mass",
         )
+    elif method == "jta":
+        keys = (
+            "utility",
+            "redundancy",
+            "marginal_score",
+            "embedding_norm",
+            "tensorsketch_embedding_norm",
+            "coefficient_norm",
+            "hidden_state_norm",
+            "w_probability",
+            "w",
+        )
     else:
         raise ValueError(f"Unknown selector-summary method: {method!r}")
     result: dict[str, Any] = {}
@@ -155,7 +167,7 @@ def selector_summary(
         result["selection_threshold"] = float(diagnostics["s_TA"][selected].min())
     if method == "pgt" and selected_count:
         result["selection_threshold"] = float(diagnostics["s_PGT"][selected].min())
-    if method in {"opd", "rac", "cmt"} and "w" in diagnostics:
+    if method in {"opd", "rac", "cmt", "jta"} and "w" in diagnostics:
         weights = diagnostics["w"][valid_mask].detach().float()
         weight_sum = weights.sum()
         result.update(
@@ -163,6 +175,53 @@ def selector_summary(
             effective_sample_size=float(
                 weight_sum.square() / weights.square().sum().clamp_min(1e-12)
             ),
+        )
+        result["effective_token_fraction"] = float(
+            result["effective_sample_size"] / max(valid_count, 1)
+        )
+    if method == "jta":
+        result["embedding_backend"] = diagnostics.get("embedding_backend")
+        result["sketch_dim"] = diagnostics.get("sketch_dim")
+        result["vocab_hash_seed"] = diagnostics.get("vocab_hash_seed")
+        result["hidden_hash_seed"] = diagnostics.get("hidden_hash_seed")
+        summaries = diagnostics.get("prompt_summaries", [])
+        if summaries:
+            for key in (
+                "objective_improvement",
+                "initial_objective",
+                "final_objective",
+                "linear_term",
+                "quadratic_term",
+                "fw_iterations",
+                "final_gap",
+                "last_gamma",
+                "mean_gamma",
+                "achieved_kl",
+                "ess_ratio",
+                "max_to_mean_weight_ratio",
+                "matching_residual",
+                "token_count",
+            ):
+                values = torch.tensor(
+                    [float(item[key]) for item in summaries if key in item],
+                    dtype=torch.float32,
+                )
+                if values.numel():
+                    result[f"{key}_mean"] = float(values.mean())
+                    result[f"{key}_std"] = float(values.std(unbiased=False))
+                    result[f"{key}_min"] = float(values.min())
+                    result[f"{key}_max"] = float(values.max())
+            result["fw_converged_fraction"] = sum(
+                bool(item.get("converged", False)) for item in summaries
+            ) / max(len(summaries), 1)
+            result["kl_boundary_fraction"] = sum(
+                bool(item.get("kl_boundary", False)) for item in summaries
+            ) / max(len(summaries), 1)
+        result["reference_fallback_count"] = float(
+            diagnostics.get(
+                "reference_fallback_count",
+                sum(bool(item.get("reference_fallback", False)) for item in summaries),
+            )
         )
     return result
 

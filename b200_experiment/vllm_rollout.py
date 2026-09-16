@@ -170,6 +170,9 @@ class VLLMRolloutEngine:
             command.append("--enable-chunked-prefill")
         if bool(self.settings.get("async_scheduling", True)):
             command.append("--async-scheduling")
+        attention_backend = self.settings.get("attention_backend")
+        if attention_backend not in (None, ""):
+            command.extend(("--attention-backend", str(attention_backend)))
         performance_mode = self.settings.get("performance_mode", "throughput")
         if performance_mode not in (None, ""):
             command.extend(("--performance-mode", str(performance_mode)))

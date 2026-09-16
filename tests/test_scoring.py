@@ -11,6 +11,7 @@ from b200_experiment.scoring import (
     score_original_rollout,
     score_student_teacher_rollout,
 )
+from b200_experiment.selectors.jta_selector import TensorSketchOperator
 
 
 def test_joint_full_vocab_metrics_match_direct_distributions():
@@ -69,7 +70,12 @@ class _RecordingQwenModel(_FakeModel):
         self.calls.append((input_ids.shape[0], input_ids.shape[1], logits_to_keep))
         if logits_to_keep is not None:
             logits = logits[:, -int(logits_to_keep) :]
-        return SimpleNamespace(logits=logits, past_key_values=None)
+        hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, 4).contiguous()
+        return SimpleNamespace(
+            logits=logits,
+            hidden_states=(hidden,),
+            past_key_values=None,
+        )
 
 
 class ScoringTests(unittest.TestCase):
@@ -330,6 +336,42 @@ class ScoringTests(unittest.TestCase):
             candidate_ids=compact.top_k_ids,
         )
         self.assertEqual(teacher.candidate_log_probs.shape, (2, 3, 4))
+
+    def test_hidden_sketch_uses_the_causal_state_for_each_response_logit(self):
+        logits = torch.randn(2, 5, 11)
+        rollout = RolloutBatch(
+            input_ids=torch.tensor([[1, 2, 3, 4, 5], [2, 2, 3, 6, 7]]),
+            attention_mask=torch.ones(2, 5, dtype=torch.long),
+            response_ids=torch.tensor([[4, 5], [6, 7]]),
+            valid_mask=torch.ones(2, 2, dtype=torch.bool),
+            rollout_log_probs=torch.zeros(2, 2),
+            prompt_width=3,
+        )
+        operator = TensorSketchOperator(
+            sketch_dim=32, vocab_hash_seed=13, hidden_hash_seed=29
+        )
+        result = score_original_rollout(
+            _RecordingQwenModel(logits),
+            rollout,
+            retain_response_logits=False,
+            retain_response_hidden_sketch=True,
+            hidden_sketch_operator=operator,
+            top_k=4,
+            micro_batch_size=1,
+            length_bucketed=False,
+        )
+        expected_hidden = (
+            rollout.input_ids[:, rollout.prompt_width - 1 : rollout.prompt_width + 1]
+            .float()
+            .unsqueeze(-1)
+            .expand(-1, 2, 4)
+        )
+        expected = operator.reduce_hidden(expected_hidden)
+        assert torch.equal(result.response_hidden_sketch, expected)
+        assert torch.equal(
+            result.response_hidden_norm,
+            expected_hidden.square().sum(dim=-1).sqrt(),
+        )
 
 
 if __name__ == "__main__":

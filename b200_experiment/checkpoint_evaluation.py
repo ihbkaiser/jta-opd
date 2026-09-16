@@ -32,6 +32,7 @@ METHODS = (
     ("cmt", "CMT-OPD", "cmt_opd"),
     ("grpo", "GRPO", "grpo"),
     ("iw", "IW-OPD", "iw"),
+    ("jta", "JTA-OPD", "jta_opd"),
 )
 _CHECKPOINT_PATTERN = re.compile(r"^checkpoint-(\d+)$")
 _STEP_DIRECTORY_PATTERN = re.compile(r"^step-(\d+)$")
@@ -785,6 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmt-output")
     parser.add_argument("--grpo-output")
     parser.add_argument("--iw-output")
+    parser.add_argument("--jta-output")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--num-responses", type=int, default=8)
@@ -840,6 +842,7 @@ def main(argv: list[str] | None = None) -> int:
         "cmt": args.cmt_output,
         "grpo": args.grpo_output,
         "iw": args.iw_output,
+        "jta": args.jta_output,
     }
     missing = [method for method in selected_methods if requested[method] is None]
     if missing:

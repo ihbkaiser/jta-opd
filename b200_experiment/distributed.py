@@ -89,6 +89,13 @@ class DistributedContext:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return float(tensor.item())
 
+    def sum_tensor(self, value: torch.Tensor) -> torch.Tensor:
+        """Return a detached FP-preserving sum without mutating ``value``."""
+        result = value.detach().clone().contiguous()
+        if self.enabled:
+            dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        return result
+
     def mean_float(self, value: float) -> float:
         return self.sum_float(value) / self.world_size
 
@@ -327,6 +334,72 @@ def distributed_ppo_minibatch_partition(
         local_position for owner, local_position in selected if owner == int(rank)
     ]
     return local_indices, len(selected)
+
+
+def distributed_prompt_group_minibatch_partition(
+    local_prompt_counts: tuple[int, ...] | list[int],
+    rank: int,
+    num_responses: int,
+    ppo_mini_batch_size: int,
+    minibatch_index: int,
+) -> tuple[list[int], int]:
+    """Partition a PPO minibatch without splitting a prompt's rollouts.
+
+    Local trajectory rows use the prompt-major contract
+    ``prompt_0/response_0..R-1, prompt_1/response_0..R-1, ...``.  The global
+    order interleaves prompt positions across ranks, then expands each selected
+    prompt into its complete ``R``-row group.  Consequently a JTA prompt budget
+    is consumed by exactly one optimizer step.
+    """
+    counts = tuple(int(value) for value in local_prompt_counts)
+    if not counts or any(value < 0 for value in counts):
+        raise ValueError(
+            "local_prompt_counts must be a non-empty sequence of non-negative integers"
+        )
+    world_size = len(counts)
+    if not 0 <= int(rank) < world_size:
+        raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
+    responses = int(num_responses)
+    if responses <= 0:
+        raise ValueError("num_responses must be positive")
+    ppo_size = int(ppo_mini_batch_size)
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    if ppo_size % responses != 0:
+        raise ValueError(
+            "JTA ppo_mini_batch_size must be divisible by num_responses"
+        )
+    prompts_per_batch = ppo_size // responses
+    if prompts_per_batch < world_size:
+        raise ValueError(
+            "JTA prompts per PPO minibatch must be at least world_size"
+        )
+    index = int(minibatch_index)
+    if index < 0:
+        raise ValueError("minibatch_index must be non-negative")
+    total_prompts = sum(counts)
+    if total_prompts <= 0:
+        raise ValueError("local_prompt_counts must contain at least one real prompt")
+    begin = index * prompts_per_batch
+    if begin >= total_prompts:
+        raise ValueError(
+            f"minibatch_index={index} is outside "
+            f"{math.ceil(total_prompts / prompts_per_batch)} minibatches"
+        )
+    end = min(begin + prompts_per_batch, total_prompts)
+    order: list[tuple[int, int]] = []
+    for local_position in range(max(counts)):
+        for owner, count in enumerate(counts):
+            if local_position < count:
+                order.append((owner, local_position))
+    selected = order[begin:end]
+    local_indices: list[int] = []
+    for owner, local_prompt in selected:
+        if owner == int(rank):
+            local_indices.extend(
+                range(local_prompt * responses, (local_prompt + 1) * responses)
+            )
+    return local_indices, len(selected) * responses
 
 
 def padded_local_indices(

@@ -7,7 +7,7 @@ usage() {
 Usage:
   bash scripts/reeval_method_checkpoints_b200.sh METHOD [RUN_NAME]
 
-METHOD may be: opd, ta-opd (or ta), rac, pgt, cmt, grpo, or iw.
+METHOD may be: opd, ta-opd (or ta), rac, pgt, cmt, grpo, iw, or jta-opd.
 
 RUN_NAME is optional when the corresponding OPD_RUN_NAME, TA_RUN_NAME, RAC_RUN_NAME,
 PGT_RUN_NAME, CMT_RUN_NAME, GRPO_RUN_NAME, or IW_RUN_NAME environment variable is already set. To select an output directory
@@ -56,6 +56,10 @@ case "${METHOD_INPUT,,}" in
   iw|iw-opd|importance-weighted-opd|importance_weighted_opd)
     METHOD="iw"
     if [[ -n "${RUN_NAME_INPUT}" ]]; then export IW_RUN_NAME="${RUN_NAME_INPUT}"; fi
+    ;;
+  jta|jta-opd|jta_opd)
+    METHOD="jta"
+    if [[ -n "${RUN_NAME_INPUT}" ]]; then export JTA_RUN_NAME="${RUN_NAME_INPUT}"; fi
     ;;
   *)
     echo "Unknown method: ${METHOD_INPUT}" >&2

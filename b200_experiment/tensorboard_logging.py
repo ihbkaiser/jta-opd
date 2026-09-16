@@ -114,6 +114,30 @@ IW_TAGS = {
     "iw/weight_max": ("iw_weight_max",),
 }
 
+JTA_TAGS = {
+    "jta/objective_improvement_mean": ("objective_improvement_mean",),
+    "jta/linear_term_mean": ("linear_term_mean",),
+    "jta/quadratic_term_mean": ("quadratic_term_mean",),
+    "jta/fw_gap_mean": ("final_gap_mean",),
+    "jta/fw_iterations_mean": ("fw_iterations_mean",),
+    "jta/fw_converged_fraction": ("fw_converged_fraction",),
+    "jta/kl_mean": ("achieved_kl_mean",),
+    "jta/kl_max": ("achieved_kl_max",),
+    "jta/coefficient_norm_mean": ("coefficient_norm", "mean"),
+    "jta/hidden_state_norm_mean": ("hidden_state_norm", "mean"),
+    "jta/tensorsketch_embedding_norm_mean": (
+        "tensorsketch_embedding_norm",
+        "mean",
+    ),
+    "jta/ess_ratio_mean": ("ess_ratio_mean",),
+    "jta/max_to_mean_weight_ratio_mean": ("max_to_mean_weight_ratio_mean",),
+    "jta/matching_residual_mean": ("matching_residual_mean",),
+    "jta/weight_std": ("w", "std"),
+    "jta/weight_max": ("w", "max"),
+    "jta/effective_token_fraction": ("effective_token_fraction",),
+    "jta/reference_fallback_count": ("reference_fallback_count",),
+}
+
 
 def _selector_value(selector: dict[str, Any], path: tuple[str, ...]) -> float:
     value: Any = selector
@@ -188,6 +212,17 @@ def production_tensorboard_metrics(
                 if all(key in metrics and metrics[key] is not None for key in path)
             }
         )
+    elif method == "jta":
+        if metrics.get("jta_allocation_time") is not None:
+            selected["system/jta_allocation_time"] = float(
+                metrics["jta_allocation_time"]
+            )
+        valid_tokens = max(int(selector.get("valid_tokens", 0)), 1)
+        for tag, path in JTA_TAGS.items():
+            try:
+                selected[tag] = _selector_value(selector, path)
+            except (KeyError, TypeError):
+                continue
     sanity = metrics.get("vllm_logprob_sanity", {})
     if bool(sanity.get("enabled", False)):
         selected["debug/vllm_hf_logprob_mae"] = float(sanity["mean_abs_error"])

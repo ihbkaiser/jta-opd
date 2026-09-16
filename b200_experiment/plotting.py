@@ -30,6 +30,8 @@ _PROGRESS_METHOD_ALIASES = {
     "grpo": "grpo",
     "iw": "iw",
     "iw-opd": "iw",
+    "jta": "jta",
+    "jta-opd": "jta",
 }
 _PROGRESS_METHODS = {
     "opd": {
@@ -73,6 +75,12 @@ _PROGRESS_METHODS = {
         "slug": "iw_opd",
         "color": "tab:cyan",
         "output_argument": "--iw-output",
+    },
+    "jta": {
+        "label": "JTA-OPD",
+        "slug": "jta_opd",
+        "color": "tab:pink",
+        "output_argument": "--jta-output",
     },
 }
 
@@ -872,6 +880,7 @@ def plot_training_progress(
     cmt_output: str | Path | None = None,
     grpo_output: str | Path | None = None,
     iw_output: str | Path | None = None,
+    jta_output: str | Path | None = None,
 ):
     """Plot the configured evaluation metric for any selected methods."""
     results_dir = Path(results_dir).resolve()
@@ -885,6 +894,7 @@ def plot_training_progress(
         "cmt": cmt_output,
         "grpo": grpo_output,
         "iw": iw_output,
+        "jta": jta_output,
     }
     histories = {
         _PROGRESS_METHODS[item]["label"]: _read_eval_history(outputs[item], item)
@@ -1083,6 +1093,7 @@ def plot_results(
     cmt_output: str | Path | None = None,
     grpo_output: str | Path | None = None,
     iw_output: str | Path | None = None,
+    jta_output: str | Path | None = None,
 ):
     results_dir = Path(results_dir).resolve()
     plots_dir = _plot_directory(results_dir, plot_name)
@@ -1168,6 +1179,8 @@ def plot_results(
         training_outputs["grpo"] = grpo_output
     if iw_output is not None:
         training_outputs["iw"] = iw_output
+    if jta_output is not None:
+        training_outputs["jta"] = jta_output
     if opd_output is not None:
         training_outputs = {"opd": opd_output, **training_outputs}
     loss_path = _plot_loss_comparison(plots_dir, training_outputs, smoothing_window)
@@ -1207,6 +1220,11 @@ def plot_results(
         if iw_output is not None
         else None
     )
+    jta_history = (
+        Path(jta_output).resolve() / "eval_history.jsonl"
+        if jta_output is not None
+        else None
+    )
     if ta_history.is_file():
         progress_methods = ["ta"]
         if rac_history is not None and rac_history.is_file():
@@ -1221,6 +1239,8 @@ def plot_results(
             progress_methods.append("grpo")
         if iw_history is not None and iw_history.is_file():
             progress_methods.append("iw")
+        if jta_history is not None and jta_history.is_file():
+            progress_methods.append("jta")
         result.update(
             plot_training_progress(
                 results_dir,
@@ -1234,6 +1254,7 @@ def plot_results(
                 cmt_output=cmt_output,
                 grpo_output=grpo_output,
                 iw_output=iw_output,
+                jta_output=jta_output,
                 methods=progress_methods,
             )
         )

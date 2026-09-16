@@ -20,6 +20,7 @@ from b200_experiment.distributed import (
     batch_layout,
     contiguous_partition,
     distributed_ppo_minibatch_partition,
+    distributed_prompt_group_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
@@ -406,6 +407,90 @@ class DistributedInvariantTests(unittest.TestCase):
             sorted(seen),
             [(rank, position) for rank, count in enumerate(counts) for position in range(count)],
         )
+
+    def test_prompt_group_partition_keeps_all_responses_together(self):
+        for responses in (1, 2, 4):
+            ppo_size = 4 * responses
+            partitions = []
+            for minibatch_index in range(2):
+                per_rank = [
+                    distributed_prompt_group_minibatch_partition(
+                        [4, 4], rank, responses, ppo_size, minibatch_index
+                    )[0]
+                    for rank in range(2)
+                ]
+                partitions.append(per_rank)
+                for rank, rows in enumerate(per_rank):
+                    for begin in range(0, len(rows), responses):
+                        group = rows[begin : begin + responses]
+                        self.assertEqual(group, list(range(group[0], group[0] + responses)))
+
+            seen = [
+                (rank, row)
+                for per_rank in partitions
+                for rank, rows in enumerate(per_rank)
+                for row in rows
+            ]
+            self.assertEqual(
+                sorted(seen),
+                sorted(
+                    (rank, row)
+                    for rank in range(2)
+                    for row in range(4 * responses)
+                ),
+            )
+
+    def test_prompt_group_partition_rejects_invalid_group_size(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            distributed_prompt_group_minibatch_partition([8, 8], 0, 3, 16, 0)
+        with self.assertRaisesRegex(ValueError, "at least world_size"):
+            distributed_prompt_group_minibatch_partition([8, 8], 0, 2, 2, 0)
+
+    def test_sum_tensor_returns_a_detached_clone_in_single_process(self):
+        context = DistributedContext(0, 0, 1, torch.device("cpu"))
+        value = torch.tensor([1.0, 2.0], requires_grad=True)
+        result = context.sum_tensor(value)
+        self.assertTrue(torch.equal(result, value))
+        self.assertFalse(result.requires_grad)
+        self.assertIsNot(result, value)
+
+    def test_jta_train_step_accepts_complete_prompt_groups_for_r2(self):
+        torch.manual_seed(31)
+        model = _TinyCausalLM()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        input_ids = torch.tensor(
+            [
+                [1, 2, 3, 4],
+                [1, 2, 4, 5],
+                [2, 3, 4, 5],
+                [2, 3, 5, 6],
+            ],
+            dtype=torch.long,
+        )
+        rollout = RolloutBatch(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            response_ids=input_ids[:, 2:],
+            valid_mask=torch.ones(4, 2, dtype=torch.bool),
+            rollout_log_probs=torch.zeros(4, 2),
+            prompt_width=2,
+        )
+        reference = _tiny_reference(model, rollout)
+        config = _tiny_config(micro_batch_size_per_gpu=2, ppo_mini_batch_size=4)
+        config["experiment"] = {"method": "jta"}
+        metrics = _opd_train_step(
+            model,
+            optimizer,
+            rollout,
+            torch.ones(4, 2),
+            reference,
+            config,
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+            trajectory_active_mask=torch.ones(4, dtype=torch.bool),
+            prompt_group_size=2,
+        )
+        self.assertEqual(metrics["optimizer_steps"], 1)
 
     def test_optimizer_step_count_is_world_size_invariant(self):
         expected = _optimizer_steps_per_epoch(130, 64, 1, 16)

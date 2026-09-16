@@ -23,6 +23,9 @@ fi
 if [[ -f "${IW_RUN_OUTPUT}/metrics.jsonl" ]]; then
   PLOT_ARGS+=(--iw-output "${IW_RUN_OUTPUT}")
 fi
+if [[ -f "${JTA_RUN_OUTPUT}/metrics.jsonl" ]]; then
+  PLOT_ARGS+=(--jta-output "${JTA_RUN_OUTPUT}")
+fi
 cd "${REPO_DIR}"
 exec "${PYTHON_BIN}" -m b200_experiment.cli plot \
   --results "${RUN_RESULTS_DIR}" \

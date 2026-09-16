@@ -107,6 +107,7 @@ def _default_history_method(name: str, config: dict) -> str:
         "PGT": "pgt",
         "CMT-OPD": "cmt",
         "IW-OPD": "iw",
+        "JTA-OPD": "jta",
     }.get(name, name.lower().replace("-", "_"))
 
 
@@ -276,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--cmt-dir")
     aggregate.add_argument("--grpo-dir")
     aggregate.add_argument("--iw-dir")
+    aggregate.add_argument("--jta-dir")
     aggregate.add_argument("--output", required=True)
 
     plot = commands.add_parser("plot")
@@ -287,6 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--cmt-output")
     plot.add_argument("--grpo-output")
     plot.add_argument("--iw-output")
+    plot.add_argument("--jta-output")
     plot.add_argument("--smoothing-window", type=int, default=10)
     plot.add_argument("--plot-name")
 
@@ -309,6 +312,8 @@ def build_parser() -> argparse.ArgumentParser:
             "grpo",
             "iw",
             "iw-opd",
+            "jta",
+            "jta-opd",
         ),
         help="Legacy single selector: all, both=TA+RAC, or one method",
     )
@@ -316,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--methods",
         nargs="+",
         choices=(
-            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt", "grpo", "iw", "iw-opd"
+            "opd", "pure-opd", "ta", "ta-opd", "rac", "bellman-rac", "pgt", "cmt", "grpo", "iw", "iw-opd", "jta", "jta-opd"
         ),
         help="One or more methods to plot in the requested order",
     )
@@ -327,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     progress_plot.add_argument("--cmt-output")
     progress_plot.add_argument("--grpo-output")
     progress_plot.add_argument("--iw-output")
+    progress_plot.add_argument("--jta-output")
     progress_plot.add_argument("--smoothing-window", type=int, default=10)
     progress_plot.add_argument("--plot-name")
 
@@ -388,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
             model_dirs["GRPO"] = args.grpo_dir
         if args.iw_dir:
             model_dirs["IW-OPD"] = args.iw_dir
+        if args.jta_dir:
+            model_dirs["JTA-OPD"] = args.jta_dir
         result = aggregate_evaluations(
             model_dirs,
             args.output,
@@ -404,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
             cmt_output=args.cmt_output,
             grpo_output=args.grpo_output,
             iw_output=args.iw_output,
+            jta_output=args.jta_output,
         )
     elif args.command == "plot-training-progress":
         result = plot_training_progress(
@@ -419,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
             cmt_output=args.cmt_output,
             grpo_output=args.grpo_output,
             iw_output=args.iw_output,
+            jta_output=args.jta_output,
         )
     elif args.command == "plot-cmt-scores":
         result = plot_cmt_score_distributions(

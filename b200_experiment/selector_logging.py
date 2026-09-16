@@ -8,6 +8,139 @@ from typing import Any
 import torch
 
 
+class JTADebugLogger:
+    """Bounded prompt/token samples for inspecting JTA allocations."""
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        tokenizer,
+        *,
+        enabled: bool = False,
+        interval: int = 50,
+        prompts_per_rank: int = 2,
+        tokens_per_prompt: int = 32,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.root = Path(output_dir) / "jta_debug"
+        self.tokenizer = tokenizer
+        self.enabled = bool(enabled)
+        self.interval = max(1, int(interval))
+        self.prompts_per_rank = max(0, int(prompts_per_rank))
+        self.tokens_per_prompt = max(1, int(tokens_per_prompt))
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        if self.enabled:
+            self.root.mkdir(parents=True, exist_ok=True)
+            if self.rank == 0:
+                (self.root / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "format": "JSONL",
+                            "scope": "bounded JTA prompt samples",
+                            "prompts_per_rank": self.prompts_per_rank,
+                            "tokens_per_prompt": self.tokens_per_prompt,
+                            "distributed_file_pattern": "step-*_rank-*.jsonl",
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+    def should_log(self, step: int, final_step: int) -> bool:
+        return self.enabled and (
+            int(step) == 1
+            or int(step) == int(final_step)
+            or int(step) % self.interval == 0
+        )
+
+    def write(
+        self,
+        *,
+        step: int,
+        final_step: int,
+        dataset_indices: list[int],
+        sample_ids: list[str],
+        response_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+        diagnostics: dict[str, Any],
+        num_responses: int,
+        response_indices: list[int] | None = None,
+        batch_index_offset: int = 0,
+    ) -> int:
+        if not self.should_log(step, final_step) or self.prompts_per_rank <= 0:
+            return 0
+        responses = int(num_responses)
+        if responses <= 0 or response_ids.shape != valid_mask.shape:
+            raise ValueError("JTA debug logger received invalid response layout")
+        if response_ids.shape[0] % responses != 0:
+            raise ValueError("JTA debug rows must be prompt-major")
+        prompt_count = response_ids.shape[0] // responses
+        sampled_prompts = min(prompt_count, self.prompts_per_rank)
+        response_indices = response_indices or [
+            index % responses for index in range(response_ids.shape[0])
+        ]
+        rows: list[dict[str, Any]] = []
+        for prompt in range(sampled_prompts):
+            row_begin, row_end = prompt * responses, (prompt + 1) * responses
+            valid_coordinates = valid_mask[row_begin:row_end].nonzero(as_tuple=False)
+            if valid_coordinates.numel() == 0:
+                continue
+            flat_coordinates = [
+                (int(row), int(position)) for row, position in valid_coordinates.tolist()
+            ]
+            flat_coordinates.sort(
+                key=lambda pair: float(
+                    diagnostics["w"][row_begin + pair[0], pair[1]].detach().item()
+                ),
+                reverse=True,
+            )
+            selected = flat_coordinates[: self.tokens_per_prompt]
+            selected += list(reversed(flat_coordinates[-self.tokens_per_prompt :]))
+            seen: set[tuple[int, int]] = set()
+            for local_row, position in selected:
+                coordinate = (local_row, position)
+                if coordinate in seen:
+                    continue
+                seen.add(coordinate)
+                absolute_row = row_begin + local_row
+                token_id = int(response_ids[absolute_row, position].detach().item())
+                token_text = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                prompt_token_count = int(valid_mask[row_begin:row_end].sum().item())
+                row = {
+                    "training_step": int(step),
+                    "sample_id": sample_ids[absolute_row],
+                    "dataset_index": int(dataset_indices[absolute_row]),
+                    "batch_index": int(batch_index_offset) + absolute_row,
+                    "rollout_index": int(response_indices[absolute_row]),
+                    "response_position": int(position),
+                    "token_id": token_id,
+                    "token_text": str(token_text),
+                    "prior": 1.0 / max(prompt_token_count, 1),
+                }
+                for key in (
+                    "utility",
+                    "redundancy",
+                    "marginal_score",
+                    "w_probability",
+                    "w",
+                    "coefficient_norm",
+                    "hidden_state_norm",
+                    "tensorsketch_embedding_norm",
+                ):
+                    row[key] = float(
+                        diagnostics[key][absolute_row, position].detach().float().item()
+                    )
+                rows.append(row)
+        path = self.root / f"step-{int(step):06d}_rank-{self.rank:05d}.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        return len(rows)
+
+
 class SelectedTokenLogger:
     """Incremental, crash-safe gzip JSONL logger containing selected positions only."""
 
@@ -77,6 +210,17 @@ class SelectedTokenLogger:
                         "learning_value",
                         "s_CMT",
                     ],
+                    "jta": [
+                        "utility",
+                        "redundancy",
+                        "marginal_score",
+                        "embedding_norm",
+                        "coefficient_norm",
+                        "hidden_state_norm",
+                        "tensorsketch_embedding_norm",
+                        "w_probability",
+                        "w",
+                    ],
                 }[method],
             }
             if self.rank == 0:
@@ -137,6 +281,17 @@ class SelectedTokenLogger:
                 "sequential_gain",
                 "learning_value",
                 "s_CMT",
+            ),
+            "jta": (
+                "utility",
+                "redundancy",
+                "marginal_score",
+                "embedding_norm",
+                "coefficient_norm",
+                "hidden_state_norm",
+                "tensorsketch_embedding_norm",
+                "w_probability",
+                "w",
             ),
         }[self.method]
         values = {
@@ -231,6 +386,18 @@ class TokenScoreStatsLogger:
                 "full_log_ratio_mean": (-20.0, 20.0),
                 "full_log_ratio_variance": (0.0, 100.0),
                 "full_common_mass": (0.0, 1.0),
+            }
+        elif method == "jta":
+            self.ranges = {
+                "utility": (-100.0, 100.0),
+                "redundancy": (-100.0, 100.0),
+                "marginal_score": (-100.0, 100.0),
+                "embedding_norm": (0.0, 100.0),
+                "coefficient_norm": (0.0, 100.0),
+                "hidden_state_norm": (0.0, 100.0),
+                "tensorsketch_embedding_norm": (0.0, 100.0),
+                "w_probability": (0.0, 1.0),
+                "w": (0.0, 100.0),
             }
         else:
             raise ValueError(f"Unknown token-score method: {method!r}")

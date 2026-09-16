@@ -136,6 +136,8 @@ def generate_on_policy(
 @dataclass
 class BaseScores:
     response_logits: torch.Tensor | None
+    response_hidden_sketch: torch.Tensor | None
+    response_hidden_norm: torch.Tensor | None
     log_normalizers: torch.Tensor
     scaled_log_normalizers: torch.Tensor
     sampled_log_probs: torch.Tensor
@@ -224,6 +226,9 @@ def _reduce_response_logits(
     top_k: int,
     candidate_ids: torch.Tensor | None,
     temperature: float,
+    response_hidden_states: torch.Tensor | None = None,
+    retain_response_hidden_sketch: bool = False,
+    hidden_sketch_operator: object | None = None,
 ) -> BaseScores:
     """Reduce one compact response-logit micro-batch to the tensors consumers use."""
     normalizer_chunks, scaled_normalizer_chunks, sampled_chunks = [], [], []
@@ -265,10 +270,28 @@ def _reduce_response_logits(
                 chunk.gather(-1, candidate_ids[:, begin:end])
                 - scaled_normalizers.unsqueeze(-1)
             )
+    response_hidden_sketch = None
+    response_hidden_norm = None
+    if retain_response_hidden_sketch:
+        if response_hidden_states is None or hidden_sketch_operator is None:
+            raise ValueError(
+                "retaining hidden sketches requires response hidden states and "
+                "a hidden_sketch_operator"
+            )
+        if response_hidden_states.shape[:2] != response_logits.shape[:2]:
+            raise ValueError("response hidden states must align with response logits")
+        response_hidden_sketch = hidden_sketch_operator.reduce_hidden(
+            response_hidden_states.detach()
+        )
+        response_hidden_norm = response_hidden_states.detach().float().square().sum(
+            dim=-1
+        ).sqrt()
     return BaseScores(
         response_logits=(
             response_logits.detach().clone() if retain_response_logits else None
         ),
+        response_hidden_sketch=response_hidden_sketch,
+        response_hidden_norm=response_hidden_norm,
         log_normalizers=torch.cat(normalizer_chunks, dim=1),
         scaled_log_normalizers=torch.cat(scaled_normalizer_chunks, dim=1),
         sampled_log_probs=torch.cat(sampled_chunks, dim=1),
@@ -316,6 +339,8 @@ def score_original_rollout(
     keep_cache: bool = False,
     score_chunk_steps: int = 128,
     retain_response_logits: bool = True,
+    retain_response_hidden_sketch: bool = False,
+    hidden_sketch_operator: object | None = None,
     top_k: int = 0,
     candidate_ids: torch.Tensor | None = None,
     temperature: float = 1.0,
@@ -351,6 +376,8 @@ def score_original_rollout(
     entropy_batches = []
     top_id_batches, top_log_prob_batches, candidate_log_prob_batches = [], [], []
     response_logit_batches = []
+    hidden_sketch_batches = []
+    hidden_norm_batches = []
     cache = None
     for batch_begin in range(0, batch_size, score_micro_batch):
         indices = order[batch_begin : batch_begin + score_micro_batch]
@@ -371,6 +398,8 @@ def score_original_rollout(
             "use_cache": keep_cache,
             "return_dict": True,
         }
+        if retain_response_hidden_sketch:
+            forward_kwargs["output_hidden_states"] = True
         response_only_logits = input_stop is not None and supports_response_only_logits(
             model
         )
@@ -387,6 +416,26 @@ def score_original_rollout(
         )
         if response_logits_view.shape[1] != local_width:
             raise RuntimeError("Model did not return every requested response logit")
+        response_hidden_view = None
+        if retain_response_hidden_sketch:
+            hidden_states = getattr(output, "hidden_states", None)
+            if hidden_states is None:
+                hidden_states = getattr(output, "last_hidden_state", None)
+            elif isinstance(hidden_states, (tuple, list)):
+                hidden_states = hidden_states[-1]
+            if hidden_states is None:
+                raise RuntimeError(
+                    "Model did not return final hidden states for JTA TensorSketch"
+                )
+            response_hidden_view = (
+                hidden_states[:, -local_width:]
+                if response_only_logits
+                else hidden_states[:, start : start + local_width]
+            )
+            if response_hidden_view.shape[:2] != response_logits_view.shape[:2]:
+                raise RuntimeError(
+                    "Causal hidden-state slice does not align with response logits"
+                )
         local_candidate_ids = (
             candidate_ids.index_select(0, indices)[:, :local_width]
             if candidate_ids is not None
@@ -400,6 +449,9 @@ def score_original_rollout(
             top_k=top_k,
             candidate_ids=local_candidate_ids,
             temperature=temperature,
+            response_hidden_states=response_hidden_view,
+            retain_response_hidden_sketch=retain_response_hidden_sketch,
+            hidden_sketch_operator=hidden_sketch_operator,
         )
         normalizer_batches.append(
             _pad_response_time(local_scores.log_normalizers, width)
@@ -424,6 +476,13 @@ def score_original_rollout(
             response_logit_batches.append(
                 _pad_response_time(local_scores.response_logits, width)
             )
+        if local_scores.response_hidden_sketch is not None:
+            hidden_sketch_batches.append(
+                _pad_response_time(local_scores.response_hidden_sketch, width)
+            )
+            hidden_norm_batches.append(
+                _pad_response_time(local_scores.response_hidden_norm, width)
+            )
         if keep_cache:
             cache = output.past_key_values
         del output, response_logits_view
@@ -437,6 +496,12 @@ def score_original_rollout(
     return BaseScores(
         response_logits=(
             restored(response_logit_batches) if response_logit_batches else None
+        ),
+        response_hidden_sketch=(
+            restored(hidden_sketch_batches) if hidden_sketch_batches else None
+        ),
+        response_hidden_norm=(
+            restored(hidden_norm_batches) if hidden_norm_batches else None
         ),
         log_normalizers=restored(normalizer_batches),
         scaled_log_normalizers=restored(scaled_normalizer_batches),
@@ -622,6 +687,8 @@ def score_student_teacher_rollout(
 
         return BaseScores(
             response_logits=None,
+            response_hidden_sketch=None,
+            response_hidden_norm=None,
             log_normalizers=restored("log_normalizers"),
             scaled_log_normalizers=restored("scaled_log_normalizers"),
             sampled_log_probs=restored("sampled_log_probs"),
