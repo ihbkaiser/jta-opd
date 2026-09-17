@@ -139,6 +139,77 @@ CMT_FULL_VOCAB_DIAGNOSTICS=true RUN_NAME="$CMT_RUN_NAME" \
   bash scripts/train_cmt_b200.sh
 ```
 
+#### CMT diagnostics và hard top-10%
+
+Khi cần kiểm tra vì sao một token được ưu tiên, bật hai logger chẩn đoán độc lập
+với objective. Logger chi tiết ghi gzip JSONL cho mọi token hợp lệ; logger tail chỉ
+ghi union các hàng cực trị trên toàn global batch. Cả hai đều tắt mặc định và không
+tham gia autograd. `marginal_flux` được ghi đúng theo
+`1[teacher_deficit] * (sampled_conditional_log_ratio - conditional_log_ratio_mean)`;
+`D`/`X`/`phi` lần lượt là `sequential_gain`/`successor_excess`/`marginal_flux`.
+FP64 và partial-horizon là kiểm tra trực tiếp cùng recurrence production, không được
+dùng để thay đổi gradient.
+
+Canonical CMT với Gibbs allocator và diagnostics đầy đủ:
+
+```bash
+CMT_ALLOCATION_MODE=gibbs CMT_ALLOCATION_KL=0.5 \
+CMT_DETAILED_LOG_ENABLED=true CMT_TAIL_LOG_ENABLED=true \
+CMT_TAIL_LOG_INTERVAL=1 CMT_TAIL_TOP_K=128 \
+CMT_TAIL_CONTEXT_TOKENS=16 CMT_TAIL_FP64_CHECK=true \
+CMT_PARTIAL_HORIZONS='[16,64,256,1024]' \
+TOKEN_SCORE_INTERVAL=5 TOKEN_SCORE_HISTOGRAM_BINS=256 \
+TOKEN_SCORE_RAW_SAMPLE_SIZE=8192 \
+CUDA_VISIBLE_DEVICES=0,1 RUN_NAME="${CMT_RUN_NAME}_diag" \
+  bash scripts/train_cmt_b200.sh
+```
+
+Hard-select top 10% là một ablation allocator, không gọi Gibbs/KL:
+
+```bash
+CMT_ALLOCATION_MODE=top_fraction CMT_TOP_FRACTION=0.10 \
+CMT_DETAILED_LOG_ENABLED=true CMT_TAIL_LOG_ENABLED=true \
+CMT_TAIL_LOG_INTERVAL=1 CMT_TAIL_TOP_K=128 \
+CUDA_VISIBLE_DEVICES=0,1 RUN_NAME="${CMT_RUN_NAME}_top10" \
+  bash scripts/train_cmt_b200.sh
+```
+
+Với `top_fraction`, code xếp hạng `s_CMT` trên toàn bộ token hợp lệ của global
+distributed batch, chọn chính xác `ceil(0.10*N)` token (tie-break theo thứ tự token
+global), đặt token còn lại về `w=0`, token được chọn về `w=N/K`. Tổng mass bằng `N`
+và vì loss là weighted-token mean nên hướng gradient tương đương binary mask.
+`g`, `g_x`, `g_d` vẫn dùng được với allocator này; canonical CMT nên dùng `g_d`.
+
+Artifact được ghi dưới output của run:
+
+```text
+<method-output>/cmt_diagnostics/manifest.json
+<method-output>/cmt_diagnostics/detailed_step-*_rank-*.jsonl.gz
+<method-output>/cmt_diagnostics/tail_step-*.jsonl.gz
+<method-output>/token_score_stats/step-*.json
+<method-output>/metrics.jsonl
+<method-output>/train_metrics.csv
+<method-output>/tensorboard/
+```
+
+`detailed_*` có identity/context, local Top-K support, common-mass transition,
+`marginal_flux`, successor `R/M/V/X`, identity errors, numerical-cancellation,
+allocation (`w`, `rho`) và detached PPO influence proxy. `tail_*` thêm
+`tail_reasons`, rank global theo `D`, `abs(D)`, `X`, `M`, `|phi|`, `learning_value`,
+`w`, cùng các suffix horizons (`h16`, `h64`, `h256`, `h1024`, `full`). JSON/CSV/TensorBoard chứa quantile tới q99.99,
+histogram log-tail, conditional masks, ESS/entropy và overlap top-0.1% giữa các
+factors. Influence metrics còn báo contribution từ top-weight tokens và ba nhóm
+0.1% theo `D` (top positive, bottom negative, top absolute). `gradient_influence_proxy`
+là `abs(w * token_loss)`, không phải exact per-parameter gradient norm.
+
+Để vẽ phân phối từ các file compact sau khi train:
+
+```bash
+CMT_OUTPUT_DIR="outputs/${CMT_RUN_NAME}/cmt_opd" \
+CMT_SCORE_RUN_NAME="${CMT_RUN_NAME}" \
+  bash scripts/plot_cmt_scores.sh
+```
+
 ### TA-OPD
 
 ```bash

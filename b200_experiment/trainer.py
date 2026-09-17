@@ -109,7 +109,11 @@ from .scoring import (
     score_student_teacher_rollout,
     supports_response_only_logits,
 )
-from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
+from .selector_logging import (
+    CMTDiagnosticsLogger,
+    SelectedTokenLogger,
+    TokenScoreStatsLogger,
+)
 from .selectors import (
     CMTSelector,
     OPDSelector,
@@ -117,6 +121,7 @@ from .selectors import (
     RACSelector,
     TASelector,
     kl_constrained_allocation,
+    top_fraction_allocation,
     top_budget_mask,
 )
 from .selectors.pgt_selector import PGTOutput
@@ -382,8 +387,10 @@ def _globalize_cmt_output(
     valid_mask: torch.Tensor,
     epsilon: float,
     distributed: DistributedContext,
-) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
-    """Solve CMT's empirical KL-constrained allocation on the global batch."""
+    allocation_mode: str = "gibbs",
+    top_fraction: float = 0.10,
+) -> tuple[SelectorOutput, dict[str, Any], int, int]:
+    """Allocate CMT supervision on the globally ordered valid-token batch."""
     keys = (
         "gain",
         "s_PGT",
@@ -391,6 +398,7 @@ def _globalize_cmt_output(
         "support_common_mass",
         "conditional_support_common_mass",
         "sampled_log_ratio",
+        "sampled_cond_r",
         "sampled_conditional_log_ratio",
         "alignment",
         "transition_weight",
@@ -398,6 +406,8 @@ def _globalize_cmt_output(
         "coverage_correction",
         "teacher_deficit",
         "marginal_flux",
+        "flux_product_form",
+        "flux_identity_error",
         "common_mass_derivative",
         "R",
         "M",
@@ -412,7 +422,34 @@ def _globalize_cmt_output(
         "teacher_union_mass",
         "teacher_tail_mass",
         "support_width",
+        "conditional_log_ratio_mean",
+        "sampled_cond_student_prob",
+        "sampled_cond_teacher_prob",
+        "sampled_raw_student_prob",
+        "sampled_raw_teacher_prob",
+        "in_support",
+        "successor_value",
+        "successor_contrast",
+        "baseline_mass_term",
+        "x_difference_form",
+        "x_product_form",
+        "x_difference_identity_error",
+        "x_product_identity_error",
+        "x_cancellation_ratio",
+        "d_product_form",
+        "d_identity_error",
+        "abs_marginal_flux",
+        "abs_sequential_gain",
+        "abs_d_over_gain",
+        "response_clipped",
+        "response_position_fraction",
     )
+    optional_fp64_keys = (
+        "successor_excess_fp64",
+        "x_fp32_fp64_abs_error",
+        "x_fp32_fp64_relative_error",
+    )
+    keys = keys + tuple(key for key in optional_fp64_keys if key in local.diagnostics)
     optional_full_keys = (
         "full_log_ratio_mean",
         "full_log_ratio_variance",
@@ -424,17 +461,62 @@ def _globalize_cmt_output(
     gathered, start, end = _gather_selector_diagnostics(
         local.diagnostics, valid_mask, keys, distributed
     )
-    global_weights, inverse_temperature, achieved_kl = kl_constrained_allocation(
-        gathered["s_CMT"], epsilon
+    allocation_mode = str(allocation_mode).strip().lower()
+    if allocation_mode == "gibbs":
+        global_weights, inverse_temperature, achieved_kl = kl_constrained_allocation(
+            gathered["s_CMT"], epsilon
+        )
+        global_selected = torch.ones_like(global_weights, dtype=torch.bool)
+        # Gibbs has no hard cutoff; ``None`` is serialized as JSON null and
+        # omitted from TensorBoard rather than emitting a non-finite scalar.
+        threshold = None
+    elif allocation_mode == "top_fraction":
+        global_weights, global_selected, threshold = top_fraction_allocation(
+            gathered["s_CMT"], top_fraction
+        )
+        inverse_temperature = 0.0
+        # A hard top-fraction allocator does not solve a KL-constrained
+        # problem.  Use JSON null (rather than NaN) so metrics/CSV/TensorBoard
+        # remain standards-compliant and downstream readers can distinguish
+        # "not applicable" from a measured KL value.
+        achieved_kl = None
+    else:
+        raise ValueError(
+            "selector.cmt_allocation_mode must be 'gibbs' or 'top_fraction', "
+            f"got {allocation_mode!r}"
+        )
+    # JSON/TensorBoard scalar consumers cannot represent +/-inf.  An infinite
+    # inverse temperature is the well-defined limiting Gibbs solution at the
+    # maximum attainable KL; serialize it as null while leaving the computed
+    # weights untouched.
+    inverse_temperature_value = float(inverse_temperature)
+    if not math.isfinite(inverse_temperature_value):
+        inverse_temperature_value = None
+    achieved_kl_value = (
+        None
+        if achieved_kl is None or not math.isfinite(float(achieved_kl))
+        else float(achieved_kl)
     )
     diagnostics = dict(local.diagnostics)
     diagnostics.update(
         w=scatter_valid(global_weights[start:end], valid_mask),
         allocation_kl_epsilon=float(epsilon),
-        allocation_kl_achieved=float(achieved_kl),
-        allocation_inverse_temperature=float(inverse_temperature),
+        allocation_kl_achieved=achieved_kl_value,
+        allocation_inverse_temperature=inverse_temperature_value,
+        allocation_mode=allocation_mode,
+        allocation_top_fraction=float(top_fraction),
+        allocation_threshold=threshold,
+        selected_mask=scatter_valid(
+            global_selected[start:end].to(torch.float32), valid_mask
+        ),
     )
     gathered["w"] = global_weights
+    gathered["selected_mask"] = global_selected
+    gathered["allocation_mode"] = allocation_mode
+    gathered["allocation_top_fraction"] = float(top_fraction)
+    gathered["allocation_threshold"] = threshold
+    gathered["allocation_kl_achieved"] = achieved_kl_value
+    gathered["allocation_inverse_temperature"] = inverse_temperature_value
     return SelectorOutput(diagnostics["w"], diagnostics), gathered, start, end
 
 
@@ -601,8 +683,19 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "student_union_mass", "teacher_union_mass", "teacher_tail_mass", "support_width",
         "support_common_mass", "conditional_support_common_mass",
         "transition_weight", "support_coverage", "coverage_correction",
-        "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
+        "teacher_deficit", "marginal_flux", "flux_product_form",
+        "flux_identity_error", "common_mass_derivative", "H",
         "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+        "sampled_raw_student_prob", "sampled_raw_teacher_prob",
+        "sampled_cond_student_prob", "sampled_cond_teacher_prob",
+        "sampled_log_ratio", "sampled_cond_r", "sampled_conditional_log_ratio",
+        "conditional_log_ratio_mean", "successor_return", "successor_mass",
+        "successor_value", "successor_contrast", "baseline_mass_term",
+        "x_difference_form", "x_product_form", "x_difference_identity_error",
+        "x_product_identity_error", "x_cancellation_ratio", "d_product_form",
+        "d_identity_error", "abs_marginal_flux", "abs_sequential_gain",
+        "abs_d_over_gain", "response_position_fraction", "successor_excess_fp64",
+        "x_fp32_fp64_abs_error", "x_fp32_fp64_relative_error",
     ):
         for statistic, value in selector.get(score, {}).items():
             row[f"{score}_{statistic}"] = value
@@ -612,6 +705,51 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "selection_threshold",
         "effective_token_weight_mass",
         "effective_sample_size",
+        "allocation_mode",
+        "allocation_inverse_temperature",
+        "allocation_kl_epsilon",
+        "allocation_kl_achieved",
+        "allocation_top_fraction",
+        "allocation_threshold",
+        "w_max",
+        "max_token_probability",
+        "top_weight_mass_top1",
+        "top_weight_mass_top10",
+        "top_weight_mass_top100",
+        "top_weight_mass_top0p1",
+        "fraction_w_lt_1e-6",
+        "fraction_w_gt_10",
+        "fraction_w_gt_100",
+        "fraction_w_gt_1000",
+        "normalized_ess",
+        "normalized_weight_entropy",
+        "weighted_loss_count",
+        "weighted_loss_contribution_mean",
+        "weighted_loss_contribution_std",
+        "weighted_loss_abs_mean",
+        "weighted_loss_abs_sum",
+        "weighted_loss_abs_top1_fraction",
+        "weighted_loss_abs_top10_fraction",
+        "weighted_loss_abs_top100_fraction",
+        "weighted_loss_abs_top0p1_fraction",
+        "weighted_loss_top_positive_d_count",
+        "weighted_loss_top_positive_d_contribution_mean",
+        "weighted_loss_top_positive_d_contribution_std",
+        "weighted_loss_top_positive_d_abs_mean",
+        "weighted_loss_top_positive_d_abs_sum",
+        "weighted_loss_top_positive_d_abs_fraction",
+        "weighted_loss_bottom_negative_d_count",
+        "weighted_loss_bottom_negative_d_contribution_mean",
+        "weighted_loss_bottom_negative_d_contribution_std",
+        "weighted_loss_bottom_negative_d_abs_mean",
+        "weighted_loss_bottom_negative_d_abs_sum",
+        "weighted_loss_bottom_negative_d_abs_fraction",
+        "weighted_loss_top_abs_d_count",
+        "weighted_loss_top_abs_d_contribution_mean",
+        "weighted_loss_top_abs_d_contribution_std",
+        "weighted_loss_top_abs_d_abs_mean",
+        "weighted_loss_top_abs_d_abs_sum",
+        "weighted_loss_top_abs_d_abs_fraction",
     ):
         row[key] = selector.get(key)
     common = (
@@ -668,6 +806,51 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "selection_threshold",
         "effective_token_weight_mass",
         "effective_sample_size",
+        "allocation_mode",
+        "allocation_inverse_temperature",
+        "allocation_kl_epsilon",
+        "allocation_kl_achieved",
+        "allocation_top_fraction",
+        "allocation_threshold",
+        "w_max",
+        "max_token_probability",
+        "top_weight_mass_top1",
+        "top_weight_mass_top10",
+        "top_weight_mass_top100",
+        "top_weight_mass_top0p1",
+        "fraction_w_lt_1e-6",
+        "fraction_w_gt_10",
+        "fraction_w_gt_100",
+        "fraction_w_gt_1000",
+        "normalized_ess",
+        "normalized_weight_entropy",
+        "weighted_loss_count",
+        "weighted_loss_contribution_mean",
+        "weighted_loss_contribution_std",
+        "weighted_loss_abs_mean",
+        "weighted_loss_abs_sum",
+        "weighted_loss_abs_top1_fraction",
+        "weighted_loss_abs_top10_fraction",
+        "weighted_loss_abs_top100_fraction",
+        "weighted_loss_abs_top0p1_fraction",
+        "weighted_loss_top_positive_d_count",
+        "weighted_loss_top_positive_d_contribution_mean",
+        "weighted_loss_top_positive_d_contribution_std",
+        "weighted_loss_top_positive_d_abs_mean",
+        "weighted_loss_top_positive_d_abs_sum",
+        "weighted_loss_top_positive_d_abs_fraction",
+        "weighted_loss_bottom_negative_d_count",
+        "weighted_loss_bottom_negative_d_contribution_mean",
+        "weighted_loss_bottom_negative_d_contribution_std",
+        "weighted_loss_bottom_negative_d_abs_mean",
+        "weighted_loss_bottom_negative_d_abs_sum",
+        "weighted_loss_bottom_negative_d_abs_fraction",
+        "weighted_loss_top_abs_d_count",
+        "weighted_loss_top_abs_d_contribution_mean",
+        "weighted_loss_top_abs_d_contribution_std",
+        "weighted_loss_top_abs_d_abs_mean",
+        "weighted_loss_top_abs_d_abs_sum",
+        "weighted_loss_top_abs_d_abs_fraction",
         "ppo_minibatch_trajectory_count",
         "local_ppo_minibatch_trajectory_count",
     )
@@ -679,8 +862,19 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
             "student_union_mass", "teacher_union_mass", "teacher_tail_mass", "support_width",
             "support_common_mass", "conditional_support_common_mass",
             "transition_weight", "support_coverage", "coverage_correction",
-            "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
+            "teacher_deficit", "marginal_flux", "flux_product_form",
+            "flux_identity_error", "common_mass_derivative", "H",
             "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+            "sampled_raw_student_prob", "sampled_raw_teacher_prob",
+            "sampled_cond_student_prob", "sampled_cond_teacher_prob",
+            "sampled_log_ratio", "sampled_cond_r", "sampled_conditional_log_ratio",
+            "conditional_log_ratio_mean", "successor_return", "successor_mass",
+            "successor_value", "successor_contrast", "baseline_mass_term",
+            "x_difference_form", "x_product_form", "x_difference_identity_error",
+            "x_product_identity_error", "x_cancellation_ratio", "d_product_form",
+            "d_identity_error", "abs_marginal_flux", "abs_sequential_gain",
+            "abs_d_over_gain", "response_position_fraction", "successor_excess_fp64",
+            "x_fp32_fp64_abs_error", "x_fp32_fp64_relative_error",
         )
         for statistic in (
             "mean",
@@ -691,7 +885,12 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
             "q25",
             "q50",
             "q75",
+            "q90",
             "q95",
+            "q99",
+            "q99.5",
+            "q99.9",
+            "q99.99",
         )
     )
     _append_csv_row(path, row, common + statistics)
@@ -1489,6 +1688,104 @@ def _global_tensor_stats(
     }
 
 
+def _global_influence_metrics(
+    buffers: dict[str, torch.Tensor],
+    valid_mask: torch.Tensor,
+    distributed: DistributedContext,
+    global_diagnostics: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Summarize detached per-token PPO influence for CMT audit logging.
+
+    The concentration subsets use the highest-weight tokens; the three D
+    influence subsets use a deterministic 0.1% tail of the global
+    ``D`` ordering (positive tail, negative tail, and absolute tail).  This is
+    a fixed diagnostic convention, not a training hyperparameter; it lets the
+    aggregate be compared across runs with different token counts.
+    """
+    contribution = buffers["weighted_loss_contribution"][valid_mask].detach().float()
+    absolute = buffers["abs_weighted_loss_contribution"][valid_mask].detach().float()
+    global_contribution, _, _, _ = distributed.all_gather_variable_1d(contribution)
+    global_absolute, _, _, _ = distributed.all_gather_variable_1d(absolute)
+    if global_contribution.numel() == 0:
+        return {"weighted_loss_count": 0.0}
+    total_abs = global_absolute.sum().clamp_min(1.0e-12)
+    count = int(global_absolute.numel())
+    # Concentration is defined by the allocator's weight rank: report how
+    # much absolute loss contribution comes from the highest-weight tokens.
+    # Stable sorting preserves the global token-order tie breaker.  The
+    # contribution-ranked fallback is useful only for standalone callers that
+    # do not provide selector weights.
+    weights = (global_diagnostics or {}).get("w")
+    if torch.is_tensor(weights) and weights.numel() == count:
+        weight_order = torch.argsort(
+            weights.detach().float().reshape(-1), descending=True, stable=True
+        )
+    else:
+        weight_order = torch.argsort(global_absolute, descending=True, stable=True)
+    ordered = global_absolute.index_select(0, weight_order)
+    result = {
+        "weighted_loss_count": float(count),
+        "weighted_loss_contribution_mean": float(global_contribution.mean()),
+        "weighted_loss_contribution_std": float(
+            global_contribution.std(unbiased=False)
+        ),
+        "weighted_loss_abs_mean": float(global_absolute.mean()),
+        "weighted_loss_abs_sum": float(total_abs),
+        "weighted_loss_abs_top1_fraction": float(ordered[:1].sum() / total_abs),
+        "weighted_loss_abs_top10_fraction": float(ordered[:10].sum() / total_abs),
+        "weighted_loss_abs_top100_fraction": float(ordered[:100].sum() / total_abs),
+        "weighted_loss_abs_top0p1_fraction": float(
+            ordered[: max(1, math.ceil(0.001 * count))].sum() / total_abs
+        ),
+    }
+    if global_diagnostics is None:
+        return result
+    d = global_diagnostics.get("sequential_gain")
+    if not torch.is_tensor(d) or d.numel() != count:
+        return result
+    d = d.detach().float().reshape(-1)
+    tail_count = max(1, math.ceil(0.001 * count))
+
+    def _group_stats(name: str, mask: torch.Tensor) -> None:
+        selected = torch.nonzero(mask, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            result[f"weighted_loss_{name}_count"] = 0.0
+            result[f"weighted_loss_{name}_contribution_mean"] = 0.0
+            result[f"weighted_loss_{name}_contribution_std"] = 0.0
+            result[f"weighted_loss_{name}_abs_mean"] = 0.0
+            result[f"weighted_loss_{name}_abs_sum"] = 0.0
+            result[f"weighted_loss_{name}_abs_fraction"] = 0.0
+            return
+        values = global_contribution.index_select(0, selected)
+        abs_values = global_absolute.index_select(0, selected)
+        result[f"weighted_loss_{name}_count"] = float(selected.numel())
+        result[f"weighted_loss_{name}_contribution_mean"] = float(values.mean())
+        result[f"weighted_loss_{name}_contribution_std"] = float(
+            values.std(unbiased=False)
+        )
+        result[f"weighted_loss_{name}_abs_mean"] = float(abs_values.mean())
+        result[f"weighted_loss_{name}_abs_sum"] = float(abs_values.sum())
+        result[f"weighted_loss_{name}_abs_fraction"] = float(
+            abs_values.sum() / total_abs
+        )
+
+    positive = torch.nonzero(d > 0, as_tuple=False).flatten()
+    positive = positive[torch.argsort(d.index_select(0, positive), descending=True, stable=True)]
+    negative = torch.nonzero(d < 0, as_tuple=False).flatten()
+    negative = negative[torch.argsort(d.index_select(0, negative), descending=False, stable=True)]
+    absolute_order = torch.argsort(d.abs(), descending=True, stable=True)
+    positive_mask = torch.zeros(count, dtype=torch.bool, device=d.device)
+    negative_mask = torch.zeros_like(positive_mask)
+    absolute_mask = torch.zeros_like(positive_mask)
+    positive_mask[positive[:tail_count]] = True
+    negative_mask[negative[:tail_count]] = True
+    absolute_mask[absolute_order[:tail_count]] = True
+    _group_stats("top_positive_d", positive_mask)
+    _group_stats("bottom_negative_d", negative_mask)
+    _group_stats("top_abs_d", absolute_mask)
+    return result
+
+
 def _opd_train_step(
     model,
     optimizer,
@@ -1504,6 +1801,7 @@ def _opd_train_step(
     max_optimizer_steps: int | None = None,
     optimizer_step_start: int = 0,
     on_optimizer_step: Callable[[int, dict[str, float]], None] | None = None,
+    diagnostic_buffers: dict[str, torch.Tensor] | None = None,
 ):
     training = config["training"]
     local_batch_size = rollout.input_ids.shape[0]
@@ -1579,6 +1877,19 @@ def _opd_train_step(
     may_skip_sync = isinstance(model, DistributedDataParallel) or (
         is_fsdp_model(model) and fsdp_no_sync
     )
+    if diagnostic_buffers is not None:
+        expected_shape = objective_valid.shape
+        for name in (
+            "token_loss",
+            "token_advantage",
+            "ppo_ratio",
+            "token_clipped",
+            "weighted_loss_contribution",
+            "abs_weighted_loss_contribution",
+        ):
+            diagnostic_buffers[name] = torch.zeros(
+                expected_shape, dtype=torch.float32, device=objective_valid.device
+            )
     minibatch_metrics: list[dict[str, float]] = []
     for ppo_index in range(offset, min(ppo_count, offset + remaining_limit)):
         # PPO_MINI_BATCH_SIZE is global.  Rank-interleaving the locally owned
@@ -1755,6 +2066,60 @@ def _opd_train_step(
                         )
                         local_ratio_max = max(
                             local_ratio_max, float(ratio_values.max().item())
+                        )
+                    if diagnostic_buffers is not None:
+                        token_ratio = ratio.mean(dim=-1)
+                        token_clipped = clipped.any(dim=-1).float()
+                        token_advantage = chunk_reference.advantages
+                        if token_advantage.ndim == 3:
+                            token_advantage = token_advantage.mean(dim=-1)
+                        elif token_advantage.ndim != 2:
+                            token_advantage = token_advantage.reshape(-1, 1).expand(
+                                -1, local_width
+                            )
+                        token_loss = per_position_loss.detach().float()
+                        token_weights = chunk_weights.detach().float()
+                        # ``chunk_indices`` can contain a repeated filler row
+                        # when rank-local trajectory counts are uneven.  Keep
+                        # diagnostics tied to real rows only; otherwise a
+                        # filler can overwrite a real token's contribution in
+                        # the detached buffer and inflate influence totals.
+                        real_rows = chunk_active.bool()
+                        real_indices = chunk_indices[real_rows]
+                        real_valid = valid_chunk[real_rows]
+                        real_values = {
+                            "token_loss": token_loss[real_rows],
+                            "token_advantage": token_advantage[real_rows].detach().float(),
+                            "ppo_ratio": token_ratio[real_rows].detach().float(),
+                            "token_clipped": token_clipped[real_rows].detach().float(),
+                        }
+                        for name, value in real_values.items():
+                            value = value * real_valid.float()
+                            diagnostic_buffers[name].index_copy_(
+                                0,
+                                real_indices,
+                                torch.nn.functional.pad(
+                                    value,
+                                    (0, expected_shape[1] - value.shape[1]),
+                                ),
+                            )
+                        weighted = token_loss * token_weights * valid_chunk.float()
+                        weighted = weighted[real_rows]
+                        diagnostic_buffers["weighted_loss_contribution"].index_copy_(
+                            0,
+                            real_indices,
+                            torch.nn.functional.pad(
+                                weighted,
+                                (0, expected_shape[1] - weighted.shape[1]),
+                            ),
+                        )
+                        diagnostic_buffers["abs_weighted_loss_contribution"].index_copy_(
+                            0,
+                            real_indices,
+                            torch.nn.functional.pad(
+                                weighted.abs(),
+                                (0, expected_shape[1] - weighted.shape[1]),
+                            ),
                         )
                 # Synchronized DDP/FSDP gradients are rank-averaged. This
                 # factor therefore yields the exact global weighted-token mean
@@ -3026,6 +3391,12 @@ def run_training(
             "global_token_budget": method in {"ta", "pgt"},
             "global_rac_weight_normalization": method == "rac",
             "global_cmt_kl_allocation": method == "cmt",
+            "cmt_allocation_mode": config.get("selector", {}).get(
+                "cmt_allocation_mode", "gibbs"
+            ),
+            "cmt_top_fraction": float(
+                config.get("selector", {}).get("cmt_top_fraction", 0.10)
+            ),
             "uniform_full_response_mask": method == "opd",
             "student_sharding_strategy": ("FULL_SHARD" if strategy == "fsdp" else None),
             "teacher_sharding_strategy": (
@@ -3107,6 +3478,17 @@ def run_training(
         successor_lambda=float(selector_cfg.get("cmt_successor_lambda", 1.0)),
         ablation_arm=str(selector_cfg.get("cmt_ablation_arm", "canonical")),
     )
+    cmt_allocation_mode = str(
+        selector_cfg.get("cmt_allocation_mode", "gibbs")
+    ).strip().lower()
+    if cmt_allocation_mode not in {"gibbs", "top_fraction"}:
+        raise ValueError(
+            "selector.cmt_allocation_mode must be 'gibbs' or 'top_fraction', "
+            f"got {cmt_allocation_mode!r}"
+        )
+    cmt_top_fraction = float(selector_cfg.get("cmt_top_fraction", 0.10))
+    if not 0.0 < cmt_top_fraction <= 1.0:
+        raise ValueError("selector.cmt_top_fraction must satisfy 0 < fraction <= 1")
     batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:
         raise ValueError("Prompt batch size and rollout.num_responses must be positive")
@@ -3132,10 +3514,28 @@ def run_training(
         tokenizer,
         method,
         chunk_steps=int(config.get("logging", {}).get("selector_chunk_steps", 50)),
-        enabled=method in {"ta", "pgt"}
+        enabled=method in {"ta", "pgt", "cmt"}
         and bool(config.get("logging", {}).get("selected_tokens_enabled", True)),
         rank=distributed.rank,
         world_size=distributed.world_size,
+    )
+    cmt_logging = config.get("logging", {})
+    cmt_diagnostic_logger = CMTDiagnosticsLogger(
+        output_dir,
+        tokenizer,
+        rank=distributed.rank,
+        world_size=distributed.world_size,
+        detailed_enabled=method == "cmt"
+        and bool(cmt_logging.get("cmt_detailed_log_enabled", False)),
+        tail_enabled=method == "cmt"
+        and bool(cmt_logging.get("cmt_tail_log_enabled", False)),
+        tail_interval=int(cmt_logging.get("cmt_tail_log_interval", 1)),
+        tail_top_k=int(cmt_logging.get("cmt_tail_top_k", 128)),
+        context_tokens=int(cmt_logging.get("cmt_tail_context_tokens", 16)),
+        fp64_check=bool(cmt_logging.get("cmt_tail_fp64_check", True)),
+        partial_horizons=cmt_logging.get(
+            "cmt_partial_horizons", [16, 64, 256, 1024]
+        ),
     )
     score_stats_logger = TokenScoreStatsLogger(
         output_dir,
@@ -3427,6 +3827,24 @@ def run_training(
                 pgt_raw,
                 rollout.response_ids,
                 valid,
+                fp64_check=bool(
+                    config.get("logging", {}).get("cmt_tail_log_enabled", False)
+                    and config.get("logging", {}).get("cmt_tail_fp64_check", True)
+                ),
+            )
+            # These masks are detached metadata used only for conditional
+            # diagnostics; they never participate in the OPD objective.
+            cmt_response_lengths = valid.long().sum(dim=-1, keepdim=True)
+            cmt_positions = torch.arange(
+                valid.shape[1], device=valid.device, dtype=torch.float32
+            ).unsqueeze(0)
+            cmt_position_fraction = cmt_positions / cmt_response_lengths.clamp_min(1)
+            cmt_response_clipped = cmt_response_lengths.ge(
+                int(config["rollout"].get("max_new_tokens", 0))
+            ).expand_as(valid)
+            cmt_raw.diagnostics.update(
+                response_clipped=cmt_response_clipped.float(),
+                response_position_fraction=cmt_position_fraction.expand_as(valid),
             )
             if student_scores.full_log_ratio_mean is not None:
                 for field in (
@@ -3641,6 +4059,8 @@ def run_training(
                 valid,
                 float(selector_cfg.get("cmt_allocation_kl", 0.5)),
                 distributed,
+                cmt_allocation_mode,
+                cmt_top_fraction,
             )
             primary, global_cmt_diagnostics, primary_start, primary_end = (
                 cmt_globalized
@@ -3755,6 +4175,17 @@ def run_training(
             )
             expected = math.ceil(rho * global_primary_diagnostics[score_key].numel())
             token_allocation = selected
+        elif method == "cmt" and str(
+            global_primary_diagnostics.get("allocation_mode", "gibbs")
+        ) == "top_fraction":
+            global_selected = global_primary_diagnostics["selected_mask"].bool()
+            selected = torch.zeros_like(valid, dtype=torch.bool)
+            selected[valid] = global_selected[primary_start:primary_end]
+            expected = int(global_selected.sum().item())
+            # The allocator returns N/K for selected tokens and zero for all
+            # others.  This preserves mean-one supervision mass while making
+            # the hard-selection semantics explicit.
+            token_allocation = primary.scores
         else:
             selected = valid.clone()
             global_selected = torch.ones_like(
@@ -3794,13 +4225,13 @@ def run_training(
                 diagnostics=primary.diagnostics,
                 batch_index_offset=local_start * num_responses,
             )
-            if method in {"ta", "pgt"}
+            if method in {"ta", "pgt", "cmt"}
             else 0
         )
         global_logged_selected = distributed.sum_int(logged_selected)
         if (
             bool(config.get("logging", {}).get("selected_tokens_enabled", True))
-            and method in {"ta", "pgt"}
+            and method in {"ta", "pgt", "cmt"}
             and global_logged_selected != expected
         ):
             raise AssertionError(
@@ -3868,6 +4299,11 @@ def run_training(
             if distributed.is_main:
                 progress.update(1)
 
+        cmt_diagnostic_buffers: dict[str, torch.Tensor] | None = (
+            {}
+            if cmt_diagnostic_logger.enabled and method == "cmt"
+            else None
+        )
         train_metrics = _opd_train_step(
             training_student,
             optimizer,
@@ -3883,8 +4319,64 @@ def run_training(
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
             on_optimizer_step=after_optimizer_step,
+            diagnostic_buffers=cmt_diagnostic_buffers,
         )
+        if cmt_diagnostic_buffers is not None:
+            cmt_log_diagnostics = dict(primary.diagnostics)
+            cmt_log_diagnostics.update(cmt_diagnostic_buffers)
+
+            def _finite_scalar(value):
+                if value is None:
+                    return None
+                value = float(value)
+                return value if math.isfinite(value) else None
+
+            cmt_allocation_metadata = {
+                "allocation_mode": global_primary_diagnostics.get(
+                    "allocation_mode", "gibbs"
+                ),
+                "allocation_inverse_temperature": _finite_scalar(
+                    global_primary_diagnostics.get("allocation_inverse_temperature")
+                ),
+                "allocation_kl_epsilon": _finite_scalar(
+                    global_primary_diagnostics.get("allocation_kl_epsilon")
+                ),
+                "allocation_kl_achieved": _finite_scalar(
+                    global_primary_diagnostics.get("allocation_kl_achieved")
+                ),
+                "allocation_top_fraction": _finite_scalar(
+                    global_primary_diagnostics.get("allocation_top_fraction")
+                ),
+                "allocation_threshold": _finite_scalar(
+                    global_primary_diagnostics.get("allocation_threshold")
+                ),
+            }
+            cmt_diagnostic_logger.write(
+                step=rollout_last_optimizer_step,
+                response_ids=rollout.response_ids,
+                valid_mask=valid,
+                dataset_indices=indices,
+                sample_ids=sample_ids,
+                response_indices=response_indices,
+                diagnostics=cmt_log_diagnostics,
+                batch_index_offset=local_start * num_responses,
+                max_new_tokens=int(config["rollout"].get("max_new_tokens", 0)),
+                distributed=distributed,
+                global_diagnostics=global_primary_diagnostics,
+                global_token_start=primary_start,
+                allocation_metadata=cmt_allocation_metadata,
+            )
         optimizer_steps_completed = int(train_metrics["optimizer_steps"])
+        cmt_influence_metrics = (
+            _global_influence_metrics(
+                cmt_diagnostic_buffers,
+                valid,
+                distributed,
+                global_primary_diagnostics,
+            )
+            if cmt_diagnostic_buffers is not None
+            else {}
+        )
         optimizer_step += optimizer_steps_completed
         step = optimizer_step
         checkpoint = checkpoints_by_step.get(step)
@@ -4003,7 +4495,12 @@ def run_training(
                 "ta": "hard_global_top_rho",
                 "rac": "bellman_soft_all_valid_response_tokens",
                 "pgt": "hard_global_top_rho_projected_gradient_gain",
-                "cmt": "kl_constrained_global_coupled_marginal_teachability",
+                "cmt": (
+                    "top_fraction_global_coupled_marginal_teachability"
+                    if str(selector_cfg.get("cmt_allocation_mode", "gibbs"))
+                    == "top_fraction"
+                    else "kl_constrained_global_coupled_marginal_teachability"
+                ),
                 "iw": "official_prefix_remaining_discrepancy_advantage_weight",
             }[method],
             "objective_normalization": "global_weighted_token_mean",
@@ -4157,6 +4654,10 @@ def run_training(
             ),
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
+            "cmt_actual_influence": cmt_influence_metrics
+            if cmt_influence_metrics
+            else None,
+            **cmt_influence_metrics,
         }
         # The rollout server is already sleeping; release tensors before a
         # possible periodic-evaluation subprocess reserves its KV cache.

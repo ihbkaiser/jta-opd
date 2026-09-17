@@ -86,7 +86,6 @@ CMT_TAGS = {
     "cmt/support_coverage_mean": ("support_coverage", "mean"),
     "cmt/teacher_deficit_rate": ("teacher_deficit", "mean"),
     "cmt/successor_return_mean": ("R", "mean"),
-    "cmt/successor_excess_mean": ("successor_excess", "mean"),
     "cmt/local_excess_mean": ("H", "mean"),
     "cmt/sequential_gain_mean": ("sequential_gain", "mean"),
     "cmt/learning_value_mean": ("learning_value", "mean"),
@@ -94,6 +93,36 @@ CMT_TAGS = {
     "cmt/weight_mean": ("w", "mean"),
     "cmt/weight_std": ("w", "std"),
     "cmt/weight_max": ("w", "max"),
+    "cmt/marginal_flux_mean": ("marginal_flux", "mean"),
+    "cmt/marginal_flux_std": ("marginal_flux", "std"),
+    "cmt/flux_product_form_mean": ("flux_product_form", "mean"),
+    "cmt/flux_identity_error_mean": ("flux_identity_error", "mean"),
+    "cmt/successor_mass_mean": ("successor_mass", "mean"),
+    "cmt/successor_value_mean": ("successor_value", "mean"),
+    "cmt/successor_contrast_mean": ("successor_contrast", "mean"),
+    "cmt/successor_excess_mean": ("successor_excess", "mean"),
+    "cmt/successor_excess_std": ("successor_excess", "std"),
+    "cmt/x_cancellation_ratio_q99": ("x_cancellation_ratio", "q99"),
+    "cmt/sequential_gain_abs_mean": ("abs_sequential_gain", "mean"),
+    "cmt/selected_count": ("selected_tokens",),
+    "cmt/valid_token_count": ("valid_tokens",),
+    "cmt/allocation_kl_epsilon": ("allocation_kl_epsilon",),
+    "cmt/allocation_kl_achieved": ("allocation_kl_achieved",),
+    "cmt/allocation_inverse_temperature": ("allocation_inverse_temperature",),
+    "cmt/allocation_top_fraction": ("allocation_top_fraction",),
+    "cmt/allocation_threshold": ("allocation_threshold",),
+    "cmt/weight_max_scalar": ("w_max",),
+    "cmt/max_token_probability": ("max_token_probability",),
+    "cmt/top_weight_mass_top1": ("top_weight_mass_top1",),
+    "cmt/top_weight_mass_top10": ("top_weight_mass_top10",),
+    "cmt/top_weight_mass_top100": ("top_weight_mass_top100",),
+    "cmt/top_weight_mass_top0p1": ("top_weight_mass_top0p1",),
+    "cmt/fraction_w_lt_1e-6": ("fraction_w_lt_1e-6",),
+    "cmt/fraction_w_gt_10": ("fraction_w_gt_10",),
+    "cmt/fraction_w_gt_100": ("fraction_w_gt_100",),
+    "cmt/fraction_w_gt_1000": ("fraction_w_gt_1000",),
+    "cmt/normalized_ess": ("normalized_ess",),
+    "cmt/normalized_weight_entropy": ("normalized_weight_entropy",),
 }
 
 GRPO_TAGS = {
@@ -120,6 +149,15 @@ def _selector_value(selector: dict[str, Any], path: tuple[str, ...]) -> float:
     for key in path:
         value = value[key]
     return float(value)
+
+
+def _selector_has(selector: dict[str, Any], path: tuple[str, ...]) -> bool:
+    value: Any = selector
+    for key in path:
+        if not isinstance(value, dict) or key not in value:
+            return False
+        value = value[key]
+    return value is not None
 
 
 def production_tensorboard_metrics(
@@ -170,7 +208,24 @@ def production_tensorboard_metrics(
             {
                 tag: _selector_value(selector, path)
                 for tag, path in CMT_TAGS.items()
+                if _selector_has(selector, path)
             }
+        )
+        for tag, field in {
+            "cmt/influence_weighted_loss_mean": "weighted_loss_contribution_mean",
+            "cmt/influence_weighted_loss_abs_mean": "weighted_loss_abs_mean",
+            "cmt/influence_abs_top1_fraction": "weighted_loss_abs_top1_fraction",
+            "cmt/influence_abs_top10_fraction": "weighted_loss_abs_top10_fraction",
+            "cmt/influence_abs_top100_fraction": "weighted_loss_abs_top100_fraction",
+            "cmt/influence_abs_top0p1_fraction": "weighted_loss_abs_top0p1_fraction",
+            "cmt/influence_top_positive_d_abs_fraction": "weighted_loss_top_positive_d_abs_fraction",
+            "cmt/influence_bottom_negative_d_abs_fraction": "weighted_loss_bottom_negative_d_abs_fraction",
+            "cmt/influence_top_abs_d_abs_fraction": "weighted_loss_top_abs_d_abs_fraction",
+        }.items():
+            if field in metrics and metrics[field] is not None:
+                selected[tag] = float(metrics[field])
+        selected["cmt/allocation_mode_top_fraction"] = float(
+            selector.get("allocation_mode") == "top_fraction"
         )
     elif method == "grpo":
         selected.update(

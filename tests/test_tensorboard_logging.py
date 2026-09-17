@@ -43,12 +43,41 @@ def _cmt_metrics() -> dict:
         support_coverage={"mean": 0.9},
         teacher_deficit={"mean": 0.2},
         R={"mean": 1.4},
-        successor_excess={"mean": 0.15},
+        successor_excess={"mean": 0.15, "std": 0.05},
         H={"mean": 0.2},
         sequential_gain={"mean": 0.3},
         learning_value={"mean": 0.7, "std": 0.1},
         w={"mean": 1.0, "std": 0.2, "max": 2.0},
         gain={"mean": 0.4},
+        marginal_flux={"mean": 0.1, "std": 0.2},
+        flux_product_form={"mean": 0.1},
+        flux_identity_error={"mean": 0.0},
+        successor_mass={"mean": 3.0},
+        successor_value={"mean": 0.8},
+        successor_contrast={"mean": 0.1},
+        x_cancellation_ratio={"q99": 4.0},
+        abs_sequential_gain={"mean": 0.3},
+        allocation_mode="gibbs",
+        allocation_kl_epsilon=0.5,
+        allocation_kl_achieved=0.5,
+        allocation_inverse_temperature=2.0,
+        allocation_top_fraction=0.1,
+        allocation_threshold=0.0,
+        w_max=2.0,
+        max_token_probability=0.1,
+        top_weight_mass_top1=0.2,
+        top_weight_mass_top10=0.5,
+        top_weight_mass_top100=0.9,
+        top_weight_mass_top0p1=0.9,
+        normalized_ess=0.8,
+        normalized_weight_entropy=0.95,
+        selected_tokens=3,
+        **{
+            "fraction_w_lt_1e-6": 0.0,
+            "fraction_w_gt_10": 0.0,
+            "fraction_w_gt_100": 0.0,
+            "fraction_w_gt_1000": 0.0,
+        },
     )
     return values
 
@@ -91,9 +120,22 @@ class TensorBoardMetricTests(unittest.TestCase):
         selected = production_tensorboard_metrics(_cmt_metrics(), "cmt")
         self.assertEqual(
             set(selected),
-            set(BASE_TAGS) | set(CMT_TAGS) | {"cmt/effective_token_fraction"},
+            set(BASE_TAGS)
+            | set(CMT_TAGS)
+            | {"cmt/effective_token_fraction", "cmt/allocation_mode_top_fraction"},
         )
         self.assertEqual(selected["cmt/common_mass_mean"], 0.8)
+
+    def test_top_fraction_does_not_emit_nonfinite_kl_scalar(self):
+        metrics = _cmt_metrics()
+        metrics["selector"].update(
+            allocation_mode="top_fraction",
+            allocation_kl_achieved=None,
+            allocation_inverse_temperature=0.0,
+        )
+        selected = production_tensorboard_metrics(metrics, "cmt")
+        self.assertNotIn("cmt/allocation_kl_achieved", selected)
+        self.assertEqual(selected["cmt/allocation_mode_top_fraction"], 1.0)
 
     def test_tensorboard_writer_receives_expanded_metrics(self):
         logger = object.__new__(TensorBoardLogger)
