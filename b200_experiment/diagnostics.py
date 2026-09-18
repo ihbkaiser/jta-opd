@@ -72,7 +72,6 @@ def tensor_summary(
         torch.tensor(
             [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 0.995, 0.999, 0.9999],
             device=finite.device,
-            dtype=finite.dtype,
         ),
     )
     return {
