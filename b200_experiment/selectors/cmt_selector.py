@@ -66,38 +66,6 @@ def kl_constrained_allocation(
     return probabilities * count, inverse_temperature, achieved_kl
 
 
-@torch.no_grad()
-def top_fraction_allocation(
-    values: torch.Tensor,
-    fraction: float,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Deterministic global hard allocation with mean-one selected weights.
-
-    ``values`` is already the globally gathered valid-token score vector.  A
-    stable descending sort (with original global token order as the tie
-    breaker) makes the selected set invariant to rank count.  The returned
-    weights have total mass ``N``: selected tokens receive ``N/K`` and all
-    other tokens receive zero, which is the mean-one counterpart of a binary
-    mask under weighted-token-mean normalization.
-    """
-    if values.ndim != 1 or values.numel() == 0:
-        raise ValueError("Top-fraction allocation expects a non-empty vector")
-    fraction = float(fraction)
-    if not 0.0 < fraction <= 1.0:
-        raise ValueError("cmt_top_fraction must satisfy 0 < fraction <= 1")
-    scores = values.detach().float()
-    if not torch.isfinite(scores).all():
-        raise FloatingPointError("Top-fraction allocation received non-finite values")
-    count = int(scores.numel())
-    selected_count = max(1, math.ceil(fraction * count))
-    order = torch.argsort(scores, descending=True, stable=True)
-    selected = torch.zeros_like(scores, dtype=torch.bool)
-    selected[order[:selected_count]] = True
-    weights = selected.to(torch.float32) * (float(count) / selected_count)
-    threshold = float(scores[order[selected_count - 1]].item())
-    return weights, selected, threshold
-
-
 class CMTSelector:
     """Support-matched, local-excess Coupled Marginal Teachability.
 
@@ -167,8 +135,6 @@ class CMTSelector:
         pgt_support: PGTOutput,
         sampled_token_ids: torch.Tensor,
         valid_mask: torch.Tensor,
-        *,
-        fp64_check: bool = False,
     ) -> PGTOutput:
         """Compute CMT scores from local conditional and raw transition quantities.
 
@@ -251,23 +217,6 @@ class CMTSelector:
             sampled_cond_r - mean_r,
             torch.zeros_like(sampled_cond_r),
         )
-        # Keep the indicator/product form beside the production expression.
-        # This is an exact algebraic identity (and not a second score): it
-        # makes it possible for row-level diagnostics to verify that the
-        # marginal flux really is
-        # 1[teacher_deficit] * (sampled_cond_r - E_pU[r]).
-        flux_product_form = teacher_deficit.to(sampled_cond_r.dtype) * (
-            sampled_cond_r - mean_r
-        )
-        flux_identity_error = (marginal_flux - flux_product_form).abs()
-        sampled_cond_student_prob = torch.where(
-            in_support, sampled_cond_student.exp(), torch.zeros_like(sampled_cond_student)
-        )
-        sampled_cond_teacher_prob = torch.where(
-            in_support, sampled_cond_teacher.exp(), torch.zeros_like(sampled_cond_teacher)
-        )
-        sampled_raw_student_prob = sampled_cond_student_prob * student_mass
-        sampled_raw_teacher_prob = sampled_cond_teacher_prob * teacher_mass
 
         # This is the part that can be Rao-Blackwellized with no successor
         # evaluations.  The action-conditioned future term cannot be summed
@@ -309,103 +258,13 @@ class CMTSelector:
                 masses[:, 1:],
                 torch.zeros_like(masses[:, 1:]),
             )
-        # Keep every successor diagnostic on the same valid-token domain as
-        # the production score.  This also handles non-contiguous masks
-        # defensively: an invalid/padding position cannot inherit a later
-        # successor through the shifted view.
-        successor_return = torch.where(
-            valid, successor_return, torch.zeros_like(successor_return)
-        )
-        successor_mass = torch.where(
-            valid, successor_mass, torch.zeros_like(successor_mass)
-        )
         successor_excess = successor_return - g * successor_mass
-        successor_value = torch.where(
-            successor_mass > tiny,
-            successor_return / successor_mass.clamp_min(tiny),
-            torch.zeros_like(successor_return),
-        )
-        successor_contrast = torch.where(
-            successor_mass > tiny,
-            successor_value - g,
-            torch.zeros_like(successor_value),
-        )
-        baseline_mass_term = g * successor_mass
-        x_difference_form = successor_return - baseline_mass_term
-        x_product_form = successor_mass * successor_contrast
-        x_difference_identity_error = (
-            successor_excess - x_difference_form
-        ).abs()
-        x_product_identity_error = (successor_excess - x_product_form).abs()
-        # Keep this audit quantity in FP64: when X is numerically tiny, the
-        # ratio can legitimately exceed FP32 even though R and g*M are finite.
-        # The denominator uses the same FP32 machine tiny as the production
-        # epsilon, promoted to FP64, rather than clipping the diagnostic.
-        x_cancellation_ratio = (
-            successor_return.to(torch.float64).abs()
-            + baseline_mass_term.to(torch.float64).abs()
-        ) / successor_excess.to(torch.float64).abs().add(float(tiny))
         sequential_gain = (
             self.successor_lambda
             * self.gamma
             * marginal_flux
             * successor_excess
         )
-        d_product_form = self.gamma * marginal_flux * successor_excess
-        d_identity_error = (
-            sequential_gain - d_product_form
-        ).abs()
-
-        # The optional FP64 branch is an audit of the same finite-horizon
-        # production recurrence.  It is deliberately detached and only
-        # enabled for tail diagnostics; the canonical score never depends on
-        # this recomputation.
-        successor_excess_fp64 = None
-        x_fp32_fp64_abs_error = None
-        x_fp32_fp64_relative_error = None
-        if fp64_check:
-            g64 = g.to(torch.float64)
-            transition64 = transition_weight.to(torch.float64)
-            valid64 = valid.bool()
-            returns64 = torch.where(valid64, g64, torch.zeros_like(g64))
-            masses64 = valid64.to(torch.float64)
-            coeff64 = torch.where(
-                valid64,
-                float(self.gamma) * transition64,
-                torch.zeros_like(transition64),
-            )
-            offset = 1
-            while offset < returns64.shape[1]:
-                left = coeff64[:, :-offset]
-                next_returns = returns64.clone()
-                next_masses = masses64.clone()
-                next_coeff = coeff64.clone()
-                next_returns[:, :-offset] = (
-                    returns64[:, :-offset] + left * returns64[:, offset:]
-                )
-                next_masses[:, :-offset] = (
-                    masses64[:, :-offset] + left * masses64[:, offset:]
-                )
-                next_coeff[:, :-offset] = left * coeff64[:, offset:]
-                returns64, masses64, coeff64 = next_returns, next_masses, next_coeff
-                offset *= 2
-            excess64 = returns64 - g64 * masses64
-            successor_excess_fp64 = torch.zeros_like(excess64)
-            if excess64.shape[1] > 1:
-                successor_excess_fp64[:, :-1] = torch.where(
-                    valid64[:, 1:],
-                    returns64[:, 1:] - g64[:, :-1] * masses64[:, 1:],
-                    torch.zeros_like(returns64[:, 1:]),
-                )
-            successor_excess_fp64 = torch.where(
-                valid64, successor_excess_fp64, torch.zeros_like(successor_excess_fp64)
-            )
-            x_fp32_fp64_abs_error = (
-                successor_excess.to(torch.float64) - successor_excess_fp64
-            ).abs().to(torch.float32)
-            x_fp32_fp64_relative_error = x_fp32_fp64_abs_error / (
-                successor_excess_fp64.abs().to(torch.float32).add(tiny)
-            )
         canonical_learning_value = torch.where(
             valid, g + sequential_gain, torch.zeros_like(g)
         )
@@ -440,12 +299,6 @@ class CMTSelector:
             sampled_log_ratio=torch.where(
                 in_support, sampled_r, torch.zeros_like(sampled_r)
             ),
-            # Short algebraic alias used in the derivation and diagnostics;
-            # ``sampled_conditional_log_ratio`` remains the serialized public
-            # field for backward compatibility.
-            sampled_cond_r=torch.where(
-                in_support, sampled_cond_r, torch.zeros_like(sampled_cond_r)
-            ),
             sampled_conditional_log_ratio=torch.where(
                 in_support, sampled_cond_r, torch.zeros_like(sampled_cond_r)
             ),
@@ -465,46 +318,17 @@ class CMTSelector:
             ),
             teacher_deficit=teacher_deficit.float(),
             marginal_flux=marginal_flux,
-            flux_product_form=flux_product_form,
-            flux_identity_error=flux_identity_error,
-            conditional_log_ratio_mean=mean_r,
-            sampled_cond_student_prob=sampled_cond_student_prob,
-            sampled_cond_teacher_prob=sampled_cond_teacher_prob,
-            sampled_raw_student_prob=sampled_raw_student_prob,
-            sampled_raw_teacher_prob=sampled_raw_teacher_prob,
-            in_support=in_support.float(),
-            support_width=pgt_support.diagnostics["support_width"].detach().float(),
             common_mass_derivative=common_mass_derivative,
             R=cumulative_return,
             M=masses,
             V=cumulative_value,
             H=local_excess,
             successor_excess=successor_excess,
-            successor_value=successor_value,
-            successor_contrast=successor_contrast,
-            baseline_mass_term=baseline_mass_term,
-            x_difference_form=x_difference_form,
-            x_product_form=x_product_form,
-            x_difference_identity_error=x_difference_identity_error,
-            x_product_identity_error=x_product_identity_error,
-            x_cancellation_ratio=x_cancellation_ratio,
             # Compatibility alias retained for older selector JSON readers;
             # this is no longer raw successor R, but the baseline-subtracted
             # successor excess used by the production derivative.
             successor_R=successor_excess,
             sequential_gain=sequential_gain,
-            # Short symbolic aliases used by the derivation and downstream
-            # diagnostics.  They are detached views of the canonical fields,
-            # not alternate scores.
-            D=sequential_gain,
-            X=successor_excess,
-            phi=marginal_flux,
-            d_product_form=d_product_form,
-            d_identity_error=d_identity_error,
-            abs_marginal_flux=marginal_flux.abs(),
-            abs_sequential_gain=sequential_gain.abs(),
-            abs_d_over_gain=sequential_gain.abs()
-            / g.add(torch.finfo(torch.float32).eps),
             learning_value=learning_value,
             s_CMT=learning_value,
             score_definition=score_definition,
@@ -516,19 +340,6 @@ class CMTSelector:
             gamma=self.gamma,
             successor_lambda=self.successor_lambda,
         )
-        if successor_excess_fp64 is not None:
-            diagnostics.update(
-                successor_excess_fp64=successor_excess_fp64,
-                x_fp32_fp64_abs_error=x_fp32_fp64_abs_error,
-                x_fp32_fp64_relative_error=x_fp32_fp64_relative_error,
-            )
-        # PGT is normally executed under ``inference_mode``; detach copied
-        # diagnostics as well so CMT remains safe for standalone callers that
-        # provide a grad-enabled PGTOutput in a unit test or diagnostic tool.
-        diagnostics = {
-            key: value.detach() if torch.is_tensor(value) else value
-            for key, value in diagnostics.items()
-        }
         for value in (
             g,
             mean_r,
@@ -547,10 +358,6 @@ class CMTSelector:
             successor_mass,
             successor_excess,
             sequential_gain,
-            flux_product_form,
-            flux_identity_error,
-            d_product_form,
-            d_identity_error,
             learning_value,
         ):
             if value.requires_grad or value.grad_fn is not None:

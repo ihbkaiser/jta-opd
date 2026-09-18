@@ -3,7 +3,6 @@ import torch
 from b200_experiment.selectors.cmt_selector import (
     CMTSelector,
     kl_constrained_allocation,
-    top_fraction_allocation,
 )
 from b200_experiment.selectors.pgt_selector import PGTOutput
 
@@ -69,9 +68,6 @@ def test_padding_is_a_hard_boundary_for_local_excess_value():
     assert torch.all(result.diagnostics["H"][~valid] == 0)
     assert torch.all(result.scores[~valid] == 0)
     assert torch.allclose(result.scores[valid], torch.ones(2))
-    for name, value in result.diagnostics.items():
-        if torch.is_tensor(value):
-            assert torch.isfinite(value).all(), name
 
 
 def test_constant_gain_is_length_neutral_even_when_coupling_survival_is_below_one():
@@ -206,41 +202,6 @@ def test_cmt_recurrence_uses_local_baseline_excess_opportunity():
     # excess of the current state's own local value.
     assert torch.allclose(result.diagnostics["H"], torch.tensor([[3.0, 1.0, 0.0]]))
     assert torch.allclose(result.scores, gain)
-
-
-def test_marginal_flux_product_identity_is_logged_exactly():
-    p = torch.log(torch.tensor([[[0.25, 0.75], [0.5, 0.5]]]))
-    q = torch.log(torch.tensor([[[0.75, 0.25], [0.5, 0.5]]]))
-    output = _support(p, q, gain=torch.ones(1, 2))
-    result = CMTSelector().compute_scores(
-        output,
-        torch.tensor([[0, 1]]),
-        torch.ones(1, 2, dtype=torch.bool),
-    )
-    diagnostics = result.diagnostics
-    expected = diagnostics["teacher_deficit"] * (
-        diagnostics["sampled_conditional_log_ratio"]
-        - diagnostics["conditional_log_ratio_mean"]
-    )
-    assert torch.equal(diagnostics["flux_product_form"], expected)
-    assert torch.allclose(diagnostics["marginal_flux"], expected)
-    assert torch.all(diagnostics["flux_identity_error"] == 0)
-
-
-def test_d_identity_error_exposes_non_unit_successor_lambda():
-    p = torch.log(torch.tensor([[[0.5, 0.5], [0.5, 0.5]]]))
-    q = torch.log(torch.tensor([[[0.9, 0.1], [0.5, 0.5]]]))
-    output = _support(p, q, gain=torch.ones(1, 2))
-    result = CMTSelector(successor_lambda=2.0).compute_scores(
-        output,
-        torch.tensor([[0, 0]]),
-        torch.ones(1, 2, dtype=torch.bool),
-    )
-    expected = (
-        result.diagnostics["sequential_gain"]
-        - result.diagnostics["d_product_form"]
-    ).abs()
-    assert torch.allclose(result.diagnostics["d_identity_error"], expected)
 
 
 def test_directional_formula_matches_finite_difference_on_support():
@@ -420,69 +381,3 @@ def test_zero_kl_budget_is_uniform():
     assert torch.equal(weights, torch.ones(3))
     assert inverse_temperature == 0.0
     assert achieved == 0.0
-
-
-def test_top_fraction_allocation_selects_exact_global_count_with_mean_one_weights():
-    values = torch.tensor([1.0, 3.0, 2.0, 3.0, -1.0, 0.0])
-    weights, selected, threshold = top_fraction_allocation(values, 0.5)
-    # Stable tie breaking preserves the first occurrence of the equal score.
-    assert selected.tolist() == [False, True, True, True, False, False]
-    assert torch.allclose(weights[selected], torch.full((3,), 2.0 / 1.0))
-    assert torch.allclose(weights.sum(), torch.tensor(6.0))
-    assert threshold == 2.0
-
-
-def test_top_fraction_allocation_validates_fraction():
-    values = torch.ones(4)
-    for fraction in (0.0, -0.1, 1.1):
-        try:
-            top_fraction_allocation(values, fraction)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("invalid top fraction was accepted")
-
-
-def test_top_fraction_mean_one_weights_match_binary_normalized_loss():
-    values = torch.tensor([0.1, 0.8, 0.4, 0.7, -0.2])
-    losses = torch.tensor([2.0, 3.0, -1.0, 4.0, 9.0])
-    weights, selected, _ = top_fraction_allocation(values, 0.4)
-    weighted_mean = (weights * losses).sum() / weights.sum()
-    binary_mean = losses[selected].mean()
-    assert torch.allclose(weighted_mean, binary_mean)
-    assert torch.all(weights[~selected] == 0)
-
-
-def test_cmt_diagnostics_expose_marginal_flux_and_identity_fields():
-    p = torch.log(torch.tensor([[[0.5, 0.5], [0.5, 0.5]]]))
-    q = torch.log(torch.tensor([[[0.8, 0.2], [0.2, 0.8]]]))
-    output = _support(p, q, gain=torch.tensor([[0.2, 0.4]]))
-    result = CMTSelector().compute_scores(
-        output,
-        torch.tensor([[0, 1]]),
-        torch.ones(1, 2, dtype=torch.bool),
-        fp64_check=True,
-    )
-    diagnostics = result.diagnostics
-    expected_flux = torch.where(
-        diagnostics["teacher_deficit"].bool(),
-        diagnostics["sampled_conditional_log_ratio"]
-        - diagnostics["conditional_log_ratio_mean"],
-        torch.zeros_like(diagnostics["marginal_flux"]),
-    )
-    assert torch.allclose(diagnostics["marginal_flux"], expected_flux)
-    assert torch.allclose(
-        diagnostics["successor_excess"], diagnostics["x_difference_form"]
-    )
-    assert torch.allclose(
-        diagnostics["successor_excess"], diagnostics["x_product_form"], atol=1e-6
-    )
-    assert torch.isfinite(diagnostics["successor_excess_fp64"]).all()
-    assert torch.isfinite(diagnostics["x_cancellation_ratio"]).all()
-    assert torch.allclose(
-        diagnostics["successor_excess"],
-        diagnostics["successor_excess_fp64"],
-        atol=2e-6,
-        rtol=2e-6,
-    )
-    assert torch.all(diagnostics["flux_identity_error"] == 0)

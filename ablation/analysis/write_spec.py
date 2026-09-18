@@ -25,8 +25,6 @@ def main() -> int:
         "rollout_seed": int(os.environ.get("ROLLOUT_SEED", "42")),
         "top_k": int(os.environ.get("TOP_K", "16")),
         "cmt_allocation_kl": float(os.environ.get("CMT_ALLOCATION_KL", "0.5")),
-        "cmt_allocation_mode": os.environ.get("CMT_ALLOCATION_MODE", "gibbs"),
-        "cmt_top_fraction": float(os.environ.get("CMT_TOP_FRACTION", "0.10")),
         "cmt_gamma": float(os.environ.get("CMT_GAMMA", "1.0")),
         "cmt_successor_lambda": float(os.environ.get("CMT_SUCCESSOR_LAMBDA", "1.0")),
         "learning_rate": float(os.environ.get("LR", os.environ.get("LEARNING_RATE", "1e-6"))),

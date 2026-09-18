@@ -95,20 +95,6 @@ class TrainingLauncherTests(unittest.TestCase):
         self.assertIn("grpo) add_plot_method grpo ;;", content)
         self.assertIn("iw|iw-opd) add_plot_method iw ;;", content)
 
-    def test_cmt_launcher_exposes_allocator_and_diagnostic_controls(self):
-        content = (REPO_ROOT / "scripts" / "train_cmt_b200.sh").read_text(
-            encoding="utf-8"
-        )
-        for variable in (
-            "CMT_ALLOCATION_MODE",
-            "CMT_TOP_FRACTION",
-            "CMT_DETAILED_LOG_ENABLED",
-            "CMT_TAIL_LOG_ENABLED",
-            "CMT_TAIL_TOP_K",
-            "CMT_PARTIAL_HORIZONS",
-        ):
-            self.assertIn(f"export {variable}=", content)
-
     def test_common_config_accepts_new_model_and_data_aliases(self):
         environment = dict(os.environ)
         environment.update(

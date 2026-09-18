@@ -49,9 +49,7 @@ def tensor_summary(
 ) -> dict[str, float]:
     if valid_mask is not None and values.shape == valid_mask.shape:
         values = values[valid_mask]
-    # FP64 preserves large cancellation diagnostics (for example kappa_X can
-    # exceed the FP32 dynamic range when X is close to zero).
-    finite = values.detach().to(torch.float64)
+    finite = values.detach().float()
     finite = finite[torch.isfinite(finite)]
     if finite.numel() == 0:
         return {
@@ -59,20 +57,9 @@ def tensor_summary(
             "std": float("nan"),
             "min": float("nan"),
             "max": float("nan"),
-            **{
-                name: float("nan")
-                for name in (
-                    "q05", "q25", "q50", "q75", "q90", "q95",
-                    "q99", "q99.5", "q99.9", "q99.99",
-                )
-            },
         }
     quantiles = torch.quantile(
-        finite,
-        torch.tensor(
-            [0.05, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99, 0.995, 0.999, 0.9999],
-            device=finite.device,
-        ),
+        finite, torch.tensor([0.05, 0.25, 0.50, 0.75, 0.95], device=finite.device)
     )
     return {
         "mean": float(finite.mean()),
@@ -81,13 +68,7 @@ def tensor_summary(
         "max": float(finite.max()),
         **{
             name: float(value)
-            for name, value in zip(
-                (
-                    "q05", "q25", "q50", "q75", "q90", "q95",
-                    "q99", "q99.5", "q99.9", "q99.99",
-                ),
-                quantiles,
-            )
+            for name, value in zip(("q05", "q25", "q50", "q75", "q95"), quantiles)
         },
     }
 
@@ -137,8 +118,6 @@ def selector_summary(
             "coverage_correction",
             "teacher_deficit",
             "marginal_flux",
-            "flux_product_form",
-            "flux_identity_error",
             "common_mass_derivative",
             "R",
             "M",
@@ -157,33 +136,6 @@ def selector_summary(
             "full_log_ratio_mean",
             "full_log_ratio_variance",
             "full_common_mass",
-            "sampled_raw_student_prob",
-            "sampled_raw_teacher_prob",
-            "sampled_cond_student_prob",
-            "sampled_cond_teacher_prob",
-            "sampled_log_ratio",
-            "sampled_cond_r",
-            "sampled_conditional_log_ratio",
-            "conditional_log_ratio_mean",
-            "successor_return",
-            "successor_mass",
-            "successor_value",
-            "successor_contrast",
-            "baseline_mass_term",
-            "x_difference_form",
-            "x_product_form",
-            "x_difference_identity_error",
-            "x_product_identity_error",
-            "x_cancellation_ratio",
-            "d_product_form",
-            "d_identity_error",
-            "abs_marginal_flux",
-            "abs_sequential_gain",
-            "abs_d_over_gain",
-            "response_position_fraction",
-            "successor_excess_fp64",
-            "x_fp32_fp64_abs_error",
-            "x_fp32_fp64_relative_error",
         )
     else:
         raise ValueError(f"Unknown selector-summary method: {method!r}")
@@ -203,10 +155,6 @@ def selector_summary(
         result["selection_threshold"] = float(diagnostics["s_TA"][selected].min())
     if method == "pgt" and selected_count:
         result["selection_threshold"] = float(diagnostics["s_PGT"][selected].min())
-    if method == "cmt" and selected_count and diagnostics.get("allocation_mode") == "top_fraction":
-        result["selection_threshold"] = float(
-            diagnostics["s_CMT"][selected].min()
-        )
     if method in {"opd", "rac", "cmt"} and "w" in diagnostics:
         weights = diagnostics["w"][valid_mask].detach().float()
         weight_sum = weights.sum()
@@ -216,52 +164,6 @@ def selector_summary(
                 weight_sum.square() / weights.square().sum().clamp_min(1e-12)
             ),
         )
-    if method == "cmt":
-        for key in (
-            "allocation_mode",
-            "allocation_inverse_temperature",
-            "allocation_kl_epsilon",
-            "allocation_kl_achieved",
-            "allocation_top_fraction",
-            "allocation_threshold",
-        ):
-            value = diagnostics.get(key)
-            if value is not None and not torch.is_tensor(value):
-                result[key] = value
-        if "w" in diagnostics and valid_count:
-            weights = diagnostics["w"][valid_mask].detach().float()
-            finite_weights = weights[torch.isfinite(weights) & (weights >= 0)]
-            if finite_weights.numel():
-                total = finite_weights.sum().clamp_min(1.0e-12)
-                ordered = torch.sort(finite_weights, descending=True).values
-                result["w_max"] = float(finite_weights.max())
-                result["max_token_probability"] = float(finite_weights.max() / total)
-                result["top_weight_mass_top1"] = float(ordered[:1].sum() / total)
-                result["top_weight_mass_top10"] = float(ordered[:10].sum() / total)
-                result["top_weight_mass_top100"] = float(ordered[:100].sum() / total)
-                result["top_weight_mass_top0p1"] = float(
-                    ordered[: max(1, (finite_weights.numel() + 999) // 1000)].sum()
-                    / total
-                )
-                ess = float(total.square() / finite_weights.square().sum().clamp_min(1.0e-12))
-                result["effective_sample_size"] = ess
-                result["normalized_ess"] = ess / max(valid_count, 1)
-                probabilities = finite_weights / total
-                result["normalized_weight_entropy"] = float(
-                    -(probabilities * probabilities.clamp_min(1.0e-30).log()).sum()
-                )
-                result["fraction_w_lt_1e-6"] = float(
-                    (finite_weights < 1.0e-6).float().mean()
-                )
-                result["fraction_w_gt_10"] = float(
-                    (finite_weights > 10.0).float().mean()
-                )
-                result["fraction_w_gt_100"] = float(
-                    (finite_weights > 100.0).float().mean()
-                )
-                result["fraction_w_gt_1000"] = float(
-                    (finite_weights > 1000.0).float().mean()
-                )
     return result
 
 

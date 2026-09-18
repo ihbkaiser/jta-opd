@@ -5,8 +5,6 @@ experiment:
 selector:
   cmt_ablation_arm: canonical
   cmt_allocation_kl: 0.5
-  cmt_allocation_mode: gibbs
-  cmt_top_fraction: 0.10
   cmt_gamma: 1.0
   cmt_successor_lambda: 1.0
   top_k: 16
@@ -19,14 +17,3 @@ training:
 training_evaluation:
   enabled: true
   max_new_tokens: 7168
-logging:
-  token_score_interval: 5
-  token_score_raw_sample_size: 8192
-  token_score_histogram_bins: 256
-  cmt_detailed_log_enabled: false
-  cmt_tail_log_enabled: false
-  cmt_tail_log_interval: 1
-  cmt_tail_top_k: 128
-  cmt_tail_context_tokens: 16
-  cmt_tail_fp64_check: true
-  cmt_partial_horizons: [16, 64, 256, 1024]

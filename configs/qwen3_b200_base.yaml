@@ -174,18 +174,9 @@ logging:
   selected_tokens_enabled: false
   selector_chunk_steps: 50
   token_score_stats_enabled: true
-  token_score_interval: 5
-  token_score_histogram_bins: 256
-  token_score_raw_sample_size: 8192
-  # CMT audit logs are intentionally opt-in.  They are detached from
-  # autograd and are written as per-rank gzip JSONL files.
-  cmt_detailed_log_enabled: false
-  cmt_tail_log_enabled: false
-  cmt_tail_log_interval: 1
-  cmt_tail_top_k: 128
-  cmt_tail_context_tokens: 16
-  cmt_tail_fp64_check: true
-  cmt_partial_horizons: [16, 64, 256, 1024]
+  token_score_interval: 50
+  token_score_histogram_bins: 64
+  token_score_raw_sample_size: 2048
   tensorboard:
     enabled: true
     log_dir: tensorboard
