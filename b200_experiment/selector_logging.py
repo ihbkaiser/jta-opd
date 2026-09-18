@@ -34,9 +34,16 @@ class SelectedTokenLogger:
                 "format": "gzip JSONL; concatenated gzip members are valid",
                 "scope": "selected/accepted response positions only",
                 "method": method,
-                "support_definition": (
+                "loss_support_definition": (
                     "student_topk" if method in {"opd", "ta", "pgt", "cmt"} else None
                 ),
+                "selector_support_definition": {
+                    "opd": "uniform_positions_no_selector_action_support",
+                    "ta": "literal_union_student_topk_teacher_topk",
+                    "rac": "literal_union_student_topk_teacher_topk",
+                    "pgt": "literal_union_student_topk_teacher_topk",
+                    "cmt": "literal_union_student_topk_teacher_topk",
+                }[method],
                 "chunk_steps": self.chunk_steps,
                 "distributed_world_size": self.world_size,
                 "distributed_file_pattern": (

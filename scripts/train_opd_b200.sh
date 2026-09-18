@@ -40,10 +40,10 @@ export MICRO_BATCH_SIZE_PER_GPU="${MICRO:-${MICRO_BATCH_SIZE_PER_GPU:-${MICRO_BA
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-auto}"
 export NUM_EPOCHS="${NUM_EPOCHS:-${EPOCHS:-1}}"
 export MAX_STEPS="${MAX_STEPS:--1}"               # -1 = consume all configured epochs
-export LR="${LR:-${LEARNING_RATE:-1.0e-6}}"
+export LR="${LR:-${LEARNING_RATE:-5.0e-6}}"
 export MAX_PROMPT_LEN="${MAX_PROMPT_LENGTH:-${MAX_PROMPT_LEN:-1024}}"
 export OVERLONG_PROMPT_POLICY="${OVERLONG_PROMPT_POLICY:-filter}"
-export MAX_RESPONSE_LEN="${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-7168}}}"
+export MAX_RESPONSE_LEN="${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-${MAX_NEW_TOKENS:-4096}}}"
 # Top-K drives the common OPD loss for all methods, including pure OPD.
 export TOP_K="${TOP_K:-16}"
 export SCORE_MICRO_BATCH_SIZE="${SCORE_MICRO_BATCH_SIZE:-8}"
@@ -54,11 +54,11 @@ export JOINT_CROSS_SCORING="${JOINT_CROSS_SCORING:-true}"
 export SCORE_CHUNK_STEPS="${SCORE_CHUNK_STEPS:-128}"
 export TA_VOCAB_CHUNK_TOKENS="${TA_VOCAB_CHUNK_TOKENS:-2048}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
-export EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
+export EVAL_INTERVAL="${EVAL_INTERVAL:-100}"
 export LOG_INTERVAL="${LOG_INTERVAL:-1}"
 export ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 
-# Periodic evaluation defaults to step 0, every 50 steps, and the final step.
+# Periodic evaluation defaults to step 0, every 100 steps, and the final step.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"
 export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-0.7}"

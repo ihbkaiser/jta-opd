@@ -4,10 +4,19 @@ experiment:
   method: cmt
   output_dir: outputs/cmt_opd
 
-# Coupled Marginal Teachability uses the conditional student/teacher
-# student-Top-K simplex for local selection/loss geometry, and a raw-mass
-# truncated Top-K common-mass kernel for sequential accessibility.
+# Coupled Marginal Teachability uses the conditional student/teacher Top-K
+# union for local scoring and a raw-mass truncated common-mass kernel for
+# sequential accessibility. Its OPD policy loss remains Student Top-16 only.
 # Exact full-vocabulary reductions are opt-in diagnostics only.
+rollout:
+  max_new_tokens: 4096
+
+training:
+  learning_rate: 5.0e-6
+
+training_evaluation:
+  interval_steps: 100
+
 selector:
   joint_cross_scoring: true
   pgt_vocab_chunk_tokens: 2048

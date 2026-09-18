@@ -89,13 +89,13 @@ export BATCH_SIZE=64
 export NUM_RESPONSES=1
 export MICRO_BATCH_SIZE_PER_GPU=8
 export PPO_MINI_BATCH_SIZE=16
-export LR=1e-6
+export LR=5e-6
 export NUM_EPOCHS=1
 export MAX_PROMPT_LENGTH=1024
-export MAX_RESPONSE_LENGTH=7168
+export MAX_RESPONSE_LENGTH=4096
 export TOP_K=16
 export SAVE_INTERVAL=50
-export EVAL_INTERVAL=50
+export EVAL_INTERVAL=100
 export TRAIN_EVAL_ENABLED=true
 export TRAIN_EVAL_NUM_RESPONSES=8
 export TRAIN_EVAL_SEED=42
@@ -131,7 +131,7 @@ RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
 CMT mặc định dùng `CMT_ALLOCATION_KL=0.5`, `CMT_GAMMA=1.0`,
-`CMT_SUCCESSOR_LAMBDA=1.0`, student Top-K support và `top_p=1`. Full-vocabulary CMT diagnostics
+`CMT_SUCCESSOR_LAMBDA=1.0`, union support cho CMT score, Student Top-16 cho OPD loss và `top_p=1`. Full-vocabulary CMT diagnostics
 không bật mặc định:
 
 ```bash

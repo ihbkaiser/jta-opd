@@ -90,7 +90,7 @@ export EVAL_INTERVAL="${EVAL_INTERVAL:-50}"
 # Optional hard cap; leave empty to train the configured number of epochs.
 export MAX_STEPS="${MAX_STEPS:-}"
 
-# Identical evaluation schedule: step 0, every 50 steps, and the final step.
+# Legacy methods inherit this shared schedule unless overridden below.
 export TRAIN_EVAL_ENABLED="${TRAIN_EVAL_ENABLED:-true}"
 export TRAIN_EVAL_BACKEND="${TRAIN_EVAL_BACKEND:-vllm}"  # vllm or hf
 export TRAIN_EVAL_TEMPERATURE="${TRAIN_EVAL_TEMPERATURE:-0.7}"
@@ -119,11 +119,15 @@ source "${SCRIPT_DIR}/common_b200.sh"
 
 resolve_run_paths
 RUN_NAME="${OPD_RUN_NAME}" OUTPUT_DIR="${OPD_RUN_OUTPUT}" \
+  LR="${OPD_LR:-5e-6}" MAX_RESPONSE_LEN="${OPD_MAX_RESPONSE_LEN:-4096}" \
+  EVAL_INTERVAL="${OPD_EVAL_INTERVAL:-100}" \
   STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
   TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
   RESUME_FROM_CHECKPOINT="${OPD_RESUME_FROM_CHECKPOINT:-}" \
   bash "${SCRIPT_DIR}/train_opd_b200.sh"
 RUN_NAME="${TA_RUN_NAME}" OUTPUT_DIR="${TA_RUN_OUTPUT}" \
+  LR="${TA_LR:-5e-6}" MAX_RESPONSE_LEN="${TA_MAX_RESPONSE_LEN:-4096}" \
+  EVAL_INTERVAL="${TA_EVAL_INTERVAL:-100}" \
   STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
   TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
   RESUME_FROM_CHECKPOINT="${TA_RESUME_FROM_CHECKPOINT:-}" \
@@ -142,6 +146,8 @@ if [[ "${RUN_PGT_TRAIN}" == "true" ]]; then
 fi
 if [[ "${RUN_CMT_TRAIN}" == "true" ]]; then
   RUN_NAME="${CMT_RUN_NAME}" OUTPUT_DIR="${CMT_RUN_OUTPUT}" \
+    LR="${CMT_LR:-5e-6}" MAX_RESPONSE_LEN="${CMT_MAX_RESPONSE_LEN:-4096}" \
+    EVAL_INTERVAL="${CMT_EVAL_INTERVAL:-100}" \
     STUDENT_MODEL="${STUDENT_MODEL}" TEACHER_MODEL="${TEACHER_MODEL}" \
     TRAIN_DATA="${TRAIN_DATA}" PROMPT_KEY="${PROMPT_KEY}" \
     RESUME_FROM_CHECKPOINT="${CMT_RESUME_FROM_CHECKPOINT:-}" \

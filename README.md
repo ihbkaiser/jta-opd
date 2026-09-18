@@ -7,11 +7,12 @@ Project độc lập này hỗ trợ bốn baseline chính trên cùng student Q
 - **Bellman-RAC**: cùng local teachability, truyền thông tin tương lai theo transition thực tế mà
   teacher ủng hộ, rồi weight mềm mọi response token.
 - **PGT (Projected-Gradient Teachability)**: xếp hạng theo natural-gradient energy của local OPD
-  trên Student-Top-K; không dùng Bellman recurrence, critic hoặc
+  trên union Student-Top-K và Teacher-Top-K; không dùng Bellman recurrence, critic hoặc
   counterfactual rollout. Đây là local baseline đang chờ one-step/held-out validation.
 - **CMT-OPD (Coupled Marginal Teachability)**: dùng conditional student/teacher distributions trên
-  Student-Top-K, cộng vào local PGT gain một *local-baseline excess* successor-opportunity derivative
-  qua **raw truncated** common-mass kernel `min(p,q)` chỉ trên support này, ước lượng trên đúng một
+  union Student-Top-K và Teacher-Top-K để tính score, cộng vào local PGT gain một
+  *local-baseline excess* successor-opportunity derivative qua **raw truncated** common-mass kernel
+  `min(p,q)` trên union này, ước lượng trên đúng một
   full-policy student rollout bằng bounded acceptance factor (không inverse coverage), rồi phân bổ
   weight bằng global KL-constrained allocation. CMT
   không claim là causal task value hay teacher-policy value; xem
@@ -88,8 +89,8 @@ Vì vậy per-position signal và denominator convention hoàn toàn chung trong
 
 ## Định nghĩa TA-OPD
 
-Tại mọi response position hợp lệ `t`, code lấy `U_t=TopK(student_t)`, gather teacher trên đúng
-các ID này, rồi renormalize cả hai phân phối trên `U_t`:
+Tại mọi response position hợp lệ `t`, TA lấy
+`U_t=TopK(student_t) union TopK(teacher_t)`, rồi renormalize cả hai phân phối trên `U_t`:
 
 ```text
 D_t = KL(qbar_t^U || pbar_t^U)
@@ -136,10 +137,10 @@ trong shared config để audit fairness.
 
 ## Định nghĩa CMT-OPD
 
-CMT dùng cùng conditional action simplex với loss cho local learning geometry:
+CMT dùng union conditional cho local score, tách biệt với Student Top-16 của loss:
 
 ```text
-U_t       = TopK(student_t)
+U_t       = TopK(student_t) union TopK(teacher_t)
 p_U,q_U   = conditional p,q on U_t
 r_U       = log q_U - log p_U
 g_t       = Var_{p_U}[r_U]                         # local PGT gain
@@ -170,7 +171,7 @@ cảnh báo và không áp dụng importance correction không hợp lệ.
   vLLM để mọi rank có lịch collective xác định.
 - Common core score student Top-K và teacher-on-student IDs một lần. Với TA/RAC/CMT, student và teacher
   được forward chung theo từng bounded micro-batch. Shared scorer có thể vẫn materialize teacher Top-K
-  cho diagnostic/legacy path, nhưng các ID đó không tham gia support của OPD/TA/CMT. Mọi scoring chỉ
+  để dựng union score của TA/CMT, nhưng các ID teacher-only không tham gia OPD loss. Mọi scoring chỉ
   giữ tensor `[B,T,K]` qua toàn rollout; hai full-vocabulary logit
   view BF16 chỉ cùng tồn tại bên trong một scoring micro-batch rồi được giải phóng.
   Default `n=1`: 64 prompt toàn cục tạo đúng 64 trajectory độc lập, tức 32 trajectory/GPU trên hai
@@ -213,9 +214,9 @@ CMT_ALLOCATION_KL CMT_GAMMA CMT_SUCCESSOR_LAMBDA CMT_FULL_VOCAB_DIAGNOSTICS
 EVAL_INTERVAL SAVE_INTERVAL LOG_INTERVAL SEED
 ```
 
-Production defaults là hai rank FSDP, BF16 full-parameter student, `LR=1e-6`, một epoch, global
+Production defaults của OPD/TA/CMT là hai rank FSDP, BF16 full-parameter student, `LR=5e-6`, một epoch, global
 prompt batch 64, `n=1`, PPO mini-batch toàn cục 16 trajectory, rồi micro-batch 8/GPU.
-Prompt/response là `1024/7168`, eval/save mỗi 50 optimizer step. Micro-batch không tự
+Prompt/response là `1024/4096`, eval mỗi 100 optimizer step và save mỗi 50 step. Micro-batch không tự
 giảm khi OOM và LR không tự scale; thử `8 → 16`, rồi lùi về `4` nếu thiếu VRAM, giữ global batch 64.
 
 Evaluation mặc định dùng vLLM `n=8`, `temperature=0.7`, `top_p=0.95`, `max_new_tokens=7168`; metric

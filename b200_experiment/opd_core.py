@@ -12,6 +12,7 @@ UPSTREAM_TOP_K_STRATEGY = "only_stu"
 UPSTREAM_REWARD_WEIGHT_MODE = "student_p"
 UPSTREAM_ADV_ESTIMATOR = "token_reward_direct"
 UPSTREAM_LOSS_AGG_MODE = "token-mean"
+OPD_LOSS_TOP_K = 16
 
 
 def compute_iw_opd_weights(
@@ -115,10 +116,9 @@ class TopKOPDReference:
     teacher_log_probs: torch.Tensor
     student_weights: torch.Tensor
     advantages: torch.Tensor
-    # CMT/PGT use the all-True student Top-K support to conditionalize the
-    # differentiable loss. Legacy OPD/TA/RAC use ``None``, preserving the
-    # pinned upstream full-vocabulary log-probability objective on the same
-    # student Top-K candidate IDs.
+    # ``None`` preserves the pinned upstream full-vocabulary log-probability
+    # objective on Student Top-K candidate IDs. Selector supports (for example
+    # the TA/CMT student/teacher union) must never be passed into this field.
     support_mask: torch.Tensor | None = None
 
 
@@ -151,10 +151,8 @@ def build_topk_opd_reference(
 
     Upstream computes ``rm_scores = -(S_logp - T_on_S) * softmax(S_logp)``
     across K, then uses ``token_reward_direct`` so these rewards become the
-    detached candidate-wise advantages.  Legacy callers pass full-vocabulary
-    log-probabilities; PGT/CMT pass conditional probabilities on their explicit
-    student Top-K support, making the same core support-consistent for those
-    methods.
+    detached candidate-wise advantages. Callers pass full-vocabulary
+    log-probabilities gathered only at Student Top-K IDs.
     """
     _validate_topk_tensors(
         student_log_probs, teacher_log_probs, valid_mask, support_mask
@@ -192,6 +190,33 @@ def build_topk_opd_reference(
         student_weights=weights,
         advantages=advantages,
         support_mask=support,
+    )
+
+
+def build_student_topk_opd_reference(
+    student_top_k_ids: torch.Tensor,
+    student_top_k_log_probs: torch.Tensor,
+    teacher_on_student_log_probs: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> TopKOPDReference:
+    """Build the invariant Student-Top-16 policy-loss reference.
+
+    TA/CMT may use a larger student/teacher union to compute selector scores,
+    but that union is intentionally absent from this API. This makes it
+    impossible for teacher-only Top-K IDs to enter the differentiable OPD
+    candidate loss through the production reference builder.
+    """
+    if student_top_k_ids.shape[-1] != OPD_LOSS_TOP_K:
+        raise ValueError(
+            "OPD loss support must contain exactly Student Top-16 IDs; "
+            f"got K={student_top_k_ids.shape[-1]}"
+        )
+    return build_topk_opd_reference(
+        student_top_k_ids,
+        student_top_k_log_probs,
+        teacher_on_student_log_probs,
+        valid_mask,
+        support_mask=None,
     )
 
 

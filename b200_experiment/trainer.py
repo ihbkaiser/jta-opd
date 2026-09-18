@@ -84,11 +84,13 @@ from .fsdp import (
 from .opd_core import (
     UPSTREAM_ADV_ESTIMATOR,
     UPSTREAM_LOSS_AGG_MODE,
+    OPD_LOSS_TOP_K,
     UPSTREAM_OPD_COMMIT,
     UPSTREAM_REWARD_WEIGHT_MODE,
     UPSTREAM_TOP_K_STRATEGY,
     TopKOPDReference,
     build_iw_opd_reference,
+    build_student_topk_opd_reference,
     build_topk_opd_reference,
     gather_candidate_log_probs,
     topk_candidate_ppo_loss,
@@ -2818,6 +2820,14 @@ def run_training(
             "This controlled experiment supports only the pinned thunlp/OPD "
             f"recipe; incompatible settings: {incompatible}"
         )
+    configured_top_k = int(config["selector"].get("top_k", OPD_LOSS_TOP_K))
+    if configured_top_k <= 0:
+        raise ValueError("selector.top_k must be positive")
+    if method in {"opd", "ta", "cmt"} and configured_top_k != OPD_LOSS_TOP_K:
+        raise ValueError(
+            f"{method.upper()} requires selector.top_k={OPD_LOSS_TOP_K} so the "
+            "policy-loss support is exactly Student Top-16"
+        )
     seed = int(experiment.get("seed", 1234))
     seed_everything(seed)
     resume_checkpoint = resolve_resume_checkpoint(
@@ -3082,9 +3092,7 @@ def run_training(
             f"Fully rendered EVAL prompt ({first_benchmark}):\n{rendered_eval_prompt}"
         )
     selector_cfg = config["selector"]
-    top_k = int(selector_cfg.get("top_k", 16))
-    if top_k <= 0:
-        raise ValueError("selector.top_k must be positive")
+    top_k = configured_top_k
     opd_selector = OPDSelector()
     ta_selector = TASelector(
         top_k,
@@ -3391,10 +3399,6 @@ def run_training(
         )
         pgt_raw: PGTOutput | None = None
         pgt_score_time = 0.0
-        reference_candidate_ids = student_scores.top_k_ids
-        reference_student_log_probs = student_scores.top_k_log_probs
-        reference_teacher_log_probs = teacher_scores.candidate_log_probs
-        reference_support_mask = None
         if method in {"pgt", "cmt"}:
             if student_scores.candidate_log_probs is None:
                 raise AssertionError(
@@ -3411,16 +3415,6 @@ def run_training(
                 student_scores.candidate_log_probs,
                 valid,
                 token_chunk_size=int(selector_cfg.get("pgt_vocab_chunk_tokens", 2048)),
-            )
-            reference_candidate_ids = pgt_raw.candidate_ids
-            reference_student_log_probs = pgt_raw.student_candidate_log_probs
-            reference_teacher_log_probs = pgt_raw.teacher_candidate_log_probs
-            reference_support_mask = pgt_raw.support_mask
-        if method != "iw" and not torch.equal(
-            reference_candidate_ids, student_scores.top_k_ids
-        ):
-            raise AssertionError(
-                f"{method.upper()} candidate support must equal student Top-K IDs"
             )
         cmt_raw: PGTOutput | None = None
         cmt_score_time = 0.0
@@ -3462,13 +3456,25 @@ def run_training(
                 eps=float(config.get("iw_opd", {}).get("eps", 1.0e-8)),
             )
             iw_weight_stats = _global_tensor_stats(iw_weights[valid], distributed)
+        elif method in {"opd", "ta", "cmt"}:
+            opd_reference = build_student_topk_opd_reference(
+                student_scores.top_k_ids,
+                student_scores.top_k_log_probs,
+                teacher_scores.candidate_log_probs,
+                valid,
+            )
+            if not torch.equal(
+                opd_reference.candidate_ids, student_scores.top_k_ids
+            ):
+                raise AssertionError(
+                    f"{method.upper()} policy-loss support differs from Student Top-16"
+                )
         else:
             opd_reference = build_topk_opd_reference(
-                reference_candidate_ids,
-                reference_student_log_probs,
-                reference_teacher_log_probs,
+                student_scores.top_k_ids,
+                student_scores.top_k_log_probs,
+                teacher_scores.candidate_log_probs,
                 valid,
-                support_mask=reference_support_mask,
             )
         finite_or_raise("Top-K OPD advantages", opd_reference.advantages[valid])
         advantage_stats = _global_tensor_stats(
@@ -4017,6 +4023,17 @@ def run_training(
             "support_definition": (
                 "sampled_response_action" if method == "iw" else "student_topk"
             ),
+            "loss_support_definition": (
+                "sampled_response_action" if method == "iw" else "student_topk"
+            ),
+            "selector_support_definition": {
+                "opd": "uniform_positions_no_selector_action_support",
+                "ta": "literal_union_student_topk_teacher_topk",
+                "rac": "literal_union_student_topk_teacher_topk",
+                "pgt": "literal_union_student_topk_teacher_topk",
+                "cmt": "literal_union_student_topk_teacher_topk",
+                "iw": "sampled_response_action",
+            }[method],
             "opd_candidate_support": (
                 "sampled_response_action"
                 if method == "iw"
@@ -4025,11 +4042,7 @@ def run_training(
             "opd_support_geometry": (
                 "sampled_action_singleton"
                 if method == "iw"
-                else (
-                    "conditional_student_teacher_on_student_topk"
-                    if method in {"pgt", "cmt"}
-                    else "global_log_probabilities_on_student_topk_candidates"
-                )
+                else "global_log_probabilities_on_student_topk_candidates"
             ),
             "opd_top_k": top_k,
             "opd_top_k_strategy": top_k_strategy,

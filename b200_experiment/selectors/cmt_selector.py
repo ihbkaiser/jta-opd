@@ -69,9 +69,9 @@ def kl_constrained_allocation(
 class CMTSelector:
     """Support-matched, local-excess Coupled Marginal Teachability.
 
-    The executable action space is the student Top-K support U.  Student and
+    The local scoring action space is the student/teacher Top-K union U. Student and
     teacher probabilities are conditionalized on U by ``PGTSelector`` for the
-    local PGT/OPD geometry.  Sequential accessibility instead uses the original
+    local PGT/CMT geometry. Sequential accessibility instead uses the original
     probability mass on U, yielding the truncated sub-Markov kernel
 
         K_tilde f(s) = sum_{a in U} min(p(a|s), q(a|s)) f(sa).
@@ -97,7 +97,8 @@ class CMTSelector:
     the baseline-subtracted successor opportunity; lambda=0 is only a named
     local-only ablation.
     Descendant values are frozen in this categorical surrogate; no causal
-    shared-neural-network claim is made.
+    shared-neural-network claim is made. This union never becomes the OPD loss
+    support: optimization is separately restricted to Student Top-16.
     """
 
     def __init__(
@@ -335,7 +336,7 @@ class CMTSelector:
             ablation_arm=self.ablation_arm,
             ablation_score=learning_value,
             transition_definition=(
-                "truncated_original_student_topk_common_mass_without_inverse_coverage"
+                "truncated_original_union_common_mass_without_inverse_coverage"
             ),
             gamma=self.gamma,
             successor_lambda=self.successor_lambda,

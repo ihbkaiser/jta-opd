@@ -1,10 +1,10 @@
 # CMT-OPD refinement: support-matched bounded truncated-kernel formulation
 
-> **Implementation note (2026-09-18):** production support is now
-> `U_t = TopK(student_t)`. The derivation below remains applicable with this
-> definition of `U_t`; historical references to a student/teacher “union”
-> describe the earlier implementation and must not be read as current code
-> semantics. Teacher probabilities are gathered only on student Top-K IDs.
+> **Implementation note (2026-09-18):** production now separates two supports.
+> CMT score/accessibility uses
+> `U_t = TopK(student_t) union TopK(teacher_t)`, as derived below, while the
+> differentiable OPD loss always uses Student Top-16. Teacher-only union tokens
+> can affect learning-value allocation but never become policy-loss candidates.
 
 Ngày 2026-09-06, tôi tiếp tục audit CMT v1 theo các failure mode mới được nêu:
 geometry mismatch, length bias, variance của one-rollout estimator, coupling
@@ -16,9 +16,9 @@ không còn là formulation chính.
 
 **GO có điều kiện cho CMT-OPD v4**, với năm thay đổi bắt buộc:
 
-1. mọi local quantity của selector và OPD loss dùng cùng conditional
-   Top-K-union simplex;
-2. local PGT/OPD geometry dùng conditional union simplex, còn sequential
+1. mọi local quantity của selector dùng cùng conditional Top-K-union simplex,
+   còn OPD loss dùng Student Top-16 theo upstream `only_stu`;
+2. local PGT/CMT geometry dùng conditional union simplex, còn sequential
    accessibility dùng original probability mass trên union;
 3. rollout ngoài union bị coi là killed transition trong raw truncated kernel;
    không dùng inverse-coverage correction;

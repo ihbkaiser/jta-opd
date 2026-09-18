@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from b200_experiment.config import load_config
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAIN_SCRIPTS = (
@@ -65,6 +67,30 @@ class TrainingLauncherTests(unittest.TestCase):
                     "EVAL_INTERVAL",
                 ):
                     self.assertIn(f"export {variable}=", content)
+
+    def test_opd_ta_cmt_use_requested_shared_defaults(self):
+        for name in (
+            "train_opd_b200.sh",
+            "train_ta_b200.sh",
+            "train_cmt_b200.sh",
+        ):
+            content = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+            with self.subTest(script=name):
+                self.assertIn("LEARNING_RATE:-5.0e-6", content)
+                self.assertIn("MAX_NEW_TOKENS:-4096", content)
+                self.assertIn('EVAL_INTERVAL="${EVAL_INTERVAL:-100}"', content)
+                self.assertIn('TOP_K="${TOP_K:-16}"', content)
+        for method in ("opd", "ta", "cmt"):
+            config = load_config(
+                REPO_ROOT / "configs" / f"qwen3_b200_{method}.yaml"
+            )
+            with self.subTest(config=method):
+                self.assertEqual(config["selector"]["top_k"], 16)
+                self.assertEqual(config["training"]["learning_rate"], 5.0e-6)
+                self.assertEqual(config["rollout"]["max_new_tokens"], 4096)
+                self.assertEqual(
+                    config["training_evaluation"]["interval_steps"], 100
+                )
 
     def test_grpo_launcher_uses_memory_safe_default_microbatch(self):
         content = (REPO_ROOT / "scripts" / "train_grpo_b200.sh").read_text(

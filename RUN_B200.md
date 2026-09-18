@@ -99,12 +99,12 @@ export DISTRIBUTED_STRATEGY=fsdp
 export BATCH_SIZE=64
 export MICRO_BATCH_SIZE_PER_GPU=8
 export NUM_RESPONSES=1
-export LR=1e-6
+export LR=5e-6
 export NUM_EPOCHS=1
 export MAX_PROMPT_LENGTH=1024
 export OVERLONG_PROMPT_POLICY=filter
 export PPO_MINI_BATCH_SIZE=16
-export MAX_RESPONSE_LENGTH=7168
+export MAX_RESPONSE_LENGTH=4096
 export TOP_K=16
 export TA_RHO=0.10
 export RAC_GAMMA=0.995
@@ -113,7 +113,7 @@ export RAC_BETA=2.0
 export CMT_ALLOCATION_KL=0.5
 export CMT_GAMMA=1.0
 export CMT_SUCCESSOR_LAMBDA=1.0
-export EVAL_INTERVAL=50
+export EVAL_INTERVAL=100
 export SAVE_INTERVAL=50
 export SEED=42
 
@@ -130,11 +130,11 @@ local và được cap ở local PPO share. Final partial minibatch được gi�
 rank không có real sample để tham gia collective, training dừng với validation error thay vì âm
 thầm dùng filler như một phần effective batch.
 
-Các YAML method chỉ khác `experiment.method` và `experiment.output_dir`. OPD thuần dùng uniform
+Các YAML OPD/TA/CMT khóa cùng `LR=5e-6`, rollout 4096 và eval interval 100. OPD thuần dùng uniform
 weight `1` trên mọi valid response token; mọi launcher đi qua cùng `common_b200.sh`, do đó dùng
 cùng Top-K OPD core, vLLM rollout, data order, model, seed, batch/micro-batch, LR, optimizer,
 checkpoint và lịch
-eval mặc định step 0 / mỗi 50 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
+eval mặc định step 0 / mỗi 100 step / final. Nên chạy tuần tự trên cùng GPU layout để tránh nhiễu
 tài nguyên giữa các run.
 
 Training-time evaluation trên nhiều GPU được shard tự động: mỗi rank chạy một vLLM replica
@@ -180,7 +180,7 @@ Các launcher hiện mặc định bật cùng một nhóm tối ưu chính xác
 - crop mọi suffix sau EOS và bucket trajectory theo response length ở scoring lẫn backward;
 - scoring inference micro-batch 8 thay vì 1, đồng thời tái sử dụng `logsumexp` khi temperature bằng 1;
 - TA/RAC/PGT/CMT lấy hai chiều student/teacher Top-K trong hai forward thay vì forward student lần thứ ba;
-- CMT dùng conditional student-Top-K reductions cho local geometry, raw-mass truncated common-mass
+- CMT dùng conditional student/teacher Top-K union cho local geometry, raw-mass truncated common-mass
   transition và local-baseline excess scan; full-vocabulary reductions chỉ chạy khi
   `CMT_FULL_VOCAB_DIAGNOSTICS=true`;
 - `top_p=1` là cấu hình exact khuyến nghị cho raw-kernel estimator; launcher không còn hard-fail
