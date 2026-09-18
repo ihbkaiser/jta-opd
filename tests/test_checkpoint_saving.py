@@ -3,9 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from b200_experiment.trainer import _save_checkpoint
+import torch
+
+from b200_experiment.trainer import _save_checkpoint, _save_inference_snapshot
 
 
 class _FakeDistributed:
@@ -33,6 +36,67 @@ class _FakeDistributed:
 
 
 class CheckpointSavingTests(unittest.TestCase):
+    def test_qwen35_snapshot_keeps_composite_config_and_maps_text_weights(self):
+        class _SourceConfig:
+            model_type = "qwen3_5"
+
+            def save_pretrained(self, destination):
+                (Path(destination) / "config.json").write_text(
+                    '{"model_type":"qwen3_5"}', encoding="utf-8"
+                )
+
+        class _TextModel:
+            def __init__(self):
+                self.config = SimpleNamespace(
+                    use_cache=False, model_type="qwen3_5_text"
+                )
+                self._b200_source_config = _SourceConfig()
+                self._tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+                self.saved_state = None
+
+            def state_dict(self):
+                embedding = torch.ones(2, 3)
+                return {
+                    "model.embed_tokens.weight": embedding,
+                    "lm_head.weight": embedding,
+                    "model.layers.0.weight": torch.ones(1),
+                }
+
+            def save_pretrained(self, destination, **kwargs):
+                self.saved_state = dict(kwargs["state_dict"])
+                (Path(destination) / "model.safetensors").write_text(
+                    "fake", encoding="utf-8"
+                )
+
+        class _Tokenizer:
+            def save_pretrained(self, destination):
+                (Path(destination) / "tokenizer.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+
+        model = _TextModel()
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "snapshot"
+            _save_inference_snapshot(model, _Tokenizer(), destination)
+
+            self.assertEqual(
+                set(model.saved_state),
+                {
+                    "model.language_model.embed_tokens.weight",
+                    "lm_head.weight",
+                    "model.language_model.layers.0.weight",
+                },
+            )
+            self.assertEqual(
+                (destination / "config.json").read_text(encoding="utf-8"),
+                '{"model_type":"qwen3_5"}',
+            )
+            self.assertFalse(model.config.use_cache)
+            self.assertEqual(
+                model._tied_weights_keys,
+                {"lm_head.weight": "model.embed_tokens.weight"},
+            )
+
     def test_rank0_removes_stale_staging_directory_before_retry(self):
         with tempfile.TemporaryDirectory() as root:
             output_dir = Path(root)

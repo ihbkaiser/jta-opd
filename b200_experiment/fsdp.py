@@ -36,18 +36,31 @@ def is_fsdp_model(model) -> bool:
 
 def _transformer_layer_classes(model, fsdp_config: dict[str, Any]) -> set[type]:
     configured = fsdp_config.get("transformer_layer_cls_names")
-    if configured is None:
-        configured = getattr(model, "_no_split_modules", None)
+    if configured is None or configured == "auto":
+        # Hugging Face declares the correct decoder block names through
+        # _no_split_modules.  Search wrappers/submodules as well as the root so
+        # this continues to work with PEFT and with Qwen3.5's extracted
+        # text-only model.  Only names that actually occur in this model are
+        # retained (a composite declaration may also mention vision blocks).
+        configured = []
+        for module in model.modules():
+            declared = getattr(module, "_no_split_modules", None)
+            if isinstance(declared, str):
+                configured.append(declared)
+            elif declared:
+                configured.extend(str(name) for name in declared)
     if isinstance(configured, str):
         configured = [configured]
-    names = {str(name) for name in (configured or ["Qwen3DecoderLayer"])}
+    names = {str(name) for name in (configured or [])}
     classes = {
         type(module) for module in model.modules() if type(module).__name__ in names
     }
     if not classes:
         raise ValueError(
-            "FSDP could not find a configured transformer layer to wrap; "
-            f"requested {sorted(names)}"
+            "FSDP could not find a transformer decoder layer to wrap. Set "
+            "distributed.fsdp.transformer_layer_cls_names explicitly or use a "
+            "Hugging Face model that declares _no_split_modules; requested/"
+            f"discovered names={sorted(names)}"
         )
     return classes
 
@@ -69,7 +82,7 @@ def wrap_fsdp_model(
     *,
     role: str,
 ):
-    """FULL_SHARD a Qwen-style student or frozen teacher per decoder layer."""
+    """FULL_SHARD a Hugging Face student or frozen teacher per decoder layer."""
     if not context.enabled:
         return model
     fsdp_config = dict(config.get("distributed", {}).get("fsdp", {}))

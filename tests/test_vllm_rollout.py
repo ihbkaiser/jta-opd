@@ -12,6 +12,7 @@ from b200_experiment.vllm_rollout import (
     VLLMRolloutEngine,
     rollout_batch_from_token_ids,
 )
+from b200_experiment.models import qwen35_composite_weight_name
 
 
 def _config(max_model_len: int = 1024):
@@ -36,6 +37,16 @@ def _config(max_model_len: int = 1024):
 
 
 class VLLMRolloutTests(unittest.TestCase):
+    def test_qwen35_ipc_names_match_official_composite_checkpoint(self):
+        names = ["model.layers.0.mlp.down_proj.weight", "lm_head.weight"]
+        self.assertEqual(
+            [qwen35_composite_weight_name(name) for name in names],
+            [
+                "model.language_model.layers.0.mlp.down_proj.weight",
+                "lm_head.weight",
+            ],
+        )
+
     def test_rollout_requests_log_probs_only_for_enabled_sanity_check(self):
         with tempfile.TemporaryDirectory() as temporary:
             engine = VLLMRolloutEngine(_config(), Path(temporary))
@@ -176,6 +187,24 @@ class VLLMRolloutTests(unittest.TestCase):
         self.assertIn("--async-scheduling", command)
         self.assertIn("--performance-mode throughput", joined)
         self.assertIn("--gpu-memory-utilization 0.25", joined)
+
+    def test_qwen35_composite_rollout_prunes_the_vision_tower(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            model = Path(temporary) / "Qwen3.5-4B"
+            model.mkdir()
+            (model / "config.json").write_text(
+                '{"model_type": "qwen3_5"}', encoding="utf-8"
+            )
+            config = _config()
+            config["models"]["student_path"] = str(model)
+            engine = VLLMRolloutEngine(config, Path(temporary) / "output")
+            with patch(
+                "b200_experiment.vllm_rollout.shutil.which",
+                return_value="/venv/bin/vllm",
+            ):
+                command = engine._server_command()
+            engine.close()
+        self.assertIn("--language-model-only", command)
 
     def test_server_rejects_context_smaller_than_prompt_plus_response(self):
         with tempfile.TemporaryDirectory() as temporary:

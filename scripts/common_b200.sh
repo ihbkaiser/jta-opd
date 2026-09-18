@@ -68,9 +68,10 @@ export TRAIN_DATA_PATH="${TRAIN_DATA:-${TRAIN_DATA_PATH:-${PRESET_TRAIN_DATA_PAT
 export TRAIN_DATA_SPLIT="${TRAIN_DATA_SPLIT:-${PRESET_TRAIN_DATA_SPLIT}}"
 export TRAIN_PROMPT_KEY="${PROMPT_KEY:-${TRAIN_PROMPT_KEY:-${PRESET_TRAIN_PROMPT_KEY}}}"
 export TRAIN_PREFER_SOURCE_PROMPT="${TRAIN_PREFER_SOURCE_PROMPT:-${PRESET_TRAIN_PREFER_SOURCE_PROMPT}}"
-# This experiment intentionally has no teacher-tokenizer path. Qwen3's hard
-# no-think switch is always applied while the student tokenizer renders the one
-# shared prompt. Trainer validation rejects attempts to enable thinking.
+# This experiment intentionally has no teacher-tokenizer path. The student
+# tokenizer renders the one shared prompt and its token IDs are passed directly
+# to the teacher. ``enable_thinking=false`` is consumed by Qwen chat templates
+# and is harmless for Llama templates that do not define that option.
 # ========================================================================
 
 BASE_CONFIG="${REPO_DIR}/configs/qwen3_b200_base.yaml"

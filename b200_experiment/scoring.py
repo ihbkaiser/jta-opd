@@ -197,11 +197,12 @@ def _joint_full_vocab_metrics(
 
 
 def supports_response_only_logits(model) -> bool:
-    """Qwen3 can skip the expensive LM head on prompt hidden states."""
+    """Models whose HF forward supports the ``logits_to_keep`` argument."""
     base_model = getattr(model, "module", model)
     return str(getattr(getattr(base_model, "config", None), "model_type", "")) in {
         "qwen3",
         "qwen3_moe",
+        "qwen3_5_text",
     }
 
 

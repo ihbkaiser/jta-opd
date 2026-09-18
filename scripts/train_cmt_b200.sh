@@ -5,6 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= USER CONFIG: CMT ==========================
 # A fresh invocation gets a local-time run name automatically. You can still
 # pass RUN_NAME=... explicitly, especially when resuming an existing run.
+# Supported examples (teacher/student must have exactly the same tokenizer):
+#   /workspace/storage-shared/models/Qwen3.5-9B
+#   /workspace/storage-shared/models/Qwen3.5-4B
+#   /workspace/storage-shared/models/Llama-3.1-8B-Instruct
+#   /workspace/storage-shared/models/Llama-3.2-3B-Instruct
+# Only edit/override the next two variables; decoder/FSDP type is auto-detected.
 export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
 export TEACHER_MODEL="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-models/Qwen3-8B}}"
 case "${TRAIN_DATASET:-competition_math}" in

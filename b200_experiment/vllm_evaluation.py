@@ -306,6 +306,17 @@ def _evaluate_vllm_suite_impl(
         "trust_remote_code": False,
         "generation_config": "vllm",
     }
+    try:
+        checkpoint_config = json.loads(
+            (model_path / "config.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, TypeError):
+        checkpoint_config = {}
+    if str(checkpoint_config.get("model_type", "")) == "qwen3_5":
+        # Evaluation is text-only.  Qwen3.5 snapshots deliberately preserve
+        # the official composite config for vLLM 0.17 compatibility, so prune
+        # the vision tower rather than allocating unused dummy/missing weights.
+        engine_kwargs["language_model_only"] = True
     max_model_len = vllm_settings.get("max_model_len", 4096)
     if max_model_len is not None:
         engine_kwargs["max_model_len"] = int(max_model_len)

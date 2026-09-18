@@ -13,6 +13,59 @@ from transformers.utils import logging as transformers_logging
 transformers_logging.disable_progress_bar()
 
 
+def effective_text_config(model_config):
+    """Return the decoder config used by ``AutoModelForCausalLM``.
+
+    Text-only checkpoints (Qwen3 and Llama) expose the decoder fields at the
+    top level.  Qwen3.5 is distributed as a composite vision-language config,
+    while ``AutoModelForCausalLM`` deliberately extracts ``text_config`` and
+    builds ``Qwen3_5ForCausalLM``.  Keeping this resolution in one place avoids
+    reading a missing top-level ``vocab_size`` and records the architecture we
+    actually train rather than the outer checkpoint container.
+    """
+    get_text_config = getattr(model_config, "get_text_config", None)
+    if callable(get_text_config):
+        text_config = get_text_config()
+        if text_config is not None:
+            return text_config
+    return getattr(model_config, "text_config", None) or model_config
+
+
+def model_vocab_size(model_config) -> int:
+    text_config = effective_text_config(model_config)
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if vocab_size is None:
+        raise ValueError(
+            "Model config does not expose a text vocabulary size at either "
+            "config.vocab_size or config.text_config.vocab_size"
+        )
+    return int(vocab_size)
+
+
+def is_qwen35_composite_text_model(model) -> bool:
+    """Whether a text-only HF model originated from a composite Qwen3.5 repo."""
+    source_config = getattr(model, "_b200_source_config", None)
+    return (
+        str(getattr(source_config, "model_type", "")) == "qwen3_5"
+        and str(getattr(getattr(model, "config", None), "model_type", ""))
+        == "qwen3_5_text"
+    )
+
+
+def qwen35_composite_weight_name(name: str) -> str:
+    """Map a HF Qwen3.5 text-only key to the official composite namespace.
+
+    vLLM <=0.26 registers the official Qwen3.5 conditional architecture but
+    not its text-only architecture.  Its conditional loader understands the
+    official ``model.language_model.*`` keys, so rollout IPC and exported
+    checkpoints use that namespace.  The trainable HF module itself remains
+    text-only and therefore does not allocate or optimize the vision tower.
+    """
+    if name.startswith("model."):
+        return "model.language_model." + name[len("model.") :]
+    return name
+
+
 def _dtype(name: str):
     values = {
         "bfloat16": torch.bfloat16,
@@ -43,8 +96,8 @@ def assert_tokenizer_compatibility(
         "vocab_mapping": student_tokenizer.get_vocab() == teacher_tokenizer.get_vocab(),
         "added_vocab": student_tokenizer.get_added_vocab()
         == teacher_tokenizer.get_added_vocab(),
-        "model_vocab_size": int(student_config.vocab_size)
-        == int(teacher_config.vocab_size),
+        "model_vocab_size": model_vocab_size(student_config)
+        == model_vocab_size(teacher_config),
         "tokenizer_length": len(student_tokenizer) == len(teacher_tokenizer),
     }
     if not all(fatal_checks.values()):
@@ -118,6 +171,8 @@ def inspect_model_assets(config: dict[str, Any]) -> dict[str, Any]:
     )
     student_config = AutoConfig.from_pretrained(student_path, local_files_only=True)
     teacher_config = AutoConfig.from_pretrained(teacher_path, local_files_only=True)
+    student_text_config = effective_text_config(student_config)
+    teacher_text_config = effective_text_config(teacher_config)
     compatibility = assert_tokenizer_compatibility(
         student_tokenizer, teacher_tokenizer, student_config, teacher_config
     )
@@ -126,6 +181,8 @@ def inspect_model_assets(config: dict[str, Any]) -> dict[str, Any]:
         "teacher_path": str(teacher_path),
         "student_model_type": student_config.model_type,
         "teacher_model_type": teacher_config.model_type,
+        "student_text_model_type": student_text_config.model_type,
+        "teacher_text_model_type": teacher_text_config.model_type,
         "student_parameters_declared": getattr(student_config, "num_parameters", None),
         "teacher_parameters_declared": getattr(teacher_config, "num_parameters", None),
         "compatibility": compatibility,
@@ -155,6 +212,16 @@ def load_models(config: dict[str, Any], device: torch.device):
     }
     student = AutoModelForCausalLM.from_pretrained(student_path, **common).to(device)
     teacher = AutoModelForCausalLM.from_pretrained(teacher_path, **common).to(device)
+    # Preserve the outer checkpoint configs.  This matters for Qwen3.5: the HF
+    # training modules are text-only, but vLLM 0.17 loads the official
+    # composite architecture.  Snapshot/IPC code uses this immutable metadata
+    # to translate only the serialization namespace; training stays text-only.
+    student._b200_source_config = AutoConfig.from_pretrained(
+        student_path, local_files_only=True
+    )
+    teacher._b200_source_config = AutoConfig.from_pretrained(
+        teacher_path, local_files_only=True
+    )
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
     teacher.eval()
@@ -223,6 +290,7 @@ def load_student_model(config: dict[str, Any], device: torch.device):
         **model_dtype_kwargs(dtype),
     }
     student = AutoModelForCausalLM.from_pretrained(student_path, **common).to(device)
+    student._b200_source_config = student_config
     training = config.get("training", {})
     if training.get("use_lora", False):
         from peft import LoraConfig, get_peft_model
@@ -253,6 +321,7 @@ def load_student_model(config: dict[str, Any], device: torch.device):
         "student_path": str(student_path),
         "teacher_path": None,
         "student_model_type": student_config.model_type,
+        "student_text_model_type": effective_text_config(student_config).model_type,
         "teacher_model_type": None,
         "student_parameters_declared": getattr(student_config, "num_parameters", None),
         "teacher_parameters_declared": None,

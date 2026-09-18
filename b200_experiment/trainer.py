@@ -68,9 +68,11 @@ from .eval_schedule import (
 )
 from .metadata import collect_metadata, save_metadata
 from .models import (
+    is_qwen35_composite_text_model,
     load_models,
     load_student_model,
     load_student_tokenizer,
+    qwen35_composite_weight_name,
     validate_shared_tokenizer_protocol,
 )
 from .fsdp import (
@@ -716,12 +718,48 @@ def _save_inference_snapshot(
         is_main = distributed is None or distributed.is_main
         if is_main:
             destination.mkdir(parents=True, exist_ok=True)
-            save_kwargs = {"state_dict": state_dict} if state_dict is not None else {}
-            raw_model.save_pretrained(
-                destination,
-                safe_serialization=True,
-                **save_kwargs,
-            )
+            if is_qwen35_composite_text_model(raw_model):
+                # Keep checkpoints simultaneously usable by:
+                #   1. AutoModelForCausalLM, which extracts the text_config; and
+                #   2. vLLM 0.17, which registers Qwen3.5's official composite
+                #      architecture but not Qwen3_5ForCausalLM.
+                # Only serialization names/config change. No vision parameters
+                # are materialized, trained, or added to the optimizer.
+                source_state = (
+                    state_dict if state_dict is not None else raw_model.state_dict()
+                )
+                composite_state = {
+                    qwen35_composite_weight_name(name): value
+                    for name, value in source_state.items()
+                }
+                if len(composite_state) != len(source_state):
+                    raise RuntimeError(
+                        "Qwen3.5 composite checkpoint key mapping produced a collision"
+                    )
+                previous_tied_keys = getattr(raw_model, "_tied_weights_keys", None)
+                # Qwen3.5-4B ties embeddings and lm_head. Tell safe serialization
+                # the mapped alias so it does not reject the shared storage.
+                raw_model._tied_weights_keys = {
+                    "lm_head.weight": "model.language_model.embed_tokens.weight"
+                }
+                try:
+                    raw_model.save_pretrained(
+                        destination,
+                        safe_serialization=True,
+                        state_dict=composite_state,
+                    )
+                finally:
+                    raw_model._tied_weights_keys = previous_tied_keys
+                raw_model._b200_source_config.save_pretrained(destination)
+            else:
+                save_kwargs = (
+                    {"state_dict": state_dict} if state_dict is not None else {}
+                )
+                raw_model.save_pretrained(
+                    destination,
+                    safe_serialization=True,
+                    **save_kwargs,
+                )
             tokenizer.save_pretrained(destination)
     finally:
         raw_model.config.use_cache = previous_use_cache

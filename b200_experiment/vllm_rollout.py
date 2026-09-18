@@ -23,6 +23,7 @@ from .fsdp import (
     materialize_full_parameters,
     validated_hf_named_parameters,
 )
+from .models import is_qwen35_composite_text_model, qwen35_composite_weight_name
 from .scoring import RolloutBatch
 
 
@@ -98,6 +99,15 @@ class VLLMRolloutEngine:
         self.base_url = f"http://127.0.0.1:{self.port}"
         atexit.register(self.close)
 
+    def _uses_qwen35_composite_config(self) -> bool:
+        try:
+            payload = json.loads(
+                (self.model_path / "config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+        return str(payload.get("model_type", "")) == "qwen3_5"
+
     @staticmethod
     def _free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
@@ -170,6 +180,11 @@ class VLLMRolloutEngine:
             command.append("--enable-chunked-prefill")
         if bool(self.settings.get("async_scheduling", True)):
             command.append("--async-scheduling")
+        if self._uses_qwen35_composite_config():
+            # Official Qwen3.5 repos are composite VLM checkpoints, but OPD is
+            # text-only. vLLM prunes the unused vision tower with this flag,
+            # reducing both startup memory and the set of expected weights.
+            command.append("--language-model-only")
         performance_mode = self.settings.get("performance_mode", "throughput")
         if performance_mode not in (None, ""):
             command.extend(("--performance-mode", str(performance_mode)))
@@ -313,6 +328,15 @@ class VLLMRolloutEngine:
             torch.cuda.synchronize()
             materialization_seconds = time.perf_counter() - materialize_started
             named_parameters = validated_hf_named_parameters(model, full_model)
+            if is_qwen35_composite_text_model(full_model):
+                # The trainer intentionally owns only Qwen3.5's text decoder,
+                # whereas vLLM 0.17 serves the official composite architecture.
+                # Present the same names used by the official checkpoint so
+                # vLLM's native HF-to-vLLM mapper targets language_model.*.
+                named_parameters = [
+                    (qwen35_composite_weight_name(name), parameter)
+                    for name, parameter in named_parameters
+                ]
             ipc_started = time.perf_counter()
             IPCWeightTransferEngine.trainer_send_weights(
                 iterator=iter(named_parameters), trainer_args=trainer_args

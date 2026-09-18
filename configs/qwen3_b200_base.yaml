@@ -16,7 +16,9 @@ distributed:
   fsdp:
     sharding_strategy: FULL_SHARD
     use_orig_params: true
-    transformer_layer_cls_names: [Qwen3DecoderLayer]
+    # Auto-detected from the HF model's _no_split_modules declaration. This
+    # resolves Qwen3DecoderLayer, LlamaDecoderLayer, or Qwen3_5DecoderLayer.
+    transformer_layer_cls_names: null
     teacher_cpu_offload: false
     # false reduces/scatters every accumulated microbatch and avoids retaining
     # full unsharded gradients. Enable only for a measured throughput experiment.

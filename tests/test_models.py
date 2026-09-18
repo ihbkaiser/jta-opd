@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 from b200_experiment.models import (
     assert_tokenizer_compatibility,
+    effective_text_config,
+    model_vocab_size,
+    qwen35_composite_weight_name,
     validate_shared_tokenizer_protocol,
 )
 
@@ -27,6 +30,43 @@ class _FakeTokenizer:
 
 
 class ModelCompatibilityTests(unittest.TestCase):
+    def test_composite_qwen35_uses_nested_text_config_and_vocab(self):
+        text_config = SimpleNamespace(model_type="qwen3_5_text", vocab_size=248320)
+        composite = SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+
+        self.assertIs(effective_text_config(composite), text_config)
+        self.assertEqual(model_vocab_size(composite), 248320)
+
+    def test_qwen35_text_weights_map_to_official_composite_namespace(self):
+        self.assertEqual(
+            qwen35_composite_weight_name("model.layers.0.self_attn.q_proj.weight"),
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+        )
+        self.assertEqual(
+            qwen35_composite_weight_name("model.embed_tokens.weight"),
+            "model.language_model.embed_tokens.weight",
+        )
+        self.assertEqual(
+            qwen35_composite_weight_name("lm_head.weight"), "lm_head.weight"
+        )
+
+    def test_qwen35_teacher_student_nested_vocab_is_compatible(self):
+        vocab = {"a": 0, "b": 1}
+        student = _FakeTokenizer(vocab, {}, {})
+        teacher = _FakeTokenizer(vocab, {}, {})
+        student_config = SimpleNamespace(
+            text_config=SimpleNamespace(vocab_size=2)
+        )
+        teacher_config = SimpleNamespace(
+            text_config=SimpleNamespace(vocab_size=2)
+        )
+
+        result = assert_tokenizer_compatibility(
+            student, teacher, student_config, teacher_config
+        )
+
+        self.assertTrue(result["model_vocab_size"])
+
     def test_special_token_roles_may_differ_when_integer_vocab_is_exact(self):
         vocab = {"a": 0, "<eos>": 1, "<pad>": 2}
         student = _FakeTokenizer(vocab, {"<pad>": 2}, {"eos_token": "<eos>"})

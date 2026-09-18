@@ -45,7 +45,7 @@ ARGS=(
   --gpu-workspace-headroom-gib "${REEVAL_VLLM_GPU_WORKSPACE_HEADROOM_GIB:-${EVAL_VLLM_GPU_WORKSPACE_HEADROOM_GIB:-2}}"
   --max-num-seqs "${REEVAL_VLLM_MAX_NUM_SEQS:-${EVAL_VLLM_MAX_NUM_SEQS:-256}}"
   --max-model-len "${REEVAL_VLLM_MAX_MODEL_LEN:-${EVAL_VLLM_MAX_MODEL_LEN:-9216}}"
-  --seed "${REEVAL_SEED:-1234}"
+  --seed "${REEVAL_SEED:-42}"
   --base-cache-dir "${REEVAL_BASE_CACHE_DIR:-outputs/.base_eval_cache}"
 )
 if [[ -n "${REEVAL_BENCHMARKS:-}" ]]; then

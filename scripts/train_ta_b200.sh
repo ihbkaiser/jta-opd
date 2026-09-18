@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ================= USER CONFIG: TA-OPD ==========================
 # A fresh invocation gets a local-time run name automatically. You can still
 # pass RUN_NAME=... explicitly, especially when resuming an existing run.
+# Supported examples (teacher/student must have exactly the same tokenizer):
+# Qwen3.5-9B -> Qwen3.5-4B and Llama-3.1-8B-Instruct ->
+# Llama-3.2-3B-Instruct under /workspace/storage-shared/models. Only these two
+# variables need changing; decoder/FSDP type is auto-detected.
 export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
 export TEACHER_MODEL="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-models/Qwen3-8B}}"
 case "${TRAIN_DATASET:-competition_math}" in

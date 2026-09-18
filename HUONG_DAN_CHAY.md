@@ -35,6 +35,30 @@ export TRAIN_DATA=nlp/minhpn19/data/competition_math/data/train-00000-of-00001.p
 export PROMPT_KEY=problem
 ```
 
+### Đổi model family chỉ bằng hai path
+
+Code tự nhận diện `Qwen3DecoderLayer`, `Qwen3_5DecoderLayer` hoặc
+`LlamaDecoderLayer`; không cần sửa YAML/FSDP. Teacher và student bắt buộc có
+cùng ánh xạ token-ID (preflight sẽ dừng sớm nếu không đúng).
+
+Qwen3.5-9B teacher, Qwen3.5-4B student:
+
+```bash
+export TEACHER_MODEL=/workspace/storage-shared/models/Qwen3.5-9B
+export STUDENT_MODEL=/workspace/storage-shared/models/Qwen3.5-4B
+```
+
+Llama-3.1-8B-Instruct teacher, Llama-3.2-3B-Instruct student:
+
+```bash
+export TEACHER_MODEL=/workspace/storage-shared/models/Llama-3.1-8B-Instruct
+export STUDENT_MODEL=/workspace/storage-shared/models/Llama-3.2-3B-Instruct
+```
+
+Muốn quay lại Qwen3 thì chỉ đặt lại đúng hai biến như block mặc định phía trên.
+Qwen3.5 cần `transformers>=4.57,<5`; chạy lại `pip install -r requirements.txt`
+nếu environment cũ chưa nhận diện `qwen3_5`.
+
 Preset DAPO-Math:
 
 ```bash
@@ -433,16 +457,22 @@ BATCH_SIZE=64 MICRO_BATCH_SIZE_PER_GPU=4 SCORE_MICRO_BATCH_SIZE=4 \
 Giữ nguyên `RUN_NAME`; `RESUME=auto` sẽ tìm checkpoint hoàn chỉnh mới nhất trong output tương ứng:
 
 ```bash
-RUN_NAME="$OPD_RUN_NAME" RESUME=auto MAX_STEPS=200 \
+RUN_NAME="$OPD_RUN_NAME" RESUME=auto \
   bash scripts/train_opd_b200.sh
 
-RUN_NAME="$TA_RUN_NAME" RESUME=auto MAX_STEPS=200 \
+RUN_NAME="$TA_RUN_NAME" RESUME=auto \
   bash scripts/train_ta_b200.sh
 
-RUN_NAME="$CMT_RUN_NAME" RESUME=auto MAX_STEPS=200 \
-  bash scripts/train_cmt_b200.sh
+RUN_NAME="822192681" RESUME=auto \
+  bash scripts/train_cmt_b200_14b.sh
 
-RUN_NAME="$GRPO_RUN_NAME" RESUME=auto MAX_STEPS=200 \
+RUN_NAME="601241037" RESUME=auto \
+  bash scripts/train_cmt_b200_14b_dapo.sh
+
+RUN_NAME="734372756" RESUME=auto \
+  bash scripts/train_cmt_b200_4b_dapo.sh
+
+RUN_NAME="$GRPO_RUN_NAME" RESUME=auto \
   bash scripts/train_grpo_b200.sh
 ```
 
@@ -614,10 +644,10 @@ EVAL_NUM_RESPONSES=8 EVAL_METRIC=avg@8 EVAL_TEMPERATURE=0.7 \
 Re-evaluate **toàn bộ checkpoint** của một run chỉ với hai bộ mới:
 
 ```bash
-REEVAL_BENCHMARKS="GPQA-Diamond,AMC23" \
+REEVAL_BENCHMARKS="Competition-MATH,MATH-500,AIME24,AIME25,GPQA-Diamond,AMC23" \
 REEVAL_NUM_RESPONSES=8 REEVAL_METRIC=avg@8 \
-CUDA_VISIBLE_DEVICES=0,1 REEVAL_WORLD_SIZE=2 \
-  bash scripts/reeval_method_checkpoints_b200.sh cmt "$CMT_RUN_NAME"
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 REEVAL_WORLD_SIZE=8 \
+  bash scripts/reeval_method_checkpoints_b200.sh cmt "cmt_20260918_111418_822192681"
 ```
 
 Các run tạo trước khi cập nhật (resolved config chỉ có 4 bộ) cũng chạy được: script tự

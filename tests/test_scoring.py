@@ -10,6 +10,7 @@ from b200_experiment.scoring import (
     _joint_full_vocab_metrics,
     score_original_rollout,
     score_student_teacher_rollout,
+    supports_response_only_logits,
 )
 
 
@@ -73,6 +74,10 @@ class _RecordingQwenModel(_FakeModel):
 
 
 class ScoringTests(unittest.TestCase):
+    def test_qwen35_text_uses_response_only_logits(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5_text"))
+        self.assertTrue(supports_response_only_logits(model))
+
     def test_joint_bidirectional_scoring_matches_three_independent_forwards(self):
         torch.manual_seed(23)
         student_logits = torch.randn(4, 7, 17)

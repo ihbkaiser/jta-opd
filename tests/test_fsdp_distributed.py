@@ -13,6 +13,7 @@ from transformers.modeling_outputs import CausalLMOutput
 
 from b200_experiment.distributed import DistributedContext
 from b200_experiment.fsdp import (
+    _transformer_layer_classes,
     full_model_state_dict,
     full_optimizer_state_dict,
     materialize_full_parameters,
@@ -60,6 +61,25 @@ class _TinyQwen3LM(nn.Module):
         return CausalLMOutput(logits=self.lm_head(hidden))
 
 
+class Qwen3_5DecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+
+
+class _FamilyAgnosticContainer(nn.Module):
+    def __init__(self, layer_type):
+        super().__init__()
+        self._no_split_modules = [layer_type.__name__, "UnusedVisionBlock"]
+        self.layer = layer_type()
+
+
 def _config() -> dict:
     return {
         "distributed": {
@@ -80,6 +100,21 @@ def _config() -> dict:
             "max_grad_norm": 1.0,
         },
     }
+
+
+class FSDPAutoDetectionTests(unittest.TestCase):
+    def test_auto_detects_qwen3_qwen35_and_llama_decoder_layers(self):
+        cases = (
+            (_TinyQwen3LM(), Qwen3DecoderLayer),
+            (_FamilyAgnosticContainer(Qwen3_5DecoderLayer), Qwen3_5DecoderLayer),
+            (_FamilyAgnosticContainer(LlamaDecoderLayer), LlamaDecoderLayer),
+        )
+        for model, expected in cases:
+            with self.subTest(layer=expected.__name__):
+                classes = _transformer_layer_classes(
+                    model, {"transformer_layer_cls_names": None}
+                )
+                self.assertEqual(classes, {expected})
 
 
 def _fsdp_worker(rank: int, rendezvous: str, output_root: str) -> None:

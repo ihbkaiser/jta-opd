@@ -1,5 +1,7 @@
 torch>=2.6
-transformers>=4.51
+# Qwen3.5 AutoModelForCausalLM support (including extraction of text_config)
+# first appears in the compatible 4.57 line. Keep <5 for vLLM 0.17.x.
+transformers>=4.57,<5
 accelerate>=1.2
 peft>=0.14
 pandas>=2.0
