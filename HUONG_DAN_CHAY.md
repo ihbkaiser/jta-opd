@@ -131,7 +131,7 @@ RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
 CMT mặc định dùng `CMT_ALLOCATION_KL=0.5`, `CMT_GAMMA=1.0`,
-`CMT_SUCCESSOR_LAMBDA=1.0`, Top-K union support và `top_p=1`. Full-vocabulary CMT diagnostics
+`CMT_SUCCESSOR_LAMBDA=1.0`, student Top-K support và `top_p=1`. Full-vocabulary CMT diagnostics
 không bật mặc định:
 
 ```bash

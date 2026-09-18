@@ -5,7 +5,7 @@ experiment:
   output_dir: outputs/cmt_opd
 
 # Coupled Marginal Teachability uses the conditional student/teacher
-# Top-K-union simplex for local selection/loss geometry, and a raw-mass
+# student-Top-K simplex for local selection/loss geometry, and a raw-mass
 # truncated Top-K common-mass kernel for sequential accessibility.
 # Exact full-vocabulary reductions are opt-in diagnostics only.
 selector:

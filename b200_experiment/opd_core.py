@@ -115,8 +115,10 @@ class TopKOPDReference:
     teacher_log_probs: torch.Tensor
     student_weights: torch.Tensor
     advantages: torch.Tensor
-    # PGT uses a literal student/teacher Top-K union.  Legacy OPD/TA/RAC use
-    # the all-True default, preserving the pinned upstream objective.
+    # CMT/PGT use the all-True student Top-K support to conditionalize the
+    # differentiable loss. Legacy OPD/TA/RAC use ``None``, preserving the
+    # pinned upstream full-vocabulary log-probability objective on the same
+    # student Top-K candidate IDs.
     support_mask: torch.Tensor | None = None
 
 
@@ -151,7 +153,8 @@ def build_topk_opd_reference(
     across K, then uses ``token_reward_direct`` so these rewards become the
     detached candidate-wise advantages.  Legacy callers pass full-vocabulary
     log-probabilities; PGT/CMT pass conditional probabilities on their explicit
-    union support, making the same core support-consistent for those methods.
+    student Top-K support, making the same core support-consistent for those
+    methods.
     """
     _validate_topk_tensors(
         student_log_probs, teacher_log_probs, valid_mask, support_mask
@@ -238,7 +241,7 @@ def gather_candidate_log_probs(
 
     When ``support_mask`` is supplied, probabilities are conditionalized on
     the executable candidate support.  This is the geometry used by CMT/PGT:
-    the optimizer's categorical simplex is exactly the Top-K union rather than
+    the optimizer's categorical simplex is exactly the student Top-K rather than
     the unmaterialized vocabulary tail.
     """
     if response_logits.ndim != 3 or candidate_ids.ndim != 3:

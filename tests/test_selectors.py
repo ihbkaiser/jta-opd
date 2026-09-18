@@ -16,15 +16,16 @@ from b200_experiment.selectors import (
 from b200_experiment.selectors.base import robust_quantile_normalize
 
 
-def _literal_ta_reference(p, q, valid, top_k):
+def _student_topk_ta_reference(p, q, valid, top_k):
     disagreements, compatibilities = [], []
     for p_row, q_row in zip(p[valid], q[valid]):
         student_ids = torch.topk(p_row, top_k).indices
-        teacher_ids = torch.topk(q_row, top_k).indices
-        union = torch.unique(torch.cat((student_ids, teacher_ids)), sorted=False)
-        p_union, q_union = p_row[union], q_row[union]
-        p_union, q_union = p_union / p_union.sum(), q_union / q_union.sum()
-        disagreements.append((q_union * (q_union.log() - p_union.log())).sum())
+        p_support, q_support = p_row[student_ids], q_row[student_ids]
+        p_support = p_support / p_support.sum()
+        q_support = q_support / q_support.sum()
+        disagreements.append(
+            (q_support * (q_support.log() - p_support.log())).sum()
+        )
         compatibilities.append(q_row[student_ids].sum())
     d, c = torch.stack(disagreements), torch.stack(compatibilities)
     return robust_quantile_normalize(d) * robust_quantile_normalize(c)
@@ -39,15 +40,16 @@ class SelectorTests(unittest.TestCase):
             [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1], [1, 0, 0, 0, 0]], dtype=torch.bool
         )
 
-    def test_ta_matches_literal_union_kl_and_teacher_mass_definition(self):
+    def test_ta_matches_student_topk_kl_and_teacher_mass_definition(self):
         output = TASelector(top_k=8).compute_scores(self.p, self.q, self.valid)
-        expected = _literal_ta_reference(self.p, self.q, self.valid, 8)
+        expected = _student_topk_ta_reference(self.p, self.q, self.valid, 8)
         self.assertTrue(torch.allclose(output.scores[self.valid], expected, atol=2e-6))
         student_ids = torch.topk(self.p[self.valid], 8, dim=-1).indices
         expected_c = self.q[self.valid].gather(-1, student_ids).sum(-1)
         self.assertTrue(
             torch.allclose(output.diagnostics["C"][self.valid], expected_c, atol=1e-7)
         )
+        self.assertEqual(output.diagnostics["support_definition"], "student_topk")
 
     def test_pure_opd_uniformly_supervises_every_valid_token(self):
         output = OPDSelector().compute_scores(self.valid)
@@ -100,6 +102,32 @@ class SelectorTests(unittest.TestCase):
                     atol=2e-6,
                     rtol=2e-6,
                 ),
+                key,
+            )
+
+    def test_ta_compact_path_ignores_teacher_only_topk_tokens(self):
+        student_logits = self.p.log()
+        teacher_logits = self.q.log()
+        student_ids = torch.topk(student_logits, 8, dim=-1).indices
+        teacher_ids = torch.topk(teacher_logits, 8, dim=-1).indices
+        common = (
+            student_ids,
+            teacher_ids,
+            student_logits.gather(-1, student_ids),
+            teacher_logits.gather(-1, student_ids),
+            teacher_logits.gather(-1, teacher_ids),
+            student_logits.gather(-1, teacher_ids),
+            self.valid,
+        )
+        reference = TASelector(top_k=8).compute_scores_from_topk(*common)
+        changed = list(common)
+        changed[1] = torch.full_like(teacher_ids, teacher_logits.shape[-1] - 1)
+        changed[4] = torch.randn_like(changed[4]) * 100
+        changed[5] = torch.randn_like(changed[5]) * 100
+        actual = TASelector(top_k=8).compute_scores_from_topk(*changed)
+        for key in ("D", "C", "D_norm", "C_norm", "s_TA"):
+            self.assertTrue(
+                torch.allclose(actual.diagnostics[key], reference.diagnostics[key]),
                 key,
             )
 

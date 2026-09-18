@@ -34,12 +34,14 @@ class TASelector:
         normalize: bool = True,
         token_chunk_size: int = 2048,
     ) -> SelectorOutput:
-        """Compute exact TA statistics from compact cross-scored Top-K sets.
+        """Compute exact TA statistics on the student Top-K support.
 
         Full-vocabulary log-probabilities differ from logits only by a constant
-        at each position. Renormalizing their union therefore produces exactly
-        the same D and C as ``compute_scores_from_logits`` without retaining a
-        [B,T,V] tensor for either model.
+        at each position. Renormalizing both models on the student Top-K IDs
+        therefore produces exactly the same D and C as
+        ``compute_scores_from_logits`` without retaining a [B,T,V] tensor for
+        either model.  Teacher Top-K tensors remain accepted for compatibility
+        with the shared scorer but are not used to construct the support.
         """
         tensors = (
             student_top_k_ids,
@@ -69,30 +71,13 @@ class TASelector:
         chunk_size = max(1, int(token_chunk_size))
         for begin in range(0, valid_indices.numel(), chunk_size):
             indices = valid_indices[begin : begin + chunk_size]
-            stu_ids, tea_ids, stu_logp, tea_on_stu, tea_logp, stu_on_tea = [
+            _stu_ids, _tea_ids, stu_logp, tea_on_stu, _tea_logp, _stu_on_tea = [
                 value.index_select(0, indices) for value in flattened
             ]
-            union_ids = torch.cat((stu_ids, tea_ids), dim=-1)
-            unique = ~torch.tril(
-                union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2)), diagonal=-1
-            ).any(dim=-1)
-            negative_infinity = torch.full_like(
-                union_ids, -torch.inf, dtype=torch.float32
-            )
-            student_union = torch.where(
-                unique,
-                torch.cat((stu_logp, stu_on_tea), dim=-1).float(),
-                negative_infinity,
-            )
-            teacher_union = torch.where(
-                unique,
-                torch.cat((tea_on_stu, tea_logp), dim=-1).float(),
-                negative_infinity,
-            )
-            p_norm = torch.softmax(student_union, dim=-1).clamp_min(self.eps)
-            q_norm = torch.softmax(teacher_union, dim=-1).clamp_min(self.eps)
+            p_norm = torch.softmax(stu_logp.float(), dim=-1).clamp_min(self.eps)
+            q_norm = torch.softmax(tea_on_stu.float(), dim=-1).clamp_min(self.eps)
             disagreement_chunks.append(
-                (q_norm * (q_norm.log() - p_norm.log()) * unique).sum(dim=-1)
+                (q_norm * (q_norm.log() - p_norm.log())).sum(dim=-1)
             )
             compatibility_chunks.append(
                 torch.exp(tea_on_stu.float()).sum(dim=-1).clamp_(0.0, 1.0)
@@ -117,7 +102,8 @@ class TASelector:
             "C_norm": scatter_valid(c_norm, valid_mask),
             "s_TA": scatter_valid(score, valid_mask),
             "compatibility_convention": "teacher_mass_on_student_topk",
-            "score_input": "compact_cross_scored_student_teacher_topk",
+            "score_input": "compact_teacher_gathered_on_student_topk",
+            "support_definition": "student_topk",
         }
         return SelectorOutput(diagnostics["s_TA"], diagnostics)
 
@@ -153,21 +139,17 @@ class TASelector:
 
         k = min(self.top_k, p.shape[-1])
         _, p_top_ids = torch.topk(p, k=k, dim=-1)
-        _, q_top_ids = torch.topk(q, k=k, dim=-1)
-        union_ids = torch.cat((p_top_ids, q_top_ids), dim=-1)
-        equal = union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2))
-        unique = ~torch.tril(equal, diagonal=-1).any(dim=-1)
-        # U is the literal union of the two top-K ID sets. Both distributions
-        # are evaluated on every ID in U before being renormalized.
-        p_union = p.gather(-1, union_ids) * unique
-        q_union = q.gather(-1, union_ids) * unique
+        # U is exactly the student's Top-K ID set.  The teacher is evaluated
+        # on those same IDs before both distributions are conditionalized.
+        p_support = p.gather(-1, p_top_ids)
+        q_support = q.gather(-1, p_top_ids)
         p_norm = (
-            p_union / p_union.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            p_support / p_support.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         ).clamp_min(self.eps)
         q_norm = (
-            q_union / q_union.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            q_support / q_support.sum(dim=-1, keepdim=True).clamp_min(self.eps)
         ).clamp_min(self.eps)
-        disagreement = (q_norm * (q_norm.log() - p_norm.log()) * unique).sum(dim=-1)
+        disagreement = (q_norm * (q_norm.log() - p_norm.log())).sum(dim=-1)
 
         compatibility = q.gather(-1, p_top_ids).sum(dim=-1).clamp_(0.0, 1.0)
         if normalize:
@@ -188,6 +170,7 @@ class TASelector:
             "C_norm": scatter_valid(c_norm, valid_mask),
             "s_TA": scatter_valid(score, valid_mask),
             "compatibility_convention": "teacher_mass_on_student_topk",
+            "support_definition": "student_topk",
         }
         return SelectorOutput(diagnostics["s_TA"], diagnostics)
 
@@ -203,7 +186,7 @@ class TASelector:
         normalize: bool = True,
         token_chunk_size: int = 2048,
     ) -> SelectorOutput:
-        """Same TA definition while materializing probabilities only on U."""
+        """Same TA definition while materializing only student Top-K values."""
         if student_logits.shape != teacher_logits.shape:
             raise ValueError("Student and teacher logits must have identical shape")
         if student_logits.shape[:2] != valid_mask.shape:
@@ -234,23 +217,12 @@ class TASelector:
             q = flat_q.index_select(0, indices)
             q_log_z = flat_q_log_z.index_select(0, indices).float()
             p_top_ids = torch.topk(p, k=k, dim=-1).indices
-            q_top_ids = torch.topk(q, k=k, dim=-1).indices
-            union_ids = torch.cat((p_top_ids, q_top_ids), dim=-1)
-            equal = union_ids.unsqueeze(-1).eq(union_ids.unsqueeze(-2))
-            unique = ~torch.tril(equal, diagonal=-1).any(dim=-1)
-            negative_infinity = torch.full_like(
-                union_ids, -torch.inf, dtype=torch.float32
-            )
-            p_union_logits = torch.where(
-                unique, p.gather(-1, union_ids).float(), negative_infinity
-            )
-            q_union_logits = torch.where(
-                unique, q.gather(-1, union_ids).float(), negative_infinity
-            )
-            p_norm = torch.softmax(p_union_logits, dim=-1).clamp_min(self.eps)
-            q_norm = torch.softmax(q_union_logits, dim=-1).clamp_min(self.eps)
+            p_support_logits = p.gather(-1, p_top_ids).float()
+            q_support_logits = q.gather(-1, p_top_ids).float()
+            p_norm = torch.softmax(p_support_logits, dim=-1).clamp_min(self.eps)
+            q_norm = torch.softmax(q_support_logits, dim=-1).clamp_min(self.eps)
             disagreement_chunks.append(
-                (q_norm * (q_norm.log() - p_norm.log()) * unique).sum(dim=-1)
+                (q_norm * (q_norm.log() - p_norm.log())).sum(dim=-1)
             )
             compatibility_chunks.append(
                 torch.exp(q.gather(-1, p_top_ids).float() - q_log_z.unsqueeze(-1))
@@ -277,6 +249,7 @@ class TASelector:
             "C_norm": scatter_valid(c_norm, valid_mask),
             "s_TA": scatter_valid(score, valid_mask),
             "compatibility_convention": "teacher_mass_on_student_topk",
-            "score_input": "bf16_logits_with_fp32_union_and_normalizer",
+            "score_input": "bf16_logits_with_fp32_student_topk_and_normalizer",
+            "support_definition": "student_topk",
         }
         return SelectorOutput(diagnostics["s_TA"], diagnostics)

@@ -69,7 +69,7 @@ def kl_constrained_allocation(
 class CMTSelector:
     """Support-matched, local-excess Coupled Marginal Teachability.
 
-    The executable action space is the literal Top-K union U.  Student and
+    The executable action space is the student Top-K support U.  Student and
     teacher probabilities are conditionalized on U by ``PGTSelector`` for the
     local PGT/OPD geometry.  Sequential accessibility instead uses the original
     probability mass on U, yielding the truncated sub-Markov kernel
@@ -170,8 +170,8 @@ class CMTSelector:
         g = pgt_support.diagnostics["gain"].detach().float().clamp_min(0.0)
         g = torch.where(valid, g, torch.zeros_like(g))
 
-        student_mass = pgt_support.diagnostics["student_union_mass"].detach().float()
-        teacher_mass = pgt_support.diagnostics["teacher_union_mass"].detach().float()
+        student_mass = pgt_support.diagnostics["student_support_mass"].detach().float()
+        teacher_mass = pgt_support.diagnostics["teacher_support_mass"].detach().float()
         tiny = torch.finfo(torch.float32).tiny
         student_mass = student_mass.clamp_min(tiny)
         teacher_mass = teacher_mass.clamp_min(tiny)
@@ -308,7 +308,7 @@ class CMTSelector:
                 valid, student_mass, torch.zeros_like(student_mass)
             ),
             coverage_correction=coverage_correction,
-            teacher_union_mass=torch.where(
+            teacher_support_mass=torch.where(
                 valid, teacher_mass, torch.zeros_like(teacher_mass)
             ),
             conditional_support_common_mass=torch.where(
@@ -335,7 +335,7 @@ class CMTSelector:
             ablation_arm=self.ablation_arm,
             ablation_score=learning_value,
             transition_definition=(
-                "truncated_original_union_common_mass_without_inverse_coverage"
+                "truncated_original_student_topk_common_mass_without_inverse_coverage"
             ),
             gamma=self.gamma,
             successor_lambda=self.successor_lambda,

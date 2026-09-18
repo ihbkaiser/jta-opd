@@ -34,6 +34,9 @@ class SelectedTokenLogger:
                 "format": "gzip JSONL; concatenated gzip members are valid",
                 "scope": "selected/accepted response positions only",
                 "method": method,
+                "support_definition": (
+                    "student_topk" if method in {"opd", "ta", "pgt", "cmt"} else None
+                ),
                 "chunk_steps": self.chunk_steps,
                 "distributed_world_size": self.world_size,
                 "distributed_file_pattern": (
@@ -58,8 +61,8 @@ class SelectedTokenLogger:
                         "gain",
                         "euclidean_gain",
                         "restricted_reverse_kl",
-                        "student_union_mass",
-                        "teacher_union_mass",
+                        "student_support_mass",
+                        "teacher_support_mass",
                         "teacher_tail_mass",
                         "s_PGT",
                     ],
@@ -119,8 +122,8 @@ class SelectedTokenLogger:
                 "gain",
                 "euclidean_gain",
                 "restricted_reverse_kl",
-                "student_union_mass",
-                "teacher_union_mass",
+                "student_support_mass",
+                "teacher_support_mass",
                 "teacher_tail_mass",
                 "s_PGT",
             ),
@@ -202,8 +205,8 @@ class TokenScoreStatsLogger:
                 "gain": (0.0, 10.0),
                 "euclidean_gain": (0.0, 10.0),
                 "restricted_reverse_kl": (-10.0, 10.0),
-                "student_union_mass": (0.0, 1.0),
-                "teacher_union_mass": (0.0, 1.0),
+                "student_support_mass": (0.0, 1.0),
+                "teacher_support_mass": (0.0, 1.0),
                 "teacher_tail_mass": (0.0, 1.0),
             }
         elif method == "cmt":

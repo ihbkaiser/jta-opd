@@ -69,6 +69,25 @@ class TopKOPDCoreTests(unittest.TestCase):
             torch.allclose(reference.advantages, upstream_reward, atol=1e-6)
         )
 
+    def test_opd_gathers_teacher_only_on_student_topk_ids(self):
+        student_logits = torch.tensor([[[9.0, 8.0, 1.0, 0.0]]])
+        teacher_logits = torch.tensor([[[0.0, 1.0, 8.0, 9.0]]])
+        valid = torch.tensor([[True]])
+        reference = topk_reference_from_logits(
+            student_logits, teacher_logits, valid, top_k=2
+        )
+        expected_ids = torch.tensor([[[0, 1]]])
+        teacher_all = torch.log_softmax(teacher_logits.float(), dim=-1)
+        self.assertTrue(torch.equal(reference.candidate_ids, expected_ids))
+        self.assertTrue(
+            torch.allclose(
+                reference.teacher_log_probs,
+                teacher_all.gather(-1, expected_ids),
+            )
+        )
+        self.assertFalse(bool(reference.candidate_ids.eq(2).any()))
+        self.assertFalse(bool(reference.candidate_ids.eq(3).any()))
+
     def test_policy_loss_uses_all_candidates_not_only_sampled_token(self):
         student = torch.log_softmax(torch.arange(16, dtype=torch.float32), dim=0)
         teacher = torch.log_softmax(

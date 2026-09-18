@@ -101,8 +101,8 @@ def selector_summary(
             "s_PGT",
             "euclidean_gain",
             "restricted_reverse_kl",
-            "student_union_mass",
-            "teacher_union_mass",
+            "student_support_mass",
+            "teacher_support_mass",
             "teacher_tail_mass",
             "support_width",
         )
@@ -127,8 +127,8 @@ def selector_summary(
             "sequential_gain",
             "learning_value",
             "w",
-            "student_union_mass",
-            "teacher_union_mass",
+            "student_support_mass",
+            "teacher_support_mass",
             "teacher_tail_mass",
             # Optional full-vocabulary audit fields are present only when
             # cmt_full_vocab_diagnostics is enabled; selector_summary skips

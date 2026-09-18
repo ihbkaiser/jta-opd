@@ -1,5 +1,11 @@
 # CMT-OPD refinement: support-matched bounded truncated-kernel formulation
 
+> **Implementation note (2026-09-18):** production support is now
+> `U_t = TopK(student_t)`. The derivation below remains applicable with this
+> definition of `U_t`; historical references to a student/teacher “union”
+> describe the earlier implementation and must not be read as current code
+> semantics. Teacher probabilities are gathered only on student Top-K IDs.
+
 Ngày 2026-09-06, tôi tiếp tục audit CMT v1 theo các failure mode mới được nêu:
 geometry mismatch, length bias, variance của one-rollout estimator, coupling
 semantics, frozen descendants, Gibbs allocation và inverse-coverage variance.

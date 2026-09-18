@@ -6,9 +6,9 @@ experiment:
 
 # PGT is a local projected-gradient selector.  It intentionally does not use
 # Bellman/RAC recurrence or discounting.  The selector reuses TA's joint
-# student/teacher Top-K cross-scoring and trains on the literal support union.
-# Both distributions are conditionalized on that union so selector geometry and
-# the differentiable candidate loss use the same categorical simplex.
+# student/teacher Top-K cross-scoring but trains only on student Top-K IDs.
+# Both distributions are conditionalized on that support so selector geometry
+# and the differentiable candidate loss use the same categorical simplex.
 selector:
   joint_cross_scoring: true
   pgt_vocab_chunk_tokens: 2048

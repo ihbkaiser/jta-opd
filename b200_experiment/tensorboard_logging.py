@@ -68,7 +68,7 @@ PGT_TAGS = {
     "pgt/gain_mean": ("gain", "mean"),
     "pgt/gain_std": ("gain", "std"),
     "pgt/euclidean_gain_mean": ("euclidean_gain", "mean"),
-    "pgt/teacher_union_mass_mean": ("teacher_union_mass", "mean"),
+    "pgt/teacher_support_mass_mean": ("teacher_support_mass", "mean"),
     "pgt/teacher_tail_mass_mean": ("teacher_tail_mass", "mean"),
     "pgt/restricted_reverse_kl_mean": ("restricted_reverse_kl", "mean"),
     "pgt/selected_fraction": ("selected_fraction",),

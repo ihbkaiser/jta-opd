@@ -21,5 +21,6 @@ class OPDSelector:
             {
                 "w": weights,
                 "weighting": "uniform_all_valid_response_tokens",
+                "support_definition": "student_topk",
             },
         )

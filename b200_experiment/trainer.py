@@ -366,8 +366,8 @@ def _globalize_pgt_output(
         "s_PGT",
         "euclidean_gain",
         "restricted_reverse_kl",
-        "student_union_mass",
-        "teacher_union_mass",
+        "student_support_mass",
+        "teacher_support_mass",
         "teacher_tail_mass",
         "support_width",
     )
@@ -408,8 +408,8 @@ def _globalize_cmt_output(
         "sequential_gain",
         "learning_value",
         "s_CMT",
-        "student_union_mass",
-        "teacher_union_mass",
+        "student_support_mass",
+        "teacher_support_mass",
         "teacher_tail_mass",
         "support_width",
     )
@@ -598,7 +598,7 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
     for score in (
         "D", "C", "s_TA", "g", "alignment", "R", "M", "V", "z", "w",
         "gain", "s_PGT", "euclidean_gain", "restricted_reverse_kl",
-        "student_union_mass", "teacher_union_mass", "teacher_tail_mass", "support_width",
+        "student_support_mass", "teacher_support_mass", "teacher_tail_mass", "support_width",
         "support_common_mass", "conditional_support_common_mass",
         "transition_weight", "support_coverage", "coverage_correction",
         "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
@@ -676,7 +676,7 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         for score in (
             "D", "C", "s_TA", "g", "alignment", "R", "M", "V", "z", "w",
             "gain", "s_PGT", "euclidean_gain", "restricted_reverse_kl",
-            "student_union_mass", "teacher_union_mass", "teacher_tail_mass", "support_width",
+            "student_support_mass", "teacher_support_mass", "teacher_tail_mass", "support_width",
             "support_common_mass", "conditional_support_common_mass",
             "transition_weight", "support_coverage", "coverage_correction",
             "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
@@ -3416,6 +3416,12 @@ def run_training(
             reference_student_log_probs = pgt_raw.student_candidate_log_probs
             reference_teacher_log_probs = pgt_raw.teacher_candidate_log_probs
             reference_support_mask = pgt_raw.support_mask
+        if method != "iw" and not torch.equal(
+            reference_candidate_ids, student_scores.top_k_ids
+        ):
+            raise AssertionError(
+                f"{method.upper()} candidate support must equal student Top-K IDs"
+            )
         cmt_raw: PGTOutput | None = None
         cmt_score_time = 0.0
         if method == "cmt":
@@ -4008,22 +4014,21 @@ def run_training(
             }[method],
             "objective_normalization": "global_weighted_token_mean",
             "opd_upstream_commit": UPSTREAM_OPD_COMMIT,
+            "support_definition": (
+                "sampled_response_action" if method == "iw" else "student_topk"
+            ),
             "opd_candidate_support": (
                 "sampled_response_action"
                 if method == "iw"
-                else (
-                    "student_teacher_top_k_union"
-                    if method in {"pgt", "cmt"}
-                    else "student_top_k"
-                )
+                else "student_topk"
             ),
             "opd_support_geometry": (
                 "sampled_action_singleton"
                 if method == "iw"
                 else (
-                    "conditional_student_teacher_union"
+                    "conditional_student_teacher_on_student_topk"
                     if method in {"pgt", "cmt"}
-                    else "legacy_global_log_probability_support"
+                    else "global_log_probabilities_on_student_topk_candidates"
                 )
             ),
             "opd_top_k": top_k,
