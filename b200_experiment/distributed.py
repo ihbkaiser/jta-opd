@@ -46,9 +46,7 @@ def isolate_distributed_subprocess_environment(
     """
     isolated = dict(os.environ if environment is None else environment)
     for name in tuple(isolated):
-        if name in _DISTRIBUTED_LAUNCH_ENVIRONMENT or name.startswith(
-            "TORCHELASTIC_"
-        ):
+        if name in _DISTRIBUTED_LAUNCH_ENVIRONMENT or name.startswith("TORCHELASTIC_"):
             isolated.pop(name)
     return isolated
 
@@ -236,13 +234,9 @@ def batch_layout(
     local_prompts = (
         values["global_prompt_batch_size"] + values["world_size"] - 1
     ) // values["world_size"]
-    global_trajectories = (
-        values["global_prompt_batch_size"] * values["num_responses"]
-    )
+    global_trajectories = values["global_prompt_batch_size"] * values["num_responses"]
     ppo_size = (
-        global_trajectories
-        if ppo_mini_batch_size is None
-        else int(ppo_mini_batch_size)
+        global_trajectories if ppo_mini_batch_size is None else int(ppo_mini_batch_size)
     )
     if ppo_size <= 0:
         raise ValueError("ppo_mini_batch_size must be positive")
@@ -262,17 +256,10 @@ def batch_layout(
         local_trajectory_batch_size=local_prompts * values["num_responses"],
         ppo_mini_batch_size=ppo_size,
         local_ppo_mini_batch_size=local_ppo_size,
-        optimizer_steps_per_full_rollout=(
-            global_trajectories + ppo_size - 1
-        )
+        optimizer_steps_per_full_rollout=(global_trajectories + ppo_size - 1)
         // ppo_size,
         micro_batch_size_per_gpu=effective_micro,
-        micro_batches_per_gpu=(
-            local_ppo_size
-            + effective_micro
-            - 1
-        )
-        // effective_micro,
+        micro_batches_per_gpu=(local_ppo_size + effective_micro - 1) // effective_micro,
     )
 
 
@@ -298,7 +285,9 @@ def distributed_ppo_minibatch_partition(
     """
     counts = tuple(int(value) for value in local_counts)
     if not counts or any(value < 0 for value in counts):
-        raise ValueError("local_counts must be a non-empty sequence of non-negative integers")
+        raise ValueError(
+            "local_counts must be a non-empty sequence of non-negative integers"
+        )
     world_size = len(counts)
     if not 0 <= int(rank) < world_size:
         raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
@@ -325,6 +314,76 @@ def distributed_ppo_minibatch_partition(
     selected = order[begin:end]
     local_indices = [
         local_position for owner, local_position in selected if owner == int(rank)
+    ]
+    return local_indices, len(selected)
+
+
+def grouped_ppo_minibatch_partition(
+    group_ids_by_rank: tuple[tuple[int, ...], ...] | list[tuple[int, ...]],
+    rank: int,
+    ppo_mini_batch_size: int,
+    minibatch_index: int,
+) -> tuple[list[int], int]:
+    """Partition one global PPO minibatch in group-major order.
+
+    ``group_ids_by_rank[r][i]`` identifies the rollout/response index of local
+    trajectory ``i`` on rank ``r``.  The global order is stable group-major,
+    then rank-major, then local-row-major.  Thus, when a rollout contains one
+    row for every ``(prompt, response_index)`` pair and the PPO size equals the
+    prompt batch size, each PPO minibatch contains exactly one response from
+    every prompt.
+
+    This helper only defines membership.  It never pads, drops, or repeats a
+    real trajectory; local microbatching remains a later, orthogonal step.
+    """
+    grouped = tuple(
+        tuple(int(value) for value in values) for values in group_ids_by_rank
+    )
+    if not grouped:
+        raise ValueError("group_ids_by_rank must contain at least one rank")
+    world_size = len(grouped)
+    owner_rank = int(rank)
+    if not 0 <= owner_rank < world_size:
+        raise ValueError(f"rank={rank} is invalid for world_size={world_size}")
+    ppo_size = int(ppo_mini_batch_size)
+    if ppo_size <= 0:
+        raise ValueError("ppo_mini_batch_size must be positive")
+    index = int(minibatch_index)
+    if index < 0:
+        raise ValueError("minibatch_index must be non-negative")
+    total = sum(len(values) for values in grouped)
+    if total <= 0:
+        raise ValueError("group_ids_by_rank must contain at least one trajectory")
+
+    # Preserve the first global occurrence of each response index.  With the
+    # prompt-major layout emitted by expand_prompt_batch this is 0, 1, ..., n-1.
+    group_order: list[int] = []
+    seen_groups: set[int] = set()
+    for values in grouped:
+        for value in values:
+            if value not in seen_groups:
+                seen_groups.add(value)
+                group_order.append(value)
+
+    order: list[tuple[int, int]] = []
+    for group_id in group_order:
+        for owner, values in enumerate(grouped):
+            order.extend(
+                (owner, local_position)
+                for local_position, value in enumerate(values)
+                if value == group_id
+            )
+    if len(order) != total:
+        raise AssertionError("Grouped PPO order is not a permutation of trajectories")
+
+    begin = index * ppo_size
+    if begin >= total:
+        raise ValueError(
+            f"minibatch_index={index} is outside {math.ceil(total / ppo_size)} minibatches"
+        )
+    selected = order[begin : min(begin + ppo_size, total)]
+    local_indices = [
+        local_position for owner, local_position in selected if owner == owner_rank
     ]
     return local_indices, len(selected)
 

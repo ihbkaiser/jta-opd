@@ -41,6 +41,7 @@ from .distributed import (
     batch_layout,
     contiguous_partition,
     distributed_ppo_minibatch_partition,
+    grouped_ppo_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
@@ -223,9 +224,7 @@ def _rollout_position_after_optimizer_steps(
     )
     epoch, remaining = divmod(completed_steps, steps_per_epoch)
     for slot in range(rollout_batches):
-        prompt_count = min(
-            prompt_batch_size, num_records - slot * prompt_batch_size
-        )
+        prompt_count = min(prompt_batch_size, num_records - slot * prompt_batch_size)
         count = _ppo_minibatch_count(prompt_count * num_responses, ppo_size)
         if remaining < count:
             return epoch * rollout_batches + slot, remaining
@@ -240,34 +239,43 @@ def _format_batch_layout(
 ) -> str:
     fsdp = config.get("distributed", {}).get("fsdp", {})
     training = config["training"]
-    return "\n".join(
-        (
-            f"distributed strategy          = {strategy}",
-            f"world_size                    = {layout.world_size}",
-            f"global_prompt_batch_size      = {layout.global_prompt_batch_size}",
-            f"local_prompt_batch_size       = {layout.local_prompt_batch_size}",
-            f"num_responses                 = {layout.num_responses}",
-            f"global_trajectory_batch_size  = {layout.global_trajectory_batch_size}",
-            f"local_trajectory_batch_size   = {layout.local_trajectory_batch_size}",
-            f"ppo_mini_batch_size           = {layout.ppo_mini_batch_size}",
-            f"local_ppo_mini_batch_size      = {layout.local_ppo_mini_batch_size}",
-            "optimizer_steps/full_rollout  = "
-            f"{layout.optimizer_steps_per_full_rollout}",
-            f"micro_batch_size_per_gpu      = {layout.micro_batch_size_per_gpu}",
-            f"micro_batches_per_gpu         = {layout.micro_batches_per_gpu}",
-            f"learning_rate                 = {float(training['learning_rate']):.8g}",
-            f"max_prompt_tokens             = {int(config['data']['max_prompt_tokens'])}",
-            f"max_response_tokens           = {int(config['rollout']['max_new_tokens'])}",
-            "student_sharding_strategy     = "
-            + ("FULL_SHARD" if strategy == "fsdp" else "none"),
-            "teacher_sharding              = "
-            + ("FULL_SHARD" if strategy == "fsdp" else "replicated"),
-            "teacher_cpu_offload           = "
-            + str(bool(fsdp.get("teacher_cpu_offload", False))).lower(),
-            "gradient_checkpointing        = "
-            + str(bool(training.get("gradient_checkpointing", False))).lower(),
+    method = str(config.get("experiment", {}).get("method", "")).lower()
+    lines = [
+        f"distributed strategy          = {strategy}",
+        f"world_size                    = {layout.world_size}",
+        f"global_prompt_batch_size      = {layout.global_prompt_batch_size}",
+        f"local_prompt_batch_size       = {layout.local_prompt_batch_size}",
+        f"num_responses                 = {layout.num_responses}",
+        f"global_trajectory_batch_size  = {layout.global_trajectory_batch_size}",
+        f"local_trajectory_batch_size   = {layout.local_trajectory_batch_size}",
+        f"ppo_mini_batch_size           = {layout.ppo_mini_batch_size}",
+        f"local_ppo_mini_batch_size      = {layout.local_ppo_mini_batch_size}",
+        f"optimizer_steps/full_rollout  = {layout.optimizer_steps_per_full_rollout}",
+        f"trajectories/full_rollout     = {layout.global_trajectory_batch_size}",
+        f"PPO groups/full_rollout       = {layout.optimizer_steps_per_full_rollout}",
+        f"micro_batch_size_per_gpu      = {layout.micro_batch_size_per_gpu}",
+        f"micro_batches_per_gpu         = {layout.micro_batches_per_gpu}",
+        f"learning_rate                 = {float(training['learning_rate']):.8g}",
+        f"max_prompt_tokens             = {int(config['data']['max_prompt_tokens'])}",
+        f"max_response_tokens           = {int(config['rollout']['max_new_tokens'])}",
+        "student_sharding_strategy     = "
+        + ("FULL_SHARD" if strategy == "fsdp" else "none"),
+        "teacher_sharding              = "
+        + ("FULL_SHARD" if strategy == "fsdp" else "replicated"),
+        "teacher_cpu_offload           = "
+        + str(bool(fsdp.get("teacher_cpu_offload", False))).lower(),
+        "gradient_checkpointing        = "
+        + str(bool(training.get("gradient_checkpointing", False))).lower(),
+    ]
+    if method == "cmt":
+        lines.extend(
+            (
+                "Gibbs allocations/full_rollout = "
+                f"{layout.optimizer_steps_per_full_rollout}",
+                f"trajectories/Gibbs          = {layout.ppo_mini_batch_size}",
+            )
         )
-    )
+    return "\n".join(lines)
 
 
 def _timed(device: torch.device, function, *args, **kwargs):
@@ -384,10 +392,9 @@ def _globalize_pgt_output(
 def _globalize_cmt_output(
     local: PGTOutput,
     valid_mask: torch.Tensor,
-    epsilon: float,
     distributed: DistributedContext,
 ) -> tuple[SelectorOutput, dict[str, torch.Tensor], int, int]:
-    """Solve CMT's empirical KL-constrained allocation on the global batch."""
+    """Gather CMT scores; Gibbs allocation is intentionally PPO-group local."""
     keys = (
         "gain",
         "s_PGT",
@@ -422,24 +429,20 @@ def _globalize_cmt_output(
         "full_log_ratio_variance",
         "full_common_mass",
     )
-    keys = keys + tuple(
-        key for key in optional_full_keys if key in local.diagnostics
-    )
+    keys = keys + tuple(key for key in optional_full_keys if key in local.diagnostics)
     gathered, start, end = _gather_selector_diagnostics(
         local.diagnostics, valid_mask, keys, distributed
     )
-    global_weights, inverse_temperature, achieved_kl = kl_constrained_allocation(
-        gathered["s_CMT"], epsilon
+    # Do not solve one allocation here: this tensor spans the complete rollout
+    # (e.g. 64 prompts x 4 responses = 256 trajectories), whereas each optimizer
+    # update consumes one global PPO group (e.g. 64 trajectories).  The solver is
+    # called inside _opd_train_step on exactly the rows used by that update.
+    return (
+        SelectorOutput(local.diagnostics["s_CMT"], dict(local.diagnostics)),
+        gathered,
+        start,
+        end,
     )
-    diagnostics = dict(local.diagnostics)
-    diagnostics.update(
-        w=scatter_valid(global_weights[start:end], valid_mask),
-        allocation_kl_epsilon=float(epsilon),
-        allocation_kl_achieved=float(achieved_kl),
-        allocation_inverse_temperature=float(inverse_temperature),
-    )
-    gathered["w"] = global_weights
-    return SelectorOutput(diagnostics["w"], diagnostics), gathered, start, end
 
 
 def _globalize_rac_output(
@@ -600,13 +603,38 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         if not isinstance(value, (dict, list, tuple))
     }
     for score in (
-        "D", "C", "s_TA", "g", "alignment", "R", "M", "V", "z", "w",
-        "gain", "s_PGT", "euclidean_gain", "restricted_reverse_kl",
-        "student_support_mass", "teacher_support_mass", "teacher_tail_mass", "support_width",
-        "support_common_mass", "conditional_support_common_mass",
-        "transition_weight", "support_coverage", "coverage_correction",
-        "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
-        "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+        "D",
+        "C",
+        "s_TA",
+        "g",
+        "alignment",
+        "R",
+        "M",
+        "V",
+        "z",
+        "w",
+        "gain",
+        "s_PGT",
+        "euclidean_gain",
+        "restricted_reverse_kl",
+        "student_support_mass",
+        "teacher_support_mass",
+        "teacher_tail_mass",
+        "support_width",
+        "support_common_mass",
+        "conditional_support_common_mass",
+        "transition_weight",
+        "support_coverage",
+        "coverage_correction",
+        "teacher_deficit",
+        "marginal_flux",
+        "common_mass_derivative",
+        "H",
+        "successor_excess",
+        "sequential_gain",
+        "learning_value",
+        "s_CMT",
+        "iw_weight",
     ):
         for statistic, value in selector.get(score, {}).items():
             row[f"{score}_{statistic}"] = value
@@ -678,13 +706,38 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
     statistics = tuple(
         f"{score}_{statistic}"
         for score in (
-            "D", "C", "s_TA", "g", "alignment", "R", "M", "V", "z", "w",
-            "gain", "s_PGT", "euclidean_gain", "restricted_reverse_kl",
-            "student_support_mass", "teacher_support_mass", "teacher_tail_mass", "support_width",
-            "support_common_mass", "conditional_support_common_mass",
-            "transition_weight", "support_coverage", "coverage_correction",
-            "teacher_deficit", "marginal_flux", "common_mass_derivative", "H",
-            "successor_excess", "sequential_gain", "learning_value", "s_CMT", "iw_weight",
+            "D",
+            "C",
+            "s_TA",
+            "g",
+            "alignment",
+            "R",
+            "M",
+            "V",
+            "z",
+            "w",
+            "gain",
+            "s_PGT",
+            "euclidean_gain",
+            "restricted_reverse_kl",
+            "student_support_mass",
+            "teacher_support_mass",
+            "teacher_tail_mass",
+            "support_width",
+            "support_common_mass",
+            "conditional_support_common_mass",
+            "transition_weight",
+            "support_coverage",
+            "coverage_correction",
+            "teacher_deficit",
+            "marginal_flux",
+            "common_mass_derivative",
+            "H",
+            "successor_excess",
+            "sequential_gain",
+            "learning_value",
+            "s_CMT",
+            "iw_weight",
         )
         for statistic in (
             "mean",
@@ -833,7 +886,9 @@ def _evaluate_vllm_subprocess(
         )
         visible_devices = environment.get("CUDA_VISIBLE_DEVICES")
         if visible_devices:
-            devices = [item.strip() for item in visible_devices.split(",") if item.strip()]
+            devices = [
+                item.strip() for item in visible_devices.split(",") if item.strip()
+            ]
             if len(devices) == 1:
                 # Some schedulers pre-mask each worker to one physical GPU.
                 # In that case the only visible device is already the correct
@@ -902,7 +957,10 @@ def _evaluate_vllm_subprocess(
                         "Periodic evaluation aborted because another rank "
                         f"reported failure: {abort_path.read_text(encoding='utf-8')}"
                     )
-                if timeout_sec is not None and time.monotonic() - started >= timeout_sec:
+                if (
+                    timeout_sec is not None
+                    and time.monotonic() - started >= timeout_sec
+                ):
                     _terminate_process_group(process)
                     raise TimeoutError(
                         "Periodic evaluation subprocess exceeded the configured "
@@ -921,9 +979,7 @@ def _evaluate_vllm_subprocess(
 def _atomic_evaluation_json(path: Path, payload: dict[str, Any]) -> None:
     """Publish a small evaluation coordination record atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
-    )
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
     temporary.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -998,7 +1054,9 @@ def _probe_base_evaluation_cache(
     )
     if cached is None:
         return None
-    return materialize_evaluation(cache_entry, destination, model_name=model_name), "shared"
+    return materialize_evaluation(
+        cache_entry, destination, model_name=model_name
+    ), "shared"
 
 
 def _run_distributed_vllm_evaluation(
@@ -1024,9 +1082,7 @@ def _run_distributed_vllm_evaluation(
     method_name = METHOD_DISPLAY_NAMES[method]
     model_name = "Base student" if step == 0 else f"{method_name} step {step}"
     source_path = (
-        Path(config["models"]["student_path"]).resolve()
-        if step == 0
-        else checkpoint
+        Path(config["models"]["student_path"]).resolve() if step == 0 else checkpoint
     )
     if source_path is None:
         raise RuntimeError("Distributed vLLM evaluation requires a model snapshot path")
@@ -1105,8 +1161,10 @@ def _run_distributed_vllm_evaluation(
                 coordination_dir / f"ack-{distributed.rank:05d}.json",
                 {"state": "ack", "rank": distributed.rank},
             )
-            return suite, str(signal.get("cache_status")), float(
-                signal.get("evaluation_time", 0.0)
+            return (
+                suite,
+                str(signal.get("cache_status")),
+                float(signal.get("evaluation_time", 0.0)),
             )
 
     if distributed.is_main and cache_result is not None:
@@ -1188,8 +1246,10 @@ def _run_distributed_vllm_evaluation(
             coordination_dir / f"ack-{distributed.rank:05d}.json",
             {"state": "ack", "rank": distributed.rank},
         )
-        return suite, str(signal.get("cache_status")), float(
-            signal.get("evaluation_time", 0.0)
+        return (
+            suite,
+            str(signal.get("cache_status")),
+            float(signal.get("evaluation_time", 0.0)),
         )
 
     try:
@@ -1266,15 +1326,15 @@ def _run_distributed_vllm_evaluation(
         deadline = time.monotonic() + timeout
         while True:
             if all(
-                _read_evaluation_json(
-                    coordination_dir / f"ack-{rank:05d}.json"
-                )
+                _read_evaluation_json(coordination_dir / f"ack-{rank:05d}.json")
                 is not None
                 for rank in range(distributed.world_size)
             ):
                 break
             if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for evaluation shard acknowledgements")
+                raise TimeoutError(
+                    "Timed out waiting for evaluation shard acknowledgements"
+                )
             time.sleep(0.25)
         for shard_dir in shard_dirs:
             shutil.rmtree(shard_dir, ignore_errors=True)
@@ -1540,6 +1600,9 @@ def _opd_train_step(
     distributed: DistributedContext,
     objective_valid_mask: torch.Tensor | None = None,
     trajectory_active_mask: torch.Tensor | None = None,
+    trajectory_group_ids: list[int] | tuple[int, ...] | torch.Tensor | None = None,
+    gibbs_scores: torch.Tensor | None = None,
+    gibbs_epsilon: float | None = None,
     ppo_minibatch_offset: int = 0,
     max_optimizer_steps: int | None = None,
     optimizer_step_start: int = 0,
@@ -1557,8 +1620,7 @@ def _opd_train_step(
     # OPD/TA/RAC/CMT recipe keeps its historical dual clipping unchanged.
     dual_clip = (
         None
-        if str(config.get("experiment", {}).get("method", "")).lower()
-        in {"grpo", "iw"}
+        if str(config.get("experiment", {}).get("method", "")).lower() in {"grpo", "iw"}
         else float(training.get("ppo_dual_clip", 3.0))
     )
     objective_valid = (
@@ -1586,7 +1648,9 @@ def _opd_train_step(
         torch.arange(local_real_count, device=active_positions.device),
     ):
         raise ValueError("Active local trajectories must form a contiguous prefix")
-    counts = tuple(int(value) for value in distributed.all_gather_objects(local_real_count))
+    counts = tuple(
+        int(value) for value in distributed.all_gather_objects(local_real_count)
+    )
     global_trajectory_count = sum(counts)
     if global_trajectory_count <= 0:
         raise ValueError("OPD train step received no active global trajectories")
@@ -1596,10 +1660,35 @@ def _opd_train_step(
             "training.ppo_mini_batch_size must be at least world size so every "
             "rank can receive a real trajectory in a complete PPO minibatch"
         )
-    micro_batch = _micro_batch_size_per_gpu(
-        training, distributed.world_size, ppo_size
-    )
+    micro_batch = _micro_batch_size_per_gpu(training, distributed.world_size, ppo_size)
     ppo_count = _ppo_minibatch_count(global_trajectory_count, ppo_size)
+    if (gibbs_scores is None) != (gibbs_epsilon is None):
+        raise ValueError("gibbs_scores and gibbs_epsilon must be provided together")
+    use_groupwise_gibbs = gibbs_scores is not None
+    if gibbs_scores is not None and gibbs_scores.shape != objective_valid.shape:
+        raise ValueError("gibbs_scores must align with the token-level objective mask")
+    grouped_ids: tuple[tuple[int, ...], ...] | None = None
+    if trajectory_group_ids is not None:
+        if torch.is_tensor(trajectory_group_ids):
+            local_group_ids = tuple(
+                int(value) for value in trajectory_group_ids.detach().cpu().tolist()
+            )
+        else:
+            local_group_ids = tuple(int(value) for value in trajectory_group_ids)
+        if len(local_group_ids) != local_batch_size:
+            raise ValueError(
+                "trajectory_group_ids must align with the local rollout batch"
+            )
+        grouped_ids = tuple(
+            tuple(int(value) for value in values)
+            for values in distributed.all_gather_objects(
+                local_group_ids[:local_real_count]
+            )
+        )
+        if tuple(len(values) for values in grouped_ids) != counts:
+            raise AssertionError(
+                "Grouped PPO metadata does not match active row counts"
+            )
     offset = int(ppo_minibatch_offset)
     if not 0 <= offset < ppo_count:
         raise ValueError(
@@ -1620,16 +1709,37 @@ def _opd_train_step(
         is_fsdp_model(model) and fsdp_no_sync
     )
     minibatch_metrics: list[dict[str, float]] = []
+    allocated_position_weights = (
+        torch.zeros_like(gibbs_scores, dtype=torch.float32)
+        if use_groupwise_gibbs
+        else None
+    )
+    gibbs_allocation_count = 0
+    gibbs_allocation_seconds = 0.0
+    grouped_rows_seen: set[int] = set()
     for ppo_index in range(offset, min(ppo_count, offset + remaining_limit)):
-        # PPO_MINI_BATCH_SIZE is global.  Rank-interleaving the locally owned
-        # rollout rows makes every complete global minibatch data-parallel;
-        # rank-major contiguous slicing would put whole minibatches on one rank.
-        local_indices, global_minibatch_count = distributed_ppo_minibatch_partition(
-            counts,
-            distributed.rank,
-            ppo_size,
-            ppo_index,
-        )
+        # PPO_MINI_BATCH_SIZE is global. CMT uses response-index-major groups;
+        # other methods retain the deterministic rank-interleaved order.
+        if grouped_ids is None:
+            local_indices, global_minibatch_count = distributed_ppo_minibatch_partition(
+                counts,
+                distributed.rank,
+                ppo_size,
+                ppo_index,
+            )
+        else:
+            local_indices, global_minibatch_count = grouped_ppo_minibatch_partition(
+                grouped_ids,
+                distributed.rank,
+                ppo_size,
+                ppo_index,
+            )
+            duplicate_rows = grouped_rows_seen.intersection(local_indices)
+            if duplicate_rows:
+                raise AssertionError(
+                    f"Grouped PPO partition repeated local rows: {sorted(duplicate_rows)}"
+                )
+            grouped_rows_seen.update(local_indices)
         local_minibatch_count = len(local_indices)
         if distributed.any(local_minibatch_count == 0):
             raise ValueError(
@@ -1639,9 +1749,7 @@ def _opd_train_step(
                 "choose a PPO batch/data tail that gives every rank a real row."
             )
         padded_count = distributed.max_int(len(local_indices))
-        filler = (
-            int(response_lengths.argmin().item()) if local_batch_size else 0
-        )
+        filler = int(response_lengths.argmin().item()) if local_batch_size else 0
         row_active = [True] * len(local_indices)
         while len(local_indices) < padded_count:
             local_indices.append(filler)
@@ -1652,7 +1760,10 @@ def _opd_train_step(
         active_rows = torch.tensor(
             row_active, dtype=torch.bool, device=rollout.input_ids.device
         )
-        if bool(training.get("length_bucketed_micro_batches", True)) and micro_batch > 1:
+        if (
+            bool(training.get("length_bucketed_micro_batches", True))
+            and micro_batch > 1
+        ):
             lengths = response_lengths.index_select(0, indices)
             sort_values = torch.where(active_rows, lengths, -torch.ones_like(lengths))
             order = torch.argsort(sort_values, descending=True, stable=True)
@@ -1661,10 +1772,55 @@ def _opd_train_step(
         micro_indices = list(indices.split(micro_batch))
         micro_active = list(active_rows.split(micro_batch))
         ppo_valid = objective_valid.index_select(0, indices) & active_rows.unsqueeze(1)
-        ppo_weights = position_weights.index_select(0, indices)
-        local_weight_mass = float(
-            ppo_weights[ppo_valid].detach().float().sum().item()
-        )
+        allocation_inverse_temperature = 0.0
+        allocation_kl_achieved = 0.0
+        allocation_started = time.perf_counter()
+        if use_groupwise_gibbs:
+            # The allocation domain is exactly this optimizer update's valid
+            # token set.  It is neither the full rollout nor an individual
+            # local rank/microbatch.
+            local_group_scores = gibbs_scores.index_select(0, indices)[ppo_valid]
+            (
+                global_group_scores,
+                group_start,
+                group_end,
+                _group_lengths,
+            ) = distributed.all_gather_variable_1d(local_group_scores)
+            if global_group_scores.numel() == 0:
+                raise ValueError("CMT PPO group contains no valid tokens")
+            (
+                global_group_weights,
+                allocation_inverse_temperature,
+                allocation_kl_achieved,
+            ) = kl_constrained_allocation(
+                global_group_scores,
+                float(gibbs_epsilon),
+            )
+            ppo_weights = torch.zeros_like(
+                gibbs_scores.index_select(0, indices), dtype=torch.float32
+            )
+            ppo_weights[ppo_valid] = global_group_weights[group_start:group_end]
+            finite_or_raise("CMT groupwise Gibbs weights", ppo_weights[ppo_valid])
+            expected_group_mass = float(global_group_scores.numel())
+            actual_group_mass = float(global_group_weights.sum().item())
+            if not math.isclose(
+                actual_group_mass,
+                expected_group_mass,
+                rel_tol=1e-5,
+                abs_tol=1e-4,
+            ):
+                raise AssertionError(
+                    "CMT Gibbs weights must have mean one within the PPO group"
+                )
+            real_indices = indices[active_rows]
+            allocated_position_weights.index_copy_(
+                0, real_indices, ppo_weights[active_rows]
+            )
+            gibbs_allocation_count += 1
+        else:
+            ppo_weights = position_weights.index_select(0, indices)
+        gibbs_allocation_seconds += time.perf_counter() - allocation_started
+        local_weight_mass = float(ppo_weights[ppo_valid].detach().float().sum().item())
         global_weight_mass = distributed.sum_float(local_weight_mass)
         optimizer.zero_grad(set_to_none=True)
         forward_seconds = backward_seconds = loss_value = 0.0
@@ -1678,9 +1834,7 @@ def _opd_train_step(
         ):
             synchronize = chunk_index == len(micro_indices) - 1
             sync_context = (
-                model.no_sync()
-                if not synchronize and may_skip_sync
-                else nullcontext()
+                model.no_sync() if not synchronize and may_skip_sync else nullcontext()
             )
             with sync_context:
                 cuda_sync(device)
@@ -1693,9 +1847,9 @@ def _opd_train_step(
                 input_ids = rollout.input_ids.index_select(0, chunk_indices)[
                     :, :input_stop
                 ]
-                attention_mask = rollout.attention_mask.index_select(
-                    0, chunk_indices
-                )[:, :input_stop]
+                attention_mask = rollout.attention_mask.index_select(0, chunk_indices)[
+                    :, :input_stop
+                ]
                 forward_kwargs = {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
@@ -1719,9 +1873,7 @@ def _opd_train_step(
                     logits,
                     candidate_ids,
                     temperature=float(config["rollout"].get("temperature", 1.0)),
-                    chunk_steps=int(
-                        config["selector"].get("score_chunk_steps", 128)
-                    ),
+                    chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
                     support_mask=(
                         None
                         if opd_reference.support_mask is None
@@ -1743,9 +1895,9 @@ def _opd_train_step(
                     student_weights=opd_reference.student_weights.index_select(
                         0, chunk_indices
                     )[:, :local_width],
-                    advantages=opd_reference.advantages.index_select(
-                        0, chunk_indices
-                    )[:, :local_width],
+                    advantages=opd_reference.advantages.index_select(0, chunk_indices)[
+                        :, :local_width
+                    ],
                     support_mask=(
                         None
                         if opd_reference.support_mask is None
@@ -1761,13 +1913,17 @@ def _opd_train_step(
                     clip_high=eps_high,
                     dual_clip=dual_clip,
                 )
-                valid_chunk = (
-                    objective_valid.index_select(0, chunk_indices)[:, :local_width]
-                    & chunk_active.unsqueeze(1)
-                )
-                chunk_weights = position_weights.index_select(
-                    0, chunk_indices
-                )[:, :local_width]
+                valid_chunk = objective_valid.index_select(0, chunk_indices)[
+                    :, :local_width
+                ] & chunk_active.unsqueeze(1)
+                if use_groupwise_gibbs:
+                    chunk_weights = allocated_position_weights.index_select(
+                        0, chunk_indices
+                    )[:, :local_width]
+                else:
+                    chunk_weights = position_weights.index_select(0, chunk_indices)[
+                        :, :local_width
+                    ]
                 local_numerator, _ = weighted_token_sums(
                     per_position_loss, chunk_weights, valid_chunk
                 )
@@ -1777,8 +1933,7 @@ def _opd_train_step(
                 with torch.no_grad():
                     ratio = torch.exp(
                         (
-                            current.detach()
-                            - chunk_reference.old_student_log_probs
+                            current.detach() - chunk_reference.old_student_log_probs
                         ).clamp(min=-20.0, max=20.0)
                     )
                     candidate_valid = valid_chunk.unsqueeze(-1).expand_as(ratio)
@@ -1827,9 +1982,7 @@ def _opd_train_step(
                     candidate_ids,
                     chunk_weights,
                 )
-        gradient_norm = clip_grad_norm(
-            model, float(training.get("max_grad_norm", 1.0))
-        )
+        gradient_norm = clip_grad_norm(model, float(training.get("max_grad_norm", 1.0)))
         cuda_sync(device)
         started = time.perf_counter()
         optimizer.step()
@@ -1845,9 +1998,7 @@ def _opd_train_step(
             global_candidate_count, 1
         )
         global_ratio_min = (
-            -distributed.max_float(-local_ratio_min)
-            if global_candidate_count
-            else 1.0
+            -distributed.max_float(-local_ratio_min) if global_candidate_count else 1.0
         )
         global_ratio_max = (
             distributed.max_float(local_ratio_max) if global_candidate_count else 1.0
@@ -1855,33 +2006,44 @@ def _opd_train_step(
         metric = {
             "loss": global_loss,
             "weighted_final_loss": global_loss,
-            "base_topk_opd_loss": global_base_loss_sum
-            / max(global_valid_tokens, 1),
-            "unweighted_opd_loss": global_base_loss_sum
-            / max(global_valid_tokens, 1),
+            "base_topk_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
+            "unweighted_opd_loss": global_base_loss_sum / max(global_valid_tokens, 1),
             "gradient_norm": float(gradient_norm.detach().item()),
             "training_forward_time": forward_seconds,
             "backward_time": backward_seconds,
             "optimizer_time": optimizer_seconds,
             "global_weight_mass": global_weight_mass,
-            "clip_fraction": global_clipped_candidates
-            / max(global_candidate_count, 1),
+            "clip_fraction": global_clipped_candidates / max(global_candidate_count, 1),
             "ratio_mean": global_ratio_mean,
             "ratio_min": global_ratio_min,
             "ratio_max": global_ratio_max,
             "ppo_minibatch_index": float(ppo_index),
             "ppo_minibatch_trajectory_count": float(global_minibatch_count),
             "local_ppo_minibatch_trajectory_count": float(local_minibatch_count),
+            "gibbs_allocations": float(int(use_groupwise_gibbs)),
+            "allocation_kl_epsilon": (
+                float(gibbs_epsilon) if use_groupwise_gibbs else 0.0
+            ),
+            "allocation_kl_achieved": float(allocation_kl_achieved),
+            "allocation_inverse_temperature": float(allocation_inverse_temperature),
         }
         minibatch_metrics.append(metric)
         global_optimizer_step = optimizer_step_start + len(minibatch_metrics)
         if on_optimizer_step is not None:
             on_optimizer_step(global_optimizer_step, metric)
+    if use_groupwise_gibbs and gibbs_allocation_count != len(minibatch_metrics):
+        raise AssertionError("CMT must execute exactly one Gibbs allocation per update")
+    processed_all_groups = offset == 0 and len(minibatch_metrics) == ppo_count
+    if grouped_ids is not None and processed_all_groups:
+        expected_rows = set(range(local_real_count))
+        if grouped_rows_seen != expected_rows:
+            raise AssertionError("Grouped PPO partition did not consume each local row once")
     total_weight = sum(item["global_weight_mass"] for item in minibatch_metrics)
     if total_weight > 0:
-        aggregate_loss = sum(
-            item["loss"] * item["global_weight_mass"] for item in minibatch_metrics
-        ) / total_weight
+        aggregate_loss = (
+            sum(item["loss"] * item["global_weight_mass"] for item in minibatch_metrics)
+            / total_weight
+        )
     else:
         aggregate_loss = sum(item["loss"] for item in minibatch_metrics) / len(
             minibatch_metrics
@@ -1897,6 +2059,9 @@ def _opd_train_step(
         optimizer_time=sum(item["optimizer_time"] for item in minibatch_metrics),
         global_weight_mass=total_weight,
         optimizer_steps=len(minibatch_metrics),
+        gibbs_allocations=gibbs_allocation_count,
+        gibbs_allocation_time=gibbs_allocation_seconds,
+        allocated_position_weights=allocated_position_weights,
         minibatches=minibatch_metrics,
     )
     return result
@@ -2164,15 +2329,33 @@ def _grpo_group_advantages(
     )
     active_rewards = rewards[active_trajectories.bool()]
     active_advantages = advantages[active_trajectories.bool()]
-    return rewards, advantages, {
-        "reward_mean": float(active_rewards.mean().item()) if active_rewards.numel() else 0.0,
-        "reward_std": float(active_rewards.std(unbiased=False).item()) if active_rewards.numel() else 0.0,
-        "reward_min": float(active_rewards.min().item()) if active_rewards.numel() else 0.0,
-        "reward_max": float(active_rewards.max().item()) if active_rewards.numel() else 0.0,
-        "advantage_mean": float(active_advantages.mean().item()) if active_advantages.numel() else 0.0,
-        "advantage_std": float(active_advantages.std(unbiased=False).item()) if active_advantages.numel() else 0.0,
-        "active_groups": float(active_trajectories.reshape(-1, group_size).any(dim=-1).sum().item()),
-    }
+    return (
+        rewards,
+        advantages,
+        {
+            "reward_mean": float(active_rewards.mean().item())
+            if active_rewards.numel()
+            else 0.0,
+            "reward_std": float(active_rewards.std(unbiased=False).item())
+            if active_rewards.numel()
+            else 0.0,
+            "reward_min": float(active_rewards.min().item())
+            if active_rewards.numel()
+            else 0.0,
+            "reward_max": float(active_rewards.max().item())
+            if active_rewards.numel()
+            else 0.0,
+            "advantage_mean": float(active_advantages.mean().item())
+            if active_advantages.numel()
+            else 0.0,
+            "advantage_std": float(active_advantages.std(unbiased=False).item())
+            if active_advantages.numel()
+            else 0.0,
+            "active_groups": float(
+                active_trajectories.reshape(-1, group_size).any(dim=-1).sum().item()
+            ),
+        },
+    )
 
 
 def _run_grpo_training(
@@ -2189,7 +2372,9 @@ def _run_grpo_training(
         raise ValueError("rollout.backend must be 'vllm' or 'hf'")
     if strategy == "fsdp" and rollout_backend != "vllm":
         raise RuntimeError("FSDP GRPO training requires rollout.backend=vllm")
-    if strategy == "fsdp" and str(config["models"].get("dtype", "bfloat16")).lower() not in {"bfloat16", "bf16"}:
+    if strategy == "fsdp" and str(
+        config["models"].get("dtype", "bfloat16")
+    ).lower() not in {"bfloat16", "bf16"}:
         raise ValueError("FSDP GRPO training requires models.dtype=bfloat16")
     rollout_temperature = float(config["rollout"].get("temperature", 1.0))
     if abs(rollout_temperature - 1.0) > 1.0e-6:
@@ -2235,7 +2420,11 @@ def _run_grpo_training(
     )
     output_dir = Path(experiment["output_dir"]).resolve()
     metrics_path = output_dir / "metrics.jsonl"
-    if resume_checkpoint is None and metrics_path.exists() and not bool(experiment.get("allow_existing_output", False)):
+    if (
+        resume_checkpoint is None
+        and metrics_path.exists()
+        and not bool(experiment.get("allow_existing_output", False))
+    ):
         raise FileExistsError(f"Refusing to append to existing run: {metrics_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
     resolved_config_path = output_dir / (
@@ -2274,7 +2463,9 @@ def _run_grpo_training(
     if distributed.is_main:
         tqdm.write(f"GRPO dataset examples: {prompt_filter_summary['kept_count']}")
     setup_progress.update(1)
-    setup_progress.set_postfix_str(f"stage=start-rollout-{rollout_backend}", refresh=True)
+    setup_progress.set_postfix_str(
+        f"stage=start-rollout-{rollout_backend}", refresh=True
+    )
     rollout_engine: VLLMRolloutEngine | None = None
     if rollout_backend == "vllm":
         rollout_engine = VLLMRolloutEngine(
@@ -2301,15 +2492,25 @@ def _run_grpo_training(
             device_ids=[distributed.local_rank],
             output_device=distributed.local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=bool(config.get("distributed", {}).get("find_unused_parameters", False)),
-            gradient_as_bucket_view=bool(config.get("distributed", {}).get("gradient_as_bucket_view", True)),
+            find_unused_parameters=bool(
+                config.get("distributed", {}).get("find_unused_parameters", False)
+            ),
+            gradient_as_bucket_view=bool(
+                config.get("distributed", {}).get("gradient_as_bucket_view", True)
+            ),
             static_graph=bool(config.get("distributed", {}).get("static_graph", True)),
-            bucket_cap_mb=float(config.get("distributed", {}).get("bucket_cap_mb", 100)),
+            bucket_cap_mb=float(
+                config.get("distributed", {}).get("bucket_cap_mb", 100)
+            ),
         )
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
     optimizer, fused_optimizer = _make_optimizer(
-        [parameter for parameter in training_student.parameters() if parameter.requires_grad],
+        [
+            parameter
+            for parameter in training_student.parameters()
+            if parameter.requires_grad
+        ],
         training,
     )
     resume_state = (
@@ -2405,7 +2606,9 @@ def _run_grpo_training(
     training_eval_settings = config.get("training_evaluation", {})
     evaluation_steps = training_evaluation_steps(max_steps, training_eval_settings)
     if distributed.is_main and evaluation_steps:
-        tqdm.write("Periodic evaluation (GRPO): " + ", ".join(map(str, evaluation_steps)))
+        tqdm.write(
+            "Periodic evaluation (GRPO): " + ", ".join(map(str, evaluation_steps))
+        )
     tensorboard_logger = TensorBoardLogger(
         output_dir,
         dict(config.get("logging", {}).get("tensorboard", {})),
@@ -2413,7 +2616,9 @@ def _run_grpo_training(
         resume_step=resume_step,
     )
     initial_evaluation = None
-    if resume_step == 0 and should_run_training_evaluation(0, max_steps, training_eval_settings):
+    if resume_step == 0 and should_run_training_evaluation(
+        0, max_steps, training_eval_settings
+    ):
         initial_evaluation = _run_training_evaluation(
             training_student,
             tokenizer,
@@ -2446,7 +2651,9 @@ def _run_grpo_training(
     while optimizer_step < max_steps:
         step_started = time.perf_counter()
         rollout_first_optimizer_step = optimizer_step + 1
-        global_indices = epoch_batch_indices(len(records), batch_size, rollout_index, seed)
+        global_indices = epoch_batch_indices(
+            len(records), batch_size, rollout_index, seed
+        )
         rollout_ppo_minibatches = _ppo_minibatch_count(
             len(global_indices) * group_size, ppo_minibatch_size
         )
@@ -2468,7 +2675,9 @@ def _run_grpo_training(
         )
         batch_records = [records[index] for index in indices]
         rollout_function = (
-            rollout_engine.generate if rollout_engine is not None else generate_on_policy
+            rollout_engine.generate
+            if rollout_engine is not None
+            else generate_on_policy
         )
         rollout, rollout_time = _timed(
             device,
@@ -2482,7 +2691,8 @@ def _run_grpo_training(
             eos_token_ids=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             seed=int(config["rollout"].get("seed", seed)),
-            sample_seed_offset=rollout_index * batch_size * group_size + local_start * group_size,
+            sample_seed_offset=rollout_index * batch_size * group_size
+            + local_start * group_size,
         )
         for field in (
             "input_ids",
@@ -2493,7 +2703,9 @@ def _run_grpo_training(
         ):
             setattr(rollout, field, getattr(rollout, field).clone())
         objective_valid = rollout.valid_mask & active_trajectories.unsqueeze(1)
-        finite_or_raise("GRPO rollout log-probs", rollout.rollout_log_probs[objective_valid])
+        finite_or_raise(
+            "GRPO rollout log-probs", rollout.rollout_log_probs[objective_valid]
+        )
         _, advantages, reward_stats = _grpo_group_advantages(
             rollout,
             tokenizer,
@@ -2513,13 +2725,22 @@ def _run_grpo_training(
             torch.zeros_like(rollout.valid_mask, dtype=torch.float32),
         )
         with torch.inference_mode(False):
-            old_log_probs = torch.where(
-                rollout.valid_mask,
-                rollout.rollout_log_probs,
-                torch.zeros_like(rollout.rollout_log_probs),
-            ).detach().clone().float().unsqueeze(-1)
+            old_log_probs = (
+                torch.where(
+                    rollout.valid_mask,
+                    rollout.rollout_log_probs,
+                    torch.zeros_like(rollout.rollout_log_probs),
+                )
+                .detach()
+                .clone()
+                .float()
+                .unsqueeze(-1)
+            )
             reference = TopKOPDReference(
-                candidate_ids=rollout.response_ids.detach().clone().long().unsqueeze(-1),
+                candidate_ids=rollout.response_ids.detach()
+                .clone()
+                .long()
+                .unsqueeze(-1),
                 old_student_log_probs=old_log_probs,
                 teacher_log_probs=old_log_probs.clone(),
                 student_weights=torch.ones_like(old_log_probs),
@@ -2560,7 +2781,11 @@ def _run_grpo_training(
                 evaluation_path = checkpoint_path
                 temporary = False
                 if evaluation_path is None:
-                    evaluation_path = output_dir / ".evaluation_snapshots" / f"step-{current_step:06d}"
+                    evaluation_path = (
+                        output_dir
+                        / ".evaluation_snapshots"
+                        / f"step-{current_step:06d}"
+                    )
                     if distributed.is_main and evaluation_path.exists():
                         shutil.rmtree(evaluation_path)
                     distributed.barrier()
@@ -2592,7 +2817,9 @@ def _run_grpo_training(
         optimizer_step += optimizer_steps_completed
         step = optimizer_step
         periodic_evaluations: dict[int, dict[str, Any]] = {}
-        for evaluation_step, (evaluation_checkpoint, temporary) in sorted(evaluation_sources.items()):
+        for evaluation_step, (evaluation_checkpoint, temporary) in sorted(
+            evaluation_sources.items()
+        ):
             evaluation_result = _run_training_evaluation(
                 training_student,
                 tokenizer,
@@ -2623,7 +2850,9 @@ def _run_grpo_training(
             "rollout_first_optimizer_step": rollout_first_optimizer_step,
             "rollout_last_optimizer_step": step,
             "method": "grpo",
-            "resumed_from": str(resume_state.checkpoint) if resume_state is not None else None,
+            "resumed_from": str(resume_state.checkpoint)
+            if resume_state is not None
+            else None,
             "resume_step": resume_step,
             "batch_size": len(global_indices),
             "prompt_batch_size": len(global_indices),
@@ -2634,7 +2863,10 @@ def _run_grpo_training(
             "global_trajectory_batch_size": len(global_indices) * group_size,
             "num_trajectories": trajectory_count,
             "ppo_mini_batch_size": ppo_minibatch_size,
-            "local_ppo_mini_batch_size": (ppo_minibatch_size + distributed.world_size - 1) // distributed.world_size,
+            "local_ppo_mini_batch_size": (
+                ppo_minibatch_size + distributed.world_size - 1
+            )
+            // distributed.world_size,
             "ppo_minibatches_in_rollout": optimizer_steps_completed,
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
@@ -2658,22 +2890,29 @@ def _run_grpo_training(
             "grpo_ratio_max": train_metrics["ratio_max"],
             "gradient_norm": distributed.max_float(train_metrics["gradient_norm"]),
             "grad_norm": distributed.max_float(train_metrics["gradient_norm"]),
-            "training_forward_time": distributed.max_float(train_metrics["training_forward_time"]),
+            "training_forward_time": distributed.max_float(
+                train_metrics["training_forward_time"]
+            ),
             "backward_time": distributed.max_float(train_metrics["backward_time"]),
             "optimizer_time": distributed.max_float(train_metrics["optimizer_time"]),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "rollout_time": distributed.max_float(rollout_time),
             "wall_clock_step_time": wall_time,
             "tokens_per_second": valid_tokens / max(wall_time, 1e-12),
-            "generated_tokens_per_second": valid_tokens / max(distributed.max_float(rollout_time), 1e-12),
+            "generated_tokens_per_second": valid_tokens
+            / max(distributed.max_float(rollout_time), 1e-12),
             "num_valid_tokens": valid_tokens,
             "mean_response_length": valid_tokens / max(trajectory_count, 1),
             "peak_gpu_allocated_bytes": distributed.max_int(local_peak_allocated),
             "peak_gpu_reserved_bytes": distributed.max_int(local_peak_reserved),
             "peak_gpu_allocated_gb": distributed.max_int(local_peak_allocated) / 2**30,
             "peak_gpu_reserved_gb": distributed.max_int(local_peak_reserved) / 2**30,
-            "checkpoint": str(checkpoints_by_step[step]) if step in checkpoints_by_step else None,
-            "rollout_token_sha256": _rollout_hash(rollout.response_ids, objective_valid, distributed),
+            "checkpoint": str(checkpoints_by_step[step])
+            if step in checkpoints_by_step
+            else None,
+            "rollout_token_sha256": _rollout_hash(
+                rollout.response_ids, objective_valid, distributed
+            ),
         }
         training_events: list[dict[str, Any]] = []
         for event_offset, minibatch_metric in enumerate(train_metrics["minibatches"]):
@@ -2685,15 +2924,23 @@ def _run_grpo_training(
                     "train_loss": minibatch_metric["loss"],
                     "loss": minibatch_metric["loss"],
                     "weighted_final_loss": minibatch_metric["weighted_final_loss"],
-                    "gradient_norm": distributed.max_float(minibatch_metric["gradient_norm"]),
-                    "grad_norm": distributed.max_float(minibatch_metric["gradient_norm"]),
+                    "gradient_norm": distributed.max_float(
+                        minibatch_metric["gradient_norm"]
+                    ),
+                    "grad_norm": distributed.max_float(
+                        minibatch_metric["gradient_norm"]
+                    ),
                     "grpo_clip_fraction": minibatch_metric["clip_fraction"],
                     "grpo_ratio_mean": minibatch_metric["ratio_mean"],
                     "grpo_ratio_min": minibatch_metric["ratio_min"],
                     "grpo_ratio_max": minibatch_metric["ratio_max"],
                     "ppo_minibatch_index": int(minibatch_metric["ppo_minibatch_index"]),
-                    "ppo_minibatch_trajectory_count": int(minibatch_metric["ppo_minibatch_trajectory_count"]),
-                    "checkpoint": str(checkpoints_by_step[event_step]) if event_step in checkpoints_by_step else None,
+                    "ppo_minibatch_trajectory_count": int(
+                        minibatch_metric["ppo_minibatch_trajectory_count"]
+                    ),
+                    "checkpoint": str(checkpoints_by_step[event_step])
+                    if event_step in checkpoints_by_step
+                    else None,
                 }
             )
             if event_step in periodic_evaluations:
@@ -2715,7 +2962,14 @@ def _run_grpo_training(
                 reward=f"{reward_stats['reward_mean']:.3f}",
                 refresh=True,
             )
-        del encoded, rollout, objective_valid, active_trajectories, reference, position_weights
+        del (
+            encoded,
+            rollout,
+            objective_valid,
+            active_trajectories,
+            reference,
+            position_weights,
+        )
         ppo_minibatch_offset += optimizer_steps_completed
         if ppo_minibatch_offset >= rollout_ppo_minibatches:
             rollout_index += 1
@@ -2737,7 +2991,9 @@ def _run_grpo_training(
         "ppo_mini_batch_size": ppo_minibatch_size,
         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "rollout_backend": rollout_backend,
-        "resumed_from": str(resume_state.checkpoint) if resume_state is not None else None,
+        "resumed_from": str(resume_state.checkpoint)
+        if resume_state is not None
+        else None,
         "resume_step": resume_step,
         "distributed_world_size": distributed.world_size,
         "global_batch_preserved": True,
@@ -2745,14 +3001,20 @@ def _run_grpo_training(
         "student_path": model_metadata["student_path"],
         "teacher_path": None,
         "selector_score_dir": None,
-        "evaluation_history": str((output_dir / "eval_history.jsonl").resolve()) if bool(training_eval_settings.get("enabled", False)) else None,
+        "evaluation_history": str((output_dir / "eval_history.jsonl").resolve())
+        if bool(training_eval_settings.get("enabled", False))
+        else None,
         "initial_evaluation": initial_evaluation,
     }
     if distributed.is_main:
         with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, ensure_ascii=False, allow_nan=True)
             handle.write("\n")
-    result = summary if distributed.is_main else {"status": "worker_ok", "rank": distributed.rank}
+    result = (
+        summary
+        if distributed.is_main
+        else {"status": "worker_ok", "rank": distributed.rank}
+    )
     distributed.close()
     return result
 
@@ -2927,8 +3189,7 @@ def run_training(
     if (
         distributed.world_size > 1
         and bool(config.get("training_evaluation", {}).get("enabled", False))
-        and str(config["training_evaluation"].get("backend", "vllm")).lower()
-        != "vllm"
+        and str(config["training_evaluation"].get("backend", "vllm")).lower() != "vllm"
     ):
         raise RuntimeError(
             "Multi-GPU periodic evaluation requires backend=vllm so each rank "
@@ -3121,7 +3382,9 @@ def run_training(
             config["evaluation"]["benchmarks"][first_benchmark],
         )
         if not evaluation_records:
-            raise ValueError(f"Configured evaluation benchmark {first_benchmark} is empty")
+            raise ValueError(
+                f"Configured evaluation benchmark {first_benchmark} is empty"
+            )
         rendered_eval_prompt = render_evaluation_prompt(
             tokenizer, evaluation_records[0], config
         )
@@ -3240,7 +3503,9 @@ def run_training(
             distributed.barrier()
         else:
             if distributed.is_main:
-                tqdm.write("Evaluating the untouched base student at optimizer step 0...")
+                tqdm.write(
+                    "Evaluating the untouched base student at optimizer step 0..."
+                )
             initial_evaluation = _run_training_evaluation(
                 training_student,
                 tokenizer,
@@ -3293,9 +3558,7 @@ def run_training(
             rollout_ppo_minibatches - ppo_minibatch_offset,
             max_steps - optimizer_step,
         )
-        rollout_last_optimizer_step = (
-            optimizer_step + optimizer_steps_this_rollout
-        )
+        rollout_last_optimizer_step = optimizer_step + optimizer_steps_this_rollout
         local_start, _ = contiguous_partition(
             len(global_indices), distributed.rank, distributed.world_size
         )
@@ -3335,8 +3598,7 @@ def run_training(
             # Repeated prompts are separate requests with globally unique,
             # deterministic seeds, so all n trajectories are independent.
             sample_seed_offset=(
-                rollout_index * batch_size * num_responses
-                + local_start * num_responses
+                rollout_index * batch_size * num_responses + local_start * num_responses
             ),
         )
         rollout_backend_metrics = (
@@ -3487,9 +3749,7 @@ def run_training(
                 student_scores.sampled_log_probs,
                 teacher_scores.sampled_log_probs,
                 valid,
-                weight_max=float(
-                    config.get("iw_opd", {}).get("weight_max", 1.5)
-                ),
+                weight_max=float(config.get("iw_opd", {}).get("weight_max", 1.5)),
                 use_abs=bool(config.get("iw_opd", {}).get("use_abs", True)),
                 eps=float(config.get("iw_opd", {}).get("eps", 1.0e-8)),
             )
@@ -3501,9 +3761,7 @@ def run_training(
                 teacher_scores.candidate_log_probs,
                 valid,
             )
-            if not torch.equal(
-                opd_reference.candidate_ids, student_scores.top_k_ids
-            ):
+            if not torch.equal(opd_reference.candidate_ids, student_scores.top_k_ids):
                 raise AssertionError(
                     f"{method.upper()} policy-loss support differs from Student Top-16"
                 )
@@ -3670,9 +3928,7 @@ def run_training(
                 valid,
                 distributed,
             )
-            primary, global_pgt_diagnostics, primary_start, primary_end = (
-                pgt_globalized
-            )
+            primary, global_pgt_diagnostics, primary_start, primary_end = pgt_globalized
             ta_time = pgt_score_time
             bellman_scan_time = 0.0
             selector_time = pgt_score_time + pgt_gather_time
@@ -3689,12 +3945,9 @@ def run_training(
                 _globalize_cmt_output,
                 cmt_raw,
                 valid,
-                float(selector_cfg.get("cmt_allocation_kl", 0.5)),
                 distributed,
             )
-            primary, global_cmt_diagnostics, primary_start, primary_end = (
-                cmt_globalized
-            )
+            primary, global_cmt_diagnostics, primary_start, primary_end = cmt_globalized
             ta_time = pgt_score_time
             bellman_scan_time = cmt_score_time
             selector_time = pgt_score_time + cmt_score_time + cmt_gather_time
@@ -3793,7 +4046,13 @@ def run_training(
                 primary_start, primary_end = ta_start, ta_end
         finite_or_raise(f"{method} selector", primary.scores[valid])
         score_key = (
-            "s_TA" if method == "ta" else "s_PGT" if method == "pgt" else "w"
+            "s_TA"
+            if method == "ta"
+            else "s_PGT"
+            if method == "pgt"
+            else "s_CMT"
+            if method == "cmt"
+            else "w"
         )
         if method in {"ta", "pgt"}:
             selected, global_selected = _local_mask_from_global_budget(
@@ -3811,7 +4070,10 @@ def run_training(
                 global_primary_diagnostics[score_key], dtype=torch.bool
             )
             expected = global_primary_diagnostics[score_key].numel()
-            token_allocation = selected if method == "opd" else primary.scores
+            # CMT's actual weights are solved inside each PPO optimizer group.
+            # This placeholder is never read by _opd_train_step when
+            # gibbs_scores is supplied below.
+            token_allocation = selected if method in {"opd", "cmt"} else primary.scores
         # RAC selector computations run under inference_mode.  Materialize a
         # normal frozen tensor before it participates in a differentiable
         # weighted loss (the same guard used by TopKOPDReference).
@@ -3821,13 +4083,11 @@ def run_training(
             raise AssertionError(f"{method} supervised-token count is incorrect")
         if not torch.equal(original_rollout, rollout.input_ids):
             raise AssertionError("Selector changed the original rollout")
-        token_score_stats_path = (
-            score_stats_logger.write(
+        token_score_stats_path = None
+        if method != "cmt" and distributed.is_main:
+            token_score_stats_path = score_stats_logger.write(
                 rollout_last_optimizer_step, max_steps, global_primary_diagnostics
             )
-            if distributed.is_main
-            else None
-        )
         sample_ids = [
             f"{stable_sample_id(record, index)}::response-{response_index}"
             for record, index, response_index in zip(
@@ -3870,9 +4130,7 @@ def run_training(
         save_checkpoints = bool(training.get("save_checkpoints", True))
         save_interval = int(training.get("save_interval", 100))
 
-        def after_optimizer_step(
-            current_step: int, _metrics: dict[str, float]
-        ) -> None:
+        def after_optimizer_step(current_step: int, _metrics: dict[str, float]) -> None:
             should_evaluate = should_run_training_evaluation(
                 current_step, max_steps, training_eval_settings
             )
@@ -3929,11 +4187,49 @@ def run_training(
             distributed,
             objective_valid_mask=objective_valid,
             trajectory_active_mask=active_trajectories,
+            trajectory_group_ids=(response_indices if method == "cmt" else None),
+            gibbs_scores=(primary.scores if method == "cmt" else None),
+            gibbs_epsilon=(
+                float(selector_cfg.get("cmt_allocation_kl", 0.5))
+                if method == "cmt"
+                else None
+            ),
             ppo_minibatch_offset=ppo_minibatch_offset,
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
             on_optimizer_step=after_optimizer_step,
         )
+        if method == "cmt":
+            local_cmt_weights = train_metrics.pop("allocated_position_weights")
+            if local_cmt_weights is None:
+                raise AssertionError(
+                    "CMT training did not return groupwise Gibbs weights"
+                )
+            global_cmt_weights, weight_start, weight_end, _weight_lengths = (
+                distributed.all_gather_variable_1d(local_cmt_weights[valid])
+            )
+            if (weight_start, weight_end) != (primary_start, primary_end):
+                raise AssertionError(
+                    "CMT score/weight distributed token layouts differ"
+                )
+            global_primary_diagnostics["w"] = global_cmt_weights
+            global_cmt_diagnostics["w"] = global_cmt_weights
+            cmt_diagnostics = dict(primary.diagnostics)
+            cmt_diagnostics.update(
+                w=local_cmt_weights,
+                allocation_kl_epsilon=float(selector_cfg.get("cmt_allocation_kl", 0.5)),
+                allocation_count=int(train_metrics["gibbs_allocations"]),
+            )
+            primary = SelectorOutput(local_cmt_weights, cmt_diagnostics)
+            token_allocation = local_cmt_weights
+            score_key = "w"
+            selector_time += float(train_metrics["gibbs_allocation_time"])
+            if distributed.is_main:
+                token_score_stats_path = score_stats_logger.write(
+                    rollout_last_optimizer_step,
+                    max_steps,
+                    global_primary_diagnostics,
+                )
         optimizer_steps_completed = int(train_metrics["optimizer_steps"])
         optimizer_step += optimizer_steps_completed
         step = optimizer_step
@@ -4040,6 +4336,13 @@ def run_training(
                 // distributed.world_size
             ),
             "ppo_minibatches_in_rollout": optimizer_steps_completed,
+            "trajectories_per_full_rollout": len(global_indices) * num_responses,
+            "ppo_groups_per_full_rollout": rollout_ppo_minibatches,
+            "gibbs_allocations_in_rollout": int(train_metrics["gibbs_allocations"]),
+            "optimizer_steps_in_rollout": optimizer_steps_completed,
+            "trajectories_per_gibbs": (
+                ppo_mini_batch_size if method == "cmt" else None
+            ),
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
             "distributed_strategy": strategy,
@@ -4053,7 +4356,7 @@ def run_training(
                 "ta": "hard_global_top_rho",
                 "rac": "bellman_soft_all_valid_response_tokens",
                 "pgt": "hard_global_top_rho_projected_gradient_gain",
-                "cmt": "kl_constrained_global_coupled_marginal_teachability",
+                "cmt": "kl_constrained_per_ppo_group_coupled_marginal_teachability",
                 "iw": "official_prefix_remaining_discrepancy_advantage_weight",
             }[method],
             "objective_normalization": "global_weighted_token_mean",
@@ -4073,9 +4376,7 @@ def run_training(
                 "iw": "sampled_response_action",
             }[method],
             "opd_candidate_support": (
-                "sampled_response_action"
-                if method == "iw"
-                else "student_topk"
+                "sampled_response_action" if method == "iw" else "student_topk"
             ),
             "opd_support_geometry": (
                 "sampled_action_singleton"
@@ -4294,9 +4595,7 @@ def run_training(
                     "loss": minibatch_metric["loss"],
                     "weighted_final_loss": minibatch_metric["weighted_final_loss"],
                     "base_topk_opd_loss": minibatch_metric["base_topk_opd_loss"],
-                    "unweighted_opd_loss": minibatch_metric[
-                        "unweighted_opd_loss"
-                    ],
+                    "unweighted_opd_loss": minibatch_metric["unweighted_opd_loss"],
                     "gradient_norm": distributed.max_float(
                         minibatch_metric["gradient_norm"]
                     ),
@@ -4317,9 +4616,7 @@ def run_training(
                     "opd_ratio_mean": minibatch_metric["ratio_mean"],
                     "opd_ratio_min": minibatch_metric["ratio_min"],
                     "opd_ratio_max": minibatch_metric["ratio_max"],
-                    "ppo_minibatch_index": int(
-                        minibatch_metric["ppo_minibatch_index"]
-                    ),
+                    "ppo_minibatch_index": int(minibatch_metric["ppo_minibatch_index"]),
                     "ppo_minibatch_trajectory_count": int(
                         minibatch_metric["ppo_minibatch_trajectory_count"]
                     ),
@@ -4390,8 +4687,7 @@ def run_training(
         "full_dataset": True,
         "ppo_mini_batch_size": ppo_mini_batch_size,
         "local_ppo_mini_batch_size": (
-            (ppo_mini_batch_size + distributed.world_size - 1)
-            // distributed.world_size
+            (ppo_mini_batch_size + distributed.world_size - 1) // distributed.world_size
         ),
         "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
         "rollout_backend": rollout_backend,

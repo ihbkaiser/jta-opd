@@ -110,9 +110,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
                 expanded, indices, response_indices = expand_prompt_batch(
                     encoded, [7, 9], num_responses
                 )
-                self.assertEqual(
-                    expanded["input_ids"].shape[0], 2 * num_responses
-                )
+                self.assertEqual(expanded["input_ids"].shape[0], 2 * num_responses)
                 self.assertEqual(len(indices), 2 * num_responses)
                 self.assertEqual(
                     response_indices,
@@ -211,9 +209,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
         }
         tokenizer = _TemplateTokenizer()
 
-        train_user_prompt = record_messages(record, prompt_key="problem")[0][
-            "content"
-        ]
+        train_user_prompt = record_messages(record, prompt_key="problem")[0]["content"]
         eval_user_prompt = build_math_user_prompt(problem)
         rendered_train_prompt = render_record_prompt(record, tokenizer, data_config)
         rendered_eval_prompt = render_math_prompt(tokenizer, problem, data_config)
@@ -221,9 +217,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(train_user_prompt, eval_user_prompt)
         self.assertEqual(rendered_train_prompt, rendered_eval_prompt)
         self.assertEqual(train_user_prompt.count(MATH_USER_INSTRUCTION), 1)
-        self.assertEqual(
-            build_math_user_prompt(train_user_prompt), train_user_prompt
-        )
+        self.assertEqual(build_math_user_prompt(train_user_prompt), train_user_prompt)
 
     def test_preformatted_dataset_prompt_does_not_duplicate_instruction(self):
         formatted = build_math_user_prompt("What is $5+5$?")
@@ -239,9 +233,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(
             KeyError, "prompt.*available fields: answer, problem"
         ):
-            record_messages(
-                {"problem": "1+1?", "answer": "2"}, prompt_key="prompt"
-            )
+            record_messages({"problem": "1+1?", "answer": "2"}, prompt_key="prompt")
 
     def test_dataset_prompt_schema_validation_reports_row_before_training(self):
         with self.assertRaisesRegex(
@@ -271,9 +263,7 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(summary["original_count"], 2)
         self.assertEqual(summary["kept_count"], 1)
         self.assertEqual(summary["filtered_overlong_count"], 1)
-        encoded, _ = tokenize_prompts(
-            kept, tokenizer, config, torch.device("cpu")
-        )
+        encoded, _ = tokenize_prompts(kept, tokenizer, config, torch.device("cpu"))
         self.assertLessEqual(int(encoded["attention_mask"].sum()), 20)
 
     def test_overlong_error_policy_fails_instead_of_truncating(self):
@@ -316,7 +306,10 @@ class DataEvaluationConfigTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(rows[0], {"id": "test/prealgebra/1", "problem": "Find $2+2$.", "answer": "4"})
+            self.assertEqual(
+                rows[0],
+                {"id": "test/prealgebra/1", "problem": "Find $2+2$.", "answer": "4"},
+            )
             self.assertEqual(schema["answer_key"], "answer")
 
     def test_b200_aime24_and_aime25_schema_normalization(self):
@@ -400,11 +393,16 @@ class DataEvaluationConfigTests(unittest.TestCase):
         self.assertEqual(base["rollout"]["temperature"], 1.0)
         self.assertEqual(base["training"]["micro_batch_size_per_gpu"], 8)
         self.assertEqual(base["training"]["ppo_mini_batch_size"], 16)
+        self.assertEqual(base["training"]["epochs"], 1)
+        self.assertEqual(base["training"]["learning_rate"], 1.0e-6)
         self.assertEqual(base["data"]["overlong_prompt_policy"], "filter")
         self.assertTrue(base["training"]["gradient_checkpointing"])
         self.assertEqual(base["data"]["max_prompt_tokens"], 1024)
         self.assertEqual(base["rollout"]["max_new_tokens"], 7168)
         self.assertEqual(base["rollout"]["vllm"]["max_model_len"], 9216)
+        self.assertEqual(base["rollout"]["vllm"]["gpu_memory_utilization"], 0.40)
+        self.assertEqual(base["training"]["save_interval"], 50)
+        self.assertEqual(base["training_evaluation"]["interval_steps"], 50)
         self.assertEqual(base["selector"]["top_k"], 16)
         self.assertEqual(base["opd"]["top_k_strategy"], "only_stu")
         self.assertEqual(base["opd"]["reward_weight_mode"], "student_p")

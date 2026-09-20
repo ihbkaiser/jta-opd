@@ -107,19 +107,20 @@ export CMT_RUN_NAME="cmt_${PAIR}"
 export GRPO_RUN_NAME="grpo_qwen3_1p7b_compmath_seed42_${PAIR}"
 export IW_RUN_NAME="iw_qwen3_1p7b_8b_compmath_seed42_${PAIR}"
 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DISTRIBUTED_STRATEGY=fsdp
 export BATCH_SIZE=64
-export NUM_RESPONSES=1
-export MICRO_BATCH_SIZE_PER_GPU=8
-export PPO_MINI_BATCH_SIZE=16
+export NUM_RESPONSES=4
+export MICRO_BATCH_SIZE_PER_GPU=16
+export PPO_MINI_BATCH_SIZE=64
 export LR=5e-6
-export NUM_EPOCHS=1
 export MAX_PROMPT_LENGTH=1024
 export MAX_RESPONSE_LENGTH=4096
 export TOP_K=16
-export SAVE_INTERVAL=50
-export EVAL_INTERVAL=100
+export SAVE_INTERVAL=150
+export EVAL_INTERVAL=150
+export ROLLOUT_VLLM_GPU_MEMORY_UTILIZATION=0.6
+export ROLLOUT_VLLM_MAX_MODEL_LEN=5200
 export TRAIN_EVAL_ENABLED=true
 export TRAIN_EVAL_NUM_RESPONSES=8
 export TRAIN_EVAL_SEED=42
@@ -131,12 +132,17 @@ export ROLLOUT_TOP_P=1.0
 `MAX_STEPS` là tổng số optimizer steps mục tiêu. Không đặt hoặc đặt `MAX_STEPS=-1` để chạy hết
 epoch đã cấu hình; đặt `MAX_STEPS=1` hoặc `2` cho debug.
 
-`BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` đều là global. Với `PPO_MINI_BATCH_SIZE=16`, một global
-PPO step dùng 16 trajectories: 16/GPU trên 1 GPU, 8/GPU trên 2 GPU, 4/GPU trên 4 GPU.
-`MICRO_BATCH_SIZE_PER_GPU` chỉ điều khiển chunk local; code tự cap nó ở local PPO share khi cần.
-Các PPO minibatch hoàn chỉnh được rank-interleave deterministic để mọi rank cùng tham gia một
-optimizer step; final partial minibatch được giữ nguyên sample count và sẽ báo lỗi rõ nếu một rank
-không có real trajectory để tham gia collective.
+`BATCH_SIZE` là số prompt global. Cấu hình trên sinh `64 x 4 = 256` trajectory trong
+một lần rollout, sau đó chia thành bốn PPO group global, mỗi group 64 trajectory.
+Với CMT, group thứ `r` chứa response thứ `r` của cả 64 prompt và được giải một Gibbs
+riêng ngay trước đúng một optimizer update. Vì vậy có đúng bốn Gibbs allocation và bốn
+optimizer step cho mỗi full rollout; không còn allocation chung trên 256 trajectory.
+Trên 4 GPU, mỗi rank nhận 16 trajectory thật trong mỗi PPO group.
+`MICRO_BATCH_SIZE_PER_GPU=16` chỉ là chunk local; giảm giá trị này khi OOM không làm
+tăng số Gibbs allocation hay optimizer step.
+
+Launcher tự chọn `NUM_EPOCHS=3` cho Competition-MATH và `NUM_EPOCHS=2` cho DAPO.
+Có thể override `NUM_EPOCHS` từ command line nếu thực nghiệm cần khác.
 
 ## 3. Training
 
@@ -155,7 +161,9 @@ RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
 CMT mặc định dùng `CMT_ALLOCATION_KL=0.5`, `CMT_GAMMA=1.0`,
-`CMT_SUCCESSOR_LAMBDA=1.0`, union support cho CMT score, Student Top-16 cho OPD loss và `top_p=1`. Full-vocabulary CMT diagnostics
+`CMT_SUCCESSOR_LAMBDA=1.0`, union support cho CMT score, Student Top-16 cho OPD loss và `top_p=1`.
+Gibbs được chuẩn hoá độc lập trong từng PPO group 64 trajectory (one Gibbs = one update).
+Full-vocabulary CMT diagnostics
 không bật mặc định:
 
 ```bash
@@ -219,7 +227,7 @@ ceil(256 / PPO_MINI_BATCH_SIZE)
 Đây là lý do cấu hình tương đương với CMT phải là:
 
 ```text
-CMT : ceil(64 * 1 / 16) = 4 step/rollout
+CMT : ceil(64 * 4 / 64) = 4 step/rollout
 GRPO: ceil(64 * 4 / 64) = 4 step/rollout
 ```
 
@@ -249,11 +257,10 @@ GRPO_RUN_NAME=grpo_dapo_g4_rolloutstep_seed42 \
 bash scripts/train_grpo_b200.sh
 ```
 
-`PPO_MINI_BATCH_SIZE=64` không làm GRPO có cùng số trajectory trong một optimizer
-update với CMT; nó chỉ làm số update trên mỗi rollout (và vì thế số step trong
-một epoch) trùng nhau. Nếu cần so sánh theo số trajectory/optimizer update, hãy
-giữ `PPO_MINI_BATCH_SIZE=16` cho tất cả method và vẽ theo
-`rollout_batch_index`, `num_valid_tokens` hoặc số prompt đã thấy.
+Với cấu hình production hiện tại, GRPO `G=4, PPO=64` và CMT `n=4, PPO=64`
+đều dùng 64 trajectory cho mỗi optimizer update và đều có bốn update/full rollout.
+CMT khác ở chỗ bốn group được tạo theo response index và mỗi group có Gibbs
+allocation độc lập; GRPO dùng group-relative reward objective riêng của nó.
 
 #### Chẩn đoán OOM GRPO
 

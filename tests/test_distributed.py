@@ -20,12 +20,14 @@ from b200_experiment.distributed import (
     batch_layout,
     contiguous_partition,
     distributed_ppo_minibatch_partition,
+    grouped_ppo_minibatch_partition,
     initialize_distributed,
     isolate_distributed_subprocess_environment,
     padded_local_indices,
     unique_free_port,
 )
 from b200_experiment.selectors import TASelector
+from b200_experiment.selectors.cmt_selector import kl_constrained_allocation
 from b200_experiment.trainer import (
     _globalize_ta_output,
     _local_mask_from_global_budget,
@@ -55,7 +57,12 @@ class _TinyCausalLM(nn.Module):
         self.position_id_calls = []
 
     def forward(
-        self, input_ids, attention_mask, position_ids=None, use_cache=False, return_dict=True
+        self,
+        input_ids,
+        attention_mask,
+        position_ids=None,
+        use_cache=False,
+        return_dict=True,
     ):
         del use_cache, return_dict
         self.forward_calls += 1
@@ -274,21 +281,24 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
 
 class DistributedInvariantTests(unittest.TestCase):
     def test_nccl_process_group_is_bound_to_the_local_cuda_device(self):
-        with patch.dict(
-            os.environ,
-            {"WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"},
-            clear=False,
-        ), patch(
-            "b200_experiment.distributed.torch.cuda.is_available", return_value=True
-        ), patch(
-            "b200_experiment.distributed.torch.cuda.device_count", return_value=2
-        ), patch(
-            "b200_experiment.distributed.torch.cuda.set_device"
-        ) as set_device, patch(
-            "b200_experiment.distributed.dist.is_initialized", return_value=False
-        ), patch(
-            "b200_experiment.distributed.dist.init_process_group"
-        ) as initialize:
+        with (
+            patch.dict(
+                os.environ,
+                {"WORLD_SIZE": "2", "RANK": "1", "LOCAL_RANK": "1"},
+                clear=False,
+            ),
+            patch(
+                "b200_experiment.distributed.torch.cuda.is_available", return_value=True
+            ),
+            patch(
+                "b200_experiment.distributed.torch.cuda.device_count", return_value=2
+            ),
+            patch("b200_experiment.distributed.torch.cuda.set_device") as set_device,
+            patch(
+                "b200_experiment.distributed.dist.is_initialized", return_value=False
+            ),
+            patch("b200_experiment.distributed.dist.init_process_group") as initialize,
+        ):
             context = initialize_distributed()
 
         self.assertEqual(context.device, torch.device("cuda", 1))
@@ -327,20 +337,16 @@ class DistributedInvariantTests(unittest.TestCase):
         self.assertIn("TORCHELASTIC_USE_AGENT_STORE", source)
 
     def test_production_batch_layout_is_explicit(self):
-        layout = batch_layout(64, 1, 2, 8, 16)
+        layout = batch_layout(64, 4, 4, 16, 64)
         self.assertEqual(layout.global_prompt_batch_size, 64)
-        self.assertEqual(layout.local_prompt_batch_size, 32)
-        self.assertEqual(layout.global_trajectory_batch_size, 64)
-        self.assertEqual(layout.local_trajectory_batch_size, 32)
-        self.assertEqual(layout.ppo_mini_batch_size, 16)
-        self.assertEqual(layout.local_ppo_mini_batch_size, 8)
+        self.assertEqual(layout.local_prompt_batch_size, 16)
+        self.assertEqual(layout.global_trajectory_batch_size, 256)
+        self.assertEqual(layout.local_trajectory_batch_size, 64)
+        self.assertEqual(layout.ppo_mini_batch_size, 64)
+        self.assertEqual(layout.local_ppo_mini_batch_size, 16)
         self.assertEqual(layout.optimizer_steps_per_full_rollout, 4)
-        self.assertEqual(layout.micro_batch_size_per_gpu, 8)
+        self.assertEqual(layout.micro_batch_size_per_gpu, 16)
         self.assertEqual(layout.micro_batches_per_gpu, 1)
-        four_gpu = batch_layout(64, 1, 4, 8, 16)
-        self.assertEqual(four_gpu.local_ppo_mini_batch_size, 4)
-        self.assertEqual(four_gpu.micro_batch_size_per_gpu, 4)
-        self.assertEqual(four_gpu.micro_batches_per_gpu, 1)
 
     def test_global_ppo_batch_is_split_across_all_ranks(self):
         for world_size, expected_local in ((1, 16), (2, 8), (4, 4)):
@@ -349,10 +355,11 @@ class DistributedInvariantTests(unittest.TestCase):
                 distributed_ppo_minibatch_partition(counts, rank, 16, 0)[0]
                 for rank in range(world_size)
             ]
-            self.assertEqual([len(partition) for partition in partitions], [expected_local] * world_size)
             self.assertEqual(
-                sum(len(partition) for partition in partitions), 16
+                [len(partition) for partition in partitions],
+                [expected_local] * world_size,
             )
+            self.assertEqual(sum(len(partition) for partition in partitions), 16)
             self.assertEqual(partitions[0], list(range(expected_local)))
 
     def test_global_ppo_batch_32_splits_to_16_on_two_ranks(self):
@@ -363,6 +370,31 @@ class DistributedInvariantTests(unittest.TestCase):
         ]
         self.assertEqual([len(partition) for partition in partitions], [16, 16])
         self.assertEqual(sum(len(partition) for partition in partitions), 32)
+
+    def test_response_grouped_256_trajectories_form_four_exact_ppo_groups(self):
+        # Four ranks own 16 prompts each. Local rollout storage is prompt-major:
+        # response ids 0,1,2,3 repeat for every prompt.
+        group_ids_by_rank = tuple((0, 1, 2, 3) * 16 for _ in range(4))
+        seen: set[tuple[int, int]] = set()
+        for ppo_index in range(4):
+            partitions = [
+                grouped_ppo_minibatch_partition(group_ids_by_rank, rank, 64, ppo_index)[
+                    0
+                ]
+                for rank in range(4)
+            ]
+            self.assertEqual([len(partition) for partition in partitions], [16] * 4)
+            self.assertEqual(sum(map(len, partitions)), 64)
+            for rank, partition in enumerate(partitions):
+                self.assertTrue(
+                    all(group_ids_by_rank[rank][row] == ppo_index for row in partition)
+                )
+                # Exactly one response with this index from every local prompt.
+                self.assertEqual([row // 4 for row in partition], list(range(16)))
+                for row in partition:
+                    self.assertNotIn((rank, row), seen)
+                    seen.add((rank, row))
+        self.assertEqual(len(seen), 256)
 
     def test_ppo_batch_smaller_than_world_size_fails_explicitly(self):
         with self.assertRaisesRegex(ValueError, "at least world_size"):
@@ -404,7 +436,11 @@ class DistributedInvariantTests(unittest.TestCase):
                 seen.extend((rank, position) for position in local)
         self.assertEqual(
             sorted(seen),
-            [(rank, position) for rank, count in enumerate(counts) for position in range(count)],
+            [
+                (rank, position)
+                for rank, count in enumerate(counts)
+                for position in range(count)
+            ],
         )
 
     def test_optimizer_step_count_is_world_size_invariant(self):
@@ -580,6 +616,75 @@ class DistributedInvariantTests(unittest.TestCase):
             [8.0, 8.0],
         )
 
+    def test_cmt_has_one_groupwise_gibbs_allocation_per_optimizer_step(self):
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(256)], dtype=torch.long
+        )
+        valid = torch.tensor([[True, False]] * 256)
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=valid,
+            rollout_log_probs=torch.zeros((256, 2)),
+            prompt_width=2,
+        )
+        response_indices = [response for _prompt in range(64) for response in range(4)]
+        gibbs_scores = torch.zeros((256, 2), dtype=torch.float32)
+        gibbs_scores[:, 0] = torch.arange(256, dtype=torch.float32)
+
+        for micro_batch in (16, 7):
+            model = _TinyCausalLM()
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+            original_step = optimizer.step
+            step_calls = 0
+            allocation_inputs: list[torch.Tensor] = []
+
+            def counted_step(*args, **kwargs):
+                nonlocal step_calls
+                step_calls += 1
+                return original_step(*args, **kwargs)
+
+            def recorded_allocation(values, epsilon, **kwargs):
+                allocation_inputs.append(values.detach().cpu().clone())
+                return kl_constrained_allocation(values, epsilon, **kwargs)
+
+            optimizer.step = counted_step
+            with patch(
+                "b200_experiment.trainer.kl_constrained_allocation",
+                side_effect=recorded_allocation,
+            ):
+                metrics = _opd_train_step(
+                    model,
+                    optimizer,
+                    rollout,
+                    valid.float(),
+                    _tiny_reference(model, rollout),
+                    _tiny_config(micro_batch, 64),
+                    torch.device("cpu"),
+                    DistributedContext(0, 0, 1, torch.device("cpu")),
+                    trajectory_group_ids=response_indices,
+                    gibbs_scores=gibbs_scores,
+                    gibbs_epsilon=0.5,
+                )
+
+            self.assertEqual(step_calls, 4)
+            self.assertEqual(metrics["optimizer_steps"], 4)
+            self.assertEqual(metrics["gibbs_allocations"], 4)
+            self.assertEqual(len(allocation_inputs), 4)
+            for response_index, allocation_values in enumerate(allocation_inputs):
+                expected = torch.arange(response_index, 256, 4, dtype=torch.float32)
+                self.assertTrue(torch.equal(allocation_values, expected))
+            self.assertEqual(
+                [
+                    item["ppo_minibatch_trajectory_count"]
+                    for item in metrics["minibatches"]
+                ],
+                [64.0] * 4,
+            )
+            for item in metrics["minibatches"]:
+                self.assertAlmostEqual(item["global_weight_mass"], 64.0, places=4)
+
     def test_partial_ppo_minibatch_and_optimizer_step_schedule(self):
         # Prompt batches are 4, 4, 2; with n=4 this is 16, 16, 8
         # trajectories and therefore 2, 2, 1 optimizer steps at PPO size 8.
@@ -752,12 +857,8 @@ class DistributedInvariantTests(unittest.TestCase):
                 nprocs=2,
                 join=True,
             )
-            rank0 = torch.load(
-                Path(temporary) / "global-rank-0.pt", weights_only=True
-            )
-            rank1 = torch.load(
-                Path(temporary) / "global-rank-1.pt", weights_only=True
-            )
+            rank0 = torch.load(Path(temporary) / "global-rank-0.pt", weights_only=True)
+            rank1 = torch.load(Path(temporary) / "global-rank-1.pt", weights_only=True)
         self.assertTrue(torch.allclose(rank0, rank1, atol=1e-7, rtol=1e-6))
         self.assertTrue(torch.allclose(rank0, expected, atol=1e-7, rtol=1e-6))
 
