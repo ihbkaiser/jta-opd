@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -11,7 +22,9 @@ def _atomic_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+            handle.write(
+                json.dumps(_json_safe(row), sort_keys=True, allow_nan=False) + "\n"
+            )
     temporary.replace(path)
 
 
@@ -20,7 +33,9 @@ def _atomic_gzip_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with gzip.open(temporary, "wt", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+            handle.write(
+                json.dumps(_json_safe(row), sort_keys=True, allow_nan=False) + "\n"
+            )
     temporary.replace(path)
 
 

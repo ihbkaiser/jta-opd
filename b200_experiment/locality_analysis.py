@@ -351,8 +351,8 @@ def build_matched_pairs(
 
     def record(index: int) -> dict[str, Any]:
         item = dict(metadata[index])
+        item.setdefault("flat_index", index)
         item.update(
-            flat_index=index,
             g=float(local[index]),
             future_gain=float(future[index]),
         )

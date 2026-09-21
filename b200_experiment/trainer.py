@@ -23,7 +23,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from tqdm.auto import tqdm
 
-from .config import save_config
+from .config import save_config, validate_locality_probe_config
 from .data import (
     epoch_batch_indices,
     expand_prompt_batch,
@@ -68,6 +68,25 @@ from .eval_schedule import (
     training_evaluation_steps,
 )
 from .metadata import collect_metadata, save_metadata
+from .locality_analysis import (
+    assign_global_quantile_bins,
+    build_matched_pairs,
+    conditional_future_summary,
+    correlation_summary,
+    decile_summary,
+    finite_horizon_successor_gain,
+    realized_self_gain,
+    reverse_kl_on_fixed_support,
+)
+from .locality_logging import LocalityLogger
+from .locality_probe import (
+    FrozenStateProbe,
+    LocalityProbeRunner,
+    audit_prompt_overlap,
+    deterministic_prompt_sample,
+    load_competition_math_test,
+    write_probe_manifest,
+)
 from .models import (
     is_qwen35_composite_text_model,
     load_models,
@@ -152,6 +171,15 @@ METHOD_DISPLAY_NAMES = {
     "grpo": "GRPO",
     "iw": "IW-OPD",
 }
+
+
+def locality_uniform_position_weights(
+    config: dict[str, Any], valid_mask: torch.Tensor
+) -> torch.Tensor | None:
+    settings = validate_locality_probe_config(config)
+    if not bool(settings["enabled"]):
+        return None
+    return valid_mask.detach().float()
 
 
 def seed_everything(seed: int) -> None:
@@ -585,6 +613,195 @@ def _rollout_hash(
     )
     combined, _, _, _ = distributed.all_gather_variable_1d(local)
     return hashlib.sha256(combined.detach().cpu().numpy().tobytes()).hexdigest()
+
+
+def _locality_state_metadata(
+    sample_ids: list[str],
+    response_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    tokenizer,
+    *,
+    trajectory_offset: int = 0,
+    context_radius: int = 16,
+) -> list[dict[str, Any]]:
+    metadata: list[dict[str, Any]] = []
+    ids_cpu = response_ids.detach().cpu()
+    valid_cpu = valid_mask.detach().cpu().bool()
+    for row, sample_id in enumerate(sample_ids):
+        length = int(valid_cpu[row].sum())
+        tokens = ids_cpu[row, :length].tolist()
+        for position, token_id in enumerate(tokens):
+            begin = max(0, position - int(context_radius))
+            end = min(length, position + int(context_radius) + 1)
+            context_ids = tokens[begin:end]
+            metadata.append(
+                {
+                    "sample_id": str(sample_id),
+                    "trajectory_id": int(trajectory_offset + row),
+                    "response_position": int(position),
+                    "token_id": int(token_id),
+                    "token_text": tokenizer.decode([int(token_id)]),
+                    "token_context": tokenizer.decode(context_ids),
+                    "response_length": length,
+                    "distance_to_eos": length - position - 1,
+                }
+            )
+    return metadata
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _build_or_load_other_id_probe(
+    *,
+    config: dict[str, Any],
+    settings: dict[str, Any],
+    output_dir: Path,
+    records: list[dict[str, Any]],
+    student,
+    teacher,
+    tokenizer,
+    pgt_selector: PGTSelector,
+    rollout_engine: VLLMRolloutEngine | None,
+    device: torch.device,
+    distributed: DistributedContext,
+) -> tuple[FrozenStateProbe | None, dict[str, Any] | None]:
+    other = settings["other_id"]
+    if not bool(settings["enabled"]) or not bool(other.get("enabled", True)):
+        return None, None
+    probe_root = output_dir / "analysis" / "other_id_probe"
+    shard_path = probe_root / f"probe_states.rank-{distributed.rank:05d}.pt"
+    index_path = probe_root / "probe_states.pt"
+    if index_path.exists():
+        cache_index = torch.load(index_path, map_location="cpu", weights_only=False)
+        if int(cache_index.get("schema_version", 0)) != 1:
+            raise ValueError("Unsupported OTHER-ID probe cache schema")
+        if int(cache_index.get("world_size", -1)) != distributed.world_size:
+            raise ValueError(
+                "OTHER-ID probe cache world size differs from the resumed run; "
+                "rebuild the cache with the original distributed layout"
+            )
+    test_records, _test_schema = load_competition_math_test(config)
+    audit = audit_prompt_overlap(
+        records,
+        test_records,
+        train_prompt_key=str(config["data"].get("prompt_key", "problem")),
+        test_prompt_key="problem",
+    )
+    if distributed.is_main:
+        _atomic_json(output_dir / "analysis" / "data_split_audit.json", audit)
+    if audit["overlap_count"] and bool(settings.get("fail_on_prompt_overlap", True)):
+        raise ValueError(
+            f"Competition-MATH train/test prompt overlap is non-zero: {audit['overlap_count']}"
+        )
+    sampled = deterministic_prompt_sample(
+        test_records,
+        int(other["num_prompts"]),
+        seed=int(other["seed"]),
+    )
+    if shard_path.exists():
+        probe = FrozenStateProbe.load(shard_path)
+    else:
+        global_indices = list(range(len(sampled)))
+        prompt_indices, active_prompts = padded_local_indices(
+            global_indices, distributed.rank, distributed.world_size
+        )
+        prompt_records = [sampled[index] for index in prompt_indices]
+        encoded, _ = tokenize_prompts(prompt_records, tokenizer, config["data"], device)
+        rollout_function = (
+            rollout_engine.generate if rollout_engine is not None else generate_on_policy
+        )
+        rollout = rollout_function(
+            student,
+            encoded["input_ids"],
+            encoded["attention_mask"],
+            max_new_tokens=int(other["max_new_tokens"]),
+            temperature=float(config["rollout"].get("temperature", 1.0)),
+            top_p=float(config["rollout"].get("top_p", 1.0)),
+            eos_token_ids=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            seed=int(other["seed"]),
+            sample_seed_offset=prompt_indices[0] if prompt_indices else 0,
+        )
+        active = torch.tensor(active_prompts, dtype=torch.bool, device=device)
+        probe_valid = rollout.valid_mask & active.unsqueeze(1)
+        student_scores, teacher_scores = score_student_teacher_rollout(
+            student,
+            teacher,
+            rollout,
+            score_chunk_steps=int(config["selector"].get("score_chunk_steps", 128)),
+            top_k=int(config["selector"].get("top_k", OPD_LOSS_TOP_K)),
+            student_temperature=float(config["rollout"].get("temperature", 1.0)),
+            teacher_temperature=float(config.get("opd", {}).get("teacher_temperature", 1.0)),
+            micro_batch_size=int(config["selector"].get("score_micro_batch_size", 1)),
+            trim_padding=bool(config["selector"].get("trim_padding", True)),
+            length_bucketed=bool(config["selector"].get("length_bucketed_scoring", True)),
+        )
+        if student_scores.candidate_log_probs is None:
+            raise AssertionError("Probe joint scoring did not score teacher candidates")
+        scored = pgt_selector.compute_scores_from_topk(
+            student_scores.top_k_ids,
+            teacher_scores.top_k_ids,
+            student_scores.top_k_log_probs,
+            teacher_scores.candidate_log_probs,
+            teacher_scores.top_k_log_probs,
+            student_scores.candidate_log_probs,
+            probe_valid,
+            token_chunk_size=int(config["selector"].get("pgt_vocab_chunk_tokens", 2048)),
+        )
+        sample_ids = [str(sampled[index]["id"]) for index in prompt_indices]
+        metadata = _locality_state_metadata(
+            sample_ids,
+            rollout.response_ids,
+            probe_valid,
+            tokenizer,
+            trajectory_offset=min(prompt_indices) if prompt_indices else 0,
+        )
+        probe_rollout = RolloutBatch(
+            input_ids=rollout.input_ids,
+            attention_mask=rollout.attention_mask,
+            response_ids=rollout.response_ids,
+            valid_mask=probe_valid,
+            rollout_log_probs=rollout.rollout_log_probs,
+            prompt_width=rollout.prompt_width,
+        )
+        probe = FrozenStateProbe.from_scored_rollout(
+            probe_rollout, scored, metadata=metadata
+        )
+        probe.save(shard_path)
+        del student_scores, teacher_scores, scored, rollout, probe_rollout, encoded
+    distributed.barrier()
+    local_states = int(probe.valid_mask.sum())
+    global_states = distributed.sum_int(local_states)
+    if distributed.is_main:
+        shard_names = [
+            f"probe_states.rank-{rank:05d}.pt" for rank in range(distributed.world_size)
+        ]
+        torch.save(
+            {"schema_version": 1, "world_size": distributed.world_size, "shards": shard_names},
+            index_path,
+        )
+        write_probe_manifest(
+            probe_root / "manifest.json",
+            probe_name="Competition-MATH-test-fixed-step0",
+            num_prompts=len(sampled),
+            num_states=global_states,
+            seed=int(other["seed"]),
+            max_new_tokens=int(other["max_new_tokens"]),
+        )
+    distributed.barrier()
+    return probe, {
+        "probe_name": "Competition-MATH-test-fixed-step0",
+        "num_prompts": len(sampled),
+        "num_states": global_states,
+    }
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -1703,6 +1920,7 @@ def _opd_train_step(
     gibbs_weight_min: float = 0.5,
     gibbs_weight_max: float = 2.0,
     gibbs_final_epsilon: float = 0.02,
+    force_uniform_allocation: bool = False,
     rollout_id: int = 0,
     ppo_minibatch_offset: int = 0,
     max_optimizer_steps: int | None = None,
@@ -1927,19 +2145,32 @@ def _opd_train_step(
             ) = distributed.all_gather_variable_1d(local_group_scores)
             if global_group_scores.numel() == 0:
                 raise ValueError("CMT PPO group contains no valid tokens")
-            (
-                global_group_raw_weights,
-                global_group_weights,
-                allocation_inverse_temperature,
-                allocation_metrics,
-            ) = cmt_allocation(
-                global_group_scores,
-                float(gibbs_epsilon),
-                mode=gibbs_mode,
-                weight_min=gibbs_weight_min,
-                weight_max=gibbs_weight_max,
-                final_epsilon=gibbs_final_epsilon,
-            )
+            if force_uniform_allocation:
+                global_group_raw_weights = torch.ones_like(global_group_scores)
+                global_group_weights = torch.ones_like(global_group_scores)
+                allocation_metrics.update(
+                    weight_raw_max=1.0,
+                    weight_final_min=1.0,
+                    weight_final_max=1.0,
+                    normalized_ess=1.0,
+                    max_token_probability=1.0 / global_group_scores.numel(),
+                    allocation_solver_status="uniform_locality_diagnostic",
+                    allocation_maximum_feasible_kl=0.0,
+                )
+            else:
+                (
+                    global_group_raw_weights,
+                    global_group_weights,
+                    allocation_inverse_temperature,
+                    allocation_metrics,
+                ) = cmt_allocation(
+                    global_group_scores,
+                    float(gibbs_epsilon),
+                    mode=gibbs_mode,
+                    weight_min=gibbs_weight_min,
+                    weight_max=gibbs_weight_max,
+                    final_epsilon=gibbs_final_epsilon,
+                )
             ppo_raw_weights = torch.zeros_like(
                 gibbs_scores.index_select(0, indices), dtype=torch.float32
             )
@@ -3239,6 +3470,7 @@ def _run_grpo_training(
 def run_training(
     config: dict[str, Any], command_line: list[str] | None = None
 ) -> dict[str, Any]:
+    locality_settings = validate_locality_probe_config(config)
     distributed_cfg = config.get("distributed", {})
     distributed = initialize_distributed(distributed_cfg.get("backend", "nccl"))
     device = distributed.device
@@ -3566,7 +3798,8 @@ def run_training(
             "global_token_budget": method in {"ta", "pgt"},
             "global_rac_weight_normalization": method == "rac",
             "global_cmt_kl_allocation": method == "cmt",
-            "uniform_full_response_mask": method == "opd",
+            "uniform_full_response_mask": method == "opd"
+            or bool(locality_settings["enabled"]),
             "student_sharding_strategy": ("FULL_SHARD" if strategy == "fsdp" else None),
             "teacher_sharding_strategy": (
                 "FULL_SHARD" if strategy == "fsdp" else "replicated"
@@ -3684,6 +3917,49 @@ def run_training(
         successor_lambda=float(selector_cfg.get("cmt_successor_lambda", 1.0)),
         ablation_arm=str(selector_cfg.get("cmt_ablation_arm", "canonical")),
     )
+    locality_logger = (
+        LocalityLogger(output_dir, resume_step=resume_step)
+        if bool(locality_settings["enabled"]) and distributed.is_main
+        else None
+    )
+    locality_runner = (
+        LocalityProbeRunner(
+            score_chunk_steps=int(selector_cfg.get("score_chunk_steps", 128)),
+            temperature=float(config["rollout"].get("temperature", 1.0)),
+            trim_padding=bool(selector_cfg.get("trim_padding", True)),
+            length_bucketed=bool(selector_cfg.get("length_bucketed_scoring", True)),
+        )
+        if bool(locality_settings["enabled"])
+        else None
+    )
+    other_id_probe, other_id_info = _build_or_load_other_id_probe(
+        config=config,
+        settings=locality_settings,
+        output_dir=output_dir,
+        records=records,
+        student=training_student,
+        teacher=scoring_teacher,
+        tokenizer=tokenizer,
+        pgt_selector=pgt_selector,
+        rollout_engine=rollout_engine,
+        device=device,
+        distributed=distributed,
+    )
+    if locality_runner is not None and other_id_probe is not None:
+        initial_other_kl = locality_runner.score_frozen_states(
+            training_student,
+            other_id_probe,
+            device,
+            micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
+        )
+        local_other_values = initial_other_kl[other_id_probe.valid_mask.to(device)]
+        global_other_values, _, _, _ = distributed.all_gather_variable_1d(
+            local_other_values
+        )
+        locality_runner.initialize_other_id_metric(
+            float(global_other_values.double().mean())
+        )
+        del initial_other_kl, local_other_values, global_other_values
     batch_size = global_prompt_batch_size
     if batch_size <= 0 or num_responses <= 0:
         raise ValueError("Prompt batch size and rollout.num_responses must be positive")
@@ -4413,6 +4689,42 @@ def run_training(
                 f"expected {expected}"
             )
 
+        locality_train_probe: FrozenStateProbe | None = None
+        locality_g: torch.Tensor | None = None
+        locality_kl_pre: torch.Tensor | None = None
+        locality_override = locality_uniform_position_weights(config, valid)
+        if locality_override is not None:
+            if pgt_raw is None:
+                raise AssertionError("Locality analysis requires the pre-update PGT support")
+            locality_metadata = _locality_state_metadata(
+                sample_ids,
+                rollout.response_ids,
+                valid,
+                tokenizer,
+                trajectory_offset=local_start * num_responses,
+            )
+            locality_train_probe = FrozenStateProbe(
+                input_ids=rollout.input_ids.detach(),
+                attention_mask=rollout.attention_mask.detach(),
+                response_ids=rollout.response_ids.detach(),
+                valid_mask=valid.detach(),
+                prompt_width=int(rollout.prompt_width),
+                candidate_ids=pgt_raw.candidate_ids.detach().clone(),
+                support_mask=pgt_raw.support_mask.detach().clone(),
+                teacher_log_probs=(
+                    pgt_raw.teacher_candidate_log_probs.detach().clone()
+                ),
+                metadata=locality_metadata,
+            )
+            locality_g = pgt_raw.diagnostics["gain"].detach().clone()
+            locality_kl_pre = reverse_kl_on_fixed_support(
+                pgt_raw.student_candidate_log_probs,
+                pgt_raw.teacher_candidate_log_probs,
+                pgt_raw.support_mask,
+                valid,
+            )
+            token_allocation = locality_override
+
         del student_scores, teacher_scores
         # Let PyTorch reuse the released scoring-logit blocks for backward.
         # Emptying the CUDA allocator every step is materially slower on B200.
@@ -4493,12 +4805,203 @@ def run_training(
             gibbs_weight_min=cmt_weight_min,
             gibbs_weight_max=cmt_weight_max,
             gibbs_final_epsilon=cmt_final_allocation_kl,
+            force_uniform_allocation=bool(locality_settings["enabled"]),
             rollout_id=rollout_index,
             ppo_minibatch_offset=ppo_minibatch_offset,
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
             on_optimizer_step=after_optimizer_step,
         )
+        locality_row: dict[str, Any] | None = None
+        if locality_train_probe is not None:
+            if locality_runner is None or locality_g is None or locality_kl_pre is None:
+                raise AssertionError("Incomplete locality analysis state")
+            analysis_started = time.perf_counter()
+            post_started = time.perf_counter()
+            locality_kl_post = locality_runner.score_training_states_post_update(
+                training_student,
+                locality_train_probe,
+                device,
+                micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
+            )
+            cuda_sync(device)
+            train_post_rescore_sec = time.perf_counter() - post_started
+            locality_self_gain = realized_self_gain(locality_kl_pre, locality_kl_post)
+            locality_future = finite_horizon_successor_gain(
+                locality_self_gain,
+                valid,
+                locality_settings["future_horizons"],
+                gamma=float(locality_settings["future_gamma"]),
+            )
+
+            global_g, _, _, _ = distributed.all_gather_variable_1d(locality_g[valid])
+            global_pre, _, _, _ = distributed.all_gather_variable_1d(
+                locality_kl_pre[valid]
+            )
+            global_post, _, _, _ = distributed.all_gather_variable_1d(
+                locality_kl_post[valid]
+            )
+            global_self, _, _, _ = distributed.all_gather_variable_1d(
+                locality_self_gain[valid]
+            )
+            global_future: dict[int, torch.Tensor] = {}
+            for horizon, values in locality_future.items():
+                global_future[horizon], _, _, _ = distributed.all_gather_variable_1d(
+                    values[valid]
+                )
+            g_bins, _ = assign_global_quantile_bins(
+                global_g, bins=int(locality_settings["g_bins"])
+            )
+            self_summary = correlation_summary(global_g, global_self)
+            self_summary.update(
+                decile_summary(
+                    global_g,
+                    global_pre,
+                    global_post,
+                    global_self,
+                    g_bins,
+                    bins=int(locality_settings["g_bins"]),
+                )
+            )
+            future_summary = conditional_future_summary(
+                global_g,
+                global_future,
+                conditioning_quantiles=tuple(
+                    locality_settings["conditioning_quantiles"]
+                ),
+                main_horizon=int(locality_settings["main_future_horizon"]),
+            )
+
+            other_probe_started = time.perf_counter()
+            other_summary: dict[str, Any] | None = None
+            if other_id_probe is not None:
+                other_kl = locality_runner.score_frozen_states(
+                    training_student,
+                    other_id_probe,
+                    device,
+                    micro_batch_size=int(selector_cfg.get("score_micro_batch_size", 1)),
+                )
+                local_other = other_kl[other_id_probe.valid_mask.to(device)]
+                global_other, _, _, _ = distributed.all_gather_variable_1d(local_other)
+                other_summary = {
+                    **(other_id_info or {}),
+                    **locality_runner.record_other_id_metric(
+                        float(global_other.double().mean())
+                    ),
+                    "reverse_kl_median": float(global_other.double().median()),
+                    "positive_change": False,
+                    "negative_change": False,
+                }
+                other_summary["positive_change"] = bool(
+                    other_summary["realized_gain"] > 0.0
+                )
+                other_summary["negative_change"] = bool(
+                    other_summary["realized_gain"] < 0.0
+                )
+                del other_kl, local_other, global_other
+            cuda_sync(device)
+            other_id_probe_sec = time.perf_counter() - other_probe_started
+            analysis_total_sec = time.perf_counter() - analysis_started
+            locality_step = optimizer_step + 1
+            locality_row = {
+                "schema_version": 1,
+                "step": locality_step,
+                "run_role": "cmt_locality_probe_uniform_update",
+                "training_allocation": "uniform",
+                "training_weights_all_one": True,
+                "rollout_token_sha256": rollout_hash,
+                "num_train_states": int(global_g.numel()),
+                "self": self_summary,
+                "other_id": other_summary,
+                "future": future_summary,
+                "timing": {
+                    "train_post_rescore_sec": train_post_rescore_sec,
+                    "other_id_probe_sec": other_id_probe_sec,
+                    "analysis_total_sec": analysis_total_sec,
+                    "analysis_overhead_fraction": analysis_total_sec
+                    / max(time.perf_counter() - step_started, 1e-12),
+                    "peak_vram_bytes_with_analysis": int(
+                        torch.cuda.max_memory_allocated(device)
+                    ),
+                },
+            }
+
+            gathered_metadata = distributed.all_gather_objects(
+                locality_train_probe.metadata
+            )
+            if distributed.is_main:
+                global_metadata = [
+                    item for rank_rows in gathered_metadata for item in rank_rows
+                ]
+                if len(global_metadata) != global_g.numel():
+                    raise AssertionError("Locality metadata/global tensor layouts differ")
+                g_cpu = global_g.detach().cpu()
+                pre_cpu = global_pre.detach().cpu()
+                post_cpu = global_post.detach().cpu()
+                self_cpu = global_self.detach().cpu()
+                bins_cpu = g_bins.detach().cpu()
+                future_cpu = {
+                    horizon: values.detach().cpu()
+                    for horizon, values in global_future.items()
+                }
+                token_records: list[dict[str, Any]] = []
+                for index, metadata_row in enumerate(global_metadata):
+                    record = dict(metadata_row)
+                    record.update(
+                        {
+                            "step": locality_step,
+                            "flat_index": index,
+                            "g": float(g_cpu[index]),
+                            "g_decile": int(bins_cpu[index]),
+                            "g_percentile": (
+                                int(bins_cpu[index]) + 0.5
+                            )
+                            / int(locality_settings["g_bins"]),
+                            "reverse_kl_pre": float(pre_cpu[index]),
+                            "reverse_kl_post": float(post_cpu[index]),
+                            "realized_self_gain": float(self_cpu[index]),
+                        }
+                    )
+                    for horizon, values in future_cpu.items():
+                        record[f"future_gain_h{horizon}"] = float(values[index])
+                    token_records.append(record)
+                if locality_logger is None:
+                    raise AssertionError("Main rank locality logger is missing")
+                locality_logger.write_token_samples(
+                    locality_step,
+                    token_records,
+                    sample_size=int(locality_settings["token_sample_size"]),
+                )
+                band_low, band_high = future_summary["conditioning_band"]
+                thresholds = torch.quantile(
+                    g_cpu.double(), torch.tensor([band_low, band_high])
+                )
+                band_mask = g_cpu.ge(thresholds[0]) & g_cpu.le(thresholds[1])
+                band_indices = torch.nonzero(band_mask, as_tuple=False).squeeze(-1)
+                main_horizon = int(locality_settings["main_future_horizon"])
+                matched_pairs = build_matched_pairs(
+                    g_cpu.index_select(0, band_indices),
+                    future_cpu[main_horizon].index_select(0, band_indices),
+                    [token_records[index] for index in band_indices.tolist()],
+                    max_pairs=int(locality_settings["matched_pairs_per_step"]),
+                )
+                locality_logger.write_matched_pairs(locality_step, matched_pairs)
+                locality_logger.write_metrics(locality_row)
+                tensorboard_logger.write_locality(locality_step, locality_row)
+            del (
+                locality_kl_post,
+                locality_self_gain,
+                locality_future,
+                global_g,
+                global_pre,
+                global_post,
+                global_self,
+                global_future,
+                g_bins,
+                locality_train_probe,
+                locality_g,
+                locality_kl_pre,
+            )
         if method == "cmt":
             local_cmt_weights = train_metrics.pop("allocated_position_weights")
             local_cmt_raw_weights = train_metrics.pop("allocated_raw_position_weights")
@@ -4829,7 +5332,11 @@ def run_training(
                 "ta": "hard_global_top_rho",
                 "rac": "bellman_soft_all_valid_response_tokens",
                 "pgt": "hard_global_top_rho_projected_gradient_gain",
-                "cmt": "kl_constrained_per_ppo_group_coupled_marginal_teachability",
+                "cmt": (
+                    "uniform_all_valid_response_tokens_locality_diagnostic"
+                    if bool(locality_settings["enabled"])
+                    else "kl_constrained_per_ppo_group_coupled_marginal_teachability"
+                ),
                 "iw": "official_prefix_remaining_discrepancy_advantage_weight",
             }[method],
             "objective_normalization": "global_weighted_token_mean",
@@ -5001,6 +5508,7 @@ def run_training(
             "rollout_correction": (
                 dict(cmt_correction_metrics) if method == "cmt" else None
             ),
+            "locality_analysis": locality_row,
             **cmt_correction_metrics,
             **cmt_allocation_metrics,
         }

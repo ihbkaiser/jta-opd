@@ -235,6 +235,47 @@ def production_tensorboard_metrics(
     return selected
 
 
+def locality_tensorboard_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    self_metrics = metrics.get("self", {})
+    selected = {
+        f"analysis/self/{name}": float(self_metrics[name])
+        for name in (
+            "spearman_g_realized_gain",
+            "pearson_g_realized_gain",
+            "decile_mean_slope",
+            "adjacent_monotonic_fraction",
+        )
+        if self_metrics.get(name) is not None
+    }
+    for row in self_metrics.get("deciles", []):
+        if row.get("count", 0) and row.get("realized_gain_mean") is not None:
+            selected[
+                f"analysis/self/decile_{int(row['decile']):02d}_realized_gain"
+            ] = float(row["realized_gain_mean"])
+    other = metrics.get("other_id") or {}
+    if other.get("reverse_kl_after") is not None:
+        selected["analysis/other_id/reverse_kl"] = float(
+            other["reverse_kl_after"]
+        )
+    if other.get("realized_gain") is not None:
+        selected["analysis/other_id/realized_gain"] = float(other["realized_gain"])
+    future = metrics.get("future", {})
+    for source, suffix in (
+        ("horizon_32_std", "std"),
+        ("horizon_32_iqr", "iqr"),
+        ("horizon_32_p90_minus_p10", "p90_minus_p10"),
+    ):
+        if future.get(source) is not None:
+            selected[f"analysis/future/q40_q60_h32_{suffix}"] = float(
+                future[source]
+            )
+    timing = metrics.get("timing", {})
+    for field in ("train_post_rescore_sec", "other_id_probe_sec"):
+        if timing.get(field) is not None:
+            selected[f"analysis/timing/{field}"] = float(timing[field])
+    return selected
+
+
 class TensorBoardLogger:
     def __init__(
         self,
@@ -270,6 +311,12 @@ class TensorBoardLogger:
         if self.writer is None or int(step) % self.interval != 0:
             return
         for tag, value in production_tensorboard_metrics(metrics, method).items():
+            self.writer.add_scalar(tag, value, global_step=int(step))
+
+    def write_locality(self, step: int, metrics: dict[str, Any]) -> None:
+        if self.writer is None or int(step) % self.interval != 0:
+            return
+        for tag, value in locality_tensorboard_metrics(metrics).items():
             self.writer.add_scalar(tag, value, global_step=int(step))
 
     def close(self) -> None:

@@ -173,6 +173,15 @@ def test_locality_logger_upserts_steps_and_truncates_future_rows(tmp_path: Path)
     assert rows == [{"step": 1, "value": "new"}]
 
 
+def test_locality_logger_serializes_degenerate_statistics_as_null(tmp_path: Path):
+    logger = LocalityLogger(tmp_path, resume_step=0)
+
+    logger.write_metrics({"step": 1, "self": {"spearman": float("nan")}})
+
+    row = json.loads(logger.metrics_path.read_text(encoding="utf-8"))
+    assert row["self"]["spearman"] is None
+
+
 def test_locality_logger_stratifies_samples_and_writes_gzip_pairs(tmp_path: Path):
     logger = LocalityLogger(tmp_path, resume_step=0)
     records = [
