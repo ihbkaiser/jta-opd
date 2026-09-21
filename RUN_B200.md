@@ -30,6 +30,13 @@ The launcher rejects train/test prompt overlap by default. Full task evaluation
 continues at the canonical interval; dense OTHER-ID uses fixed step-0
 Competition-MATH test states.
 
+Generate every paper figure as both 300-DPI PNG and vector PDF:
+
+```bash
+OUTPUT_DIR=figures/locality \
+bash scripts/plot_locality_analysis.sh outputs/<run>/cmt_locality
+```
+
 ## Fresh environment
 
 ```bash
