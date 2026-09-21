@@ -114,15 +114,24 @@ from .scoring import (
     score_student_teacher_rollout,
     supports_response_only_logits,
 )
-from .selector_logging import SelectedTokenLogger, TokenScoreStatsLogger
+from .selector_logging import (
+    CMTTokenAuditLogger,
+    SelectedTokenLogger,
+    TokenScoreStatsLogger,
+    cmt_motivation_summary,
+)
 from .selectors import (
     CMTSelector,
     OPDSelector,
     PGTSelector,
     RACSelector,
     TASelector,
-    kl_constrained_allocation,
+    cmt_allocation,
+    cmt_weight_metrics,
+    robust_cmt_correction,
     top_budget_mask,
+    validate_cmt_allocation,
+    validate_cmt_correction,
 )
 from .selectors.pgt_selector import PGTOutput
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
@@ -415,9 +424,16 @@ def _globalize_cmt_output(
         "V",
         "H",
         "successor_excess",
+        "successor_return",
+        "successor_mass",
+        "successor_value",
+        "successor_excess_total",
+        "successor_excess_average",
         "successor_R",
         "sequential_gain",
+        "sequential_gain_raw",
         "learning_value",
+        "learning_value_raw",
         "s_CMT",
         "student_support_mass",
         "teacher_support_mass",
@@ -435,13 +451,72 @@ def _globalize_cmt_output(
     )
     # Do not solve one allocation here: this tensor spans the complete rollout
     # (e.g. 64 prompts x 4 responses = 256 trajectories), whereas each optimizer
-    # update consumes one global PPO group (e.g. 64 trajectories).  The solver is
+    # update consumes one global PPO group (e.g. 64 trajectories). The solver is
     # called inside _opd_train_step on exactly the rows used by that update.
     return (
         SelectorOutput(local.diagnostics["s_CMT"], dict(local.diagnostics)),
         gathered,
         start,
         end,
+    )
+
+
+@torch.no_grad()
+def _apply_global_cmt_correction(
+    local: SelectorOutput,
+    global_diagnostics: dict[str, torch.Tensor],
+    valid_mask: torch.Tensor,
+    start: int,
+    end: int,
+    *,
+    mode: str,
+    quantile: float,
+) -> tuple[SelectorOutput, dict[str, torch.Tensor], dict[str, float]]:
+    """Correct raw CMT D once on the rollout-global valid-token population."""
+    robust_d, robust_value, kappa, metrics = robust_cmt_correction(
+        global_diagnostics["gain"],
+        global_diagnostics["sequential_gain_raw"],
+        mode=mode,
+        quantile=quantile,
+    )
+    raw_value = global_diagnostics["gain"] + global_diagnostics["sequential_gain_raw"]
+    kappa_values = torch.full_like(robust_value, float(kappa))
+    if mode == "none":
+        # Preserve every legacy/ablation score exactly in the default mode.
+        global_allocation_score = global_diagnostics["s_CMT"]
+        local_allocation_score = local.scores
+    else:
+        global_allocation_score = robust_value
+        local_allocation_score = scatter_valid(robust_value[start:end], valid_mask)
+    diagnostics = dict(local.diagnostics)
+    diagnostics.update(
+        sequential_gain_raw=scatter_valid(
+            global_diagnostics["sequential_gain_raw"][start:end], valid_mask
+        ),
+        learning_value_raw=scatter_valid(raw_value[start:end], valid_mask),
+        correction_kappa=scatter_valid(kappa_values[start:end], valid_mask),
+        sequential_gain_robust=scatter_valid(robust_d[start:end], valid_mask),
+        learning_value_robust=scatter_valid(robust_value[start:end], valid_mask),
+        allocation_score=local_allocation_score,
+        correction_mode=mode,
+        correction_quantile=float(quantile),
+    )
+    # s_CMT is the score actually supplied to allocation. Raw aliases remain
+    # explicitly available as sequential_gain_raw/learning_value_raw.
+    diagnostics["s_CMT"] = local_allocation_score
+    global_diagnostics.update(
+        sequential_gain_raw=global_diagnostics["sequential_gain_raw"],
+        learning_value_raw=raw_value,
+        correction_kappa=kappa_values,
+        sequential_gain_robust=robust_d,
+        learning_value_robust=robust_value,
+        allocation_score=global_allocation_score,
+        s_CMT=global_allocation_score,
+    )
+    return (
+        SelectorOutput(local_allocation_score, diagnostics),
+        global_diagnostics,
+        metrics,
     )
 
 
@@ -702,6 +777,27 @@ def _append_train_metrics_csv(path: Path, metrics: dict[str, Any]) -> None:
         "effective_sample_size",
         "ppo_minibatch_trajectory_count",
         "local_ppo_minibatch_trajectory_count",
+        "rollout_id",
+        "optimizer_step",
+        "ppo_group_index",
+        "group_valid_token_count",
+        "correction_kappa",
+        "sequential_gain_raw_abs_q95",
+        "sequential_gain_raw_abs_q99",
+        "sequential_gain_robust_abs_q95",
+        "sequential_gain_robust_abs_q99",
+        "correction_saturation_rate_1kappa",
+        "correction_saturation_rate_2kappa",
+        "allocation_beta",
+        "allocation_log_c",
+        "allocation_kl_target",
+        "allocation_kl_final",
+        "allocation_mean_weight_error",
+        "fraction_at_weight_min",
+        "fraction_at_weight_max",
+        "normalized_ess",
+        "max_token_probability",
+        "allocation_solver_status",
     )
     statistics = tuple(
         f"{score}_{statistic}"
@@ -1603,6 +1699,11 @@ def _opd_train_step(
     trajectory_group_ids: list[int] | tuple[int, ...] | torch.Tensor | None = None,
     gibbs_scores: torch.Tensor | None = None,
     gibbs_epsilon: float | None = None,
+    gibbs_mode: str = "gibbs",
+    gibbs_weight_min: float = 0.5,
+    gibbs_weight_max: float = 2.0,
+    gibbs_final_epsilon: float = 0.02,
+    rollout_id: int = 0,
     ppo_minibatch_offset: int = 0,
     max_optimizer_steps: int | None = None,
     optimizer_step_start: int = 0,
@@ -1668,6 +1769,7 @@ def _opd_train_step(
     if gibbs_scores is not None and gibbs_scores.shape != objective_valid.shape:
         raise ValueError("gibbs_scores must align with the token-level objective mask")
     grouped_ids: tuple[tuple[int, ...], ...] | None = None
+    local_group_ids: tuple[int, ...] = ()
     if trajectory_group_ids is not None:
         if torch.is_tensor(trajectory_group_ids):
             local_group_ids = tuple(
@@ -1711,6 +1813,26 @@ def _opd_train_step(
     minibatch_metrics: list[dict[str, float]] = []
     allocated_position_weights = (
         torch.zeros_like(gibbs_scores, dtype=torch.float32)
+        if use_groupwise_gibbs
+        else None
+    )
+    allocated_raw_position_weights = (
+        torch.zeros_like(gibbs_scores, dtype=torch.float32)
+        if use_groupwise_gibbs
+        else None
+    )
+    allocated_group_indices = (
+        torch.full_like(gibbs_scores, -1, dtype=torch.long)
+        if use_groupwise_gibbs
+        else None
+    )
+    allocated_optimizer_steps = (
+        torch.full_like(gibbs_scores, -1, dtype=torch.long)
+        if use_groupwise_gibbs
+        else None
+    )
+    allocated_processed_mask = (
+        torch.zeros_like(gibbs_scores, dtype=torch.bool)
         if use_groupwise_gibbs
         else None
     )
@@ -1773,7 +1895,24 @@ def _opd_train_step(
         micro_active = list(active_rows.split(micro_batch))
         ppo_valid = objective_valid.index_select(0, indices) & active_rows.unsqueeze(1)
         allocation_inverse_temperature = 0.0
-        allocation_kl_achieved = 0.0
+        allocation_metrics = {
+            "allocation_kl_pre_bound": 0.0,
+            "allocation_kl_post_bound": 0.0,
+            "weight_raw_max": 0.0,
+            "weight_final_min": 0.0,
+            "weight_final_max": 0.0,
+            "fraction_at_weight_min": 0.0,
+            "fraction_at_weight_max": 0.0,
+            "normalized_ess": 0.0,
+            "max_token_probability": 0.0,
+            "allocation_beta": 0.0,
+            "allocation_log_c": 0.0,
+            "allocation_kl_target": 0.0,
+            "allocation_kl_final": 0.0,
+            "allocation_mean_weight_error": 0.0,
+            "allocation_solver_status": "not_applicable",
+            "allocation_maximum_feasible_kl": float("nan"),
+        }
         allocation_started = time.perf_counter()
         if use_groupwise_gibbs:
             # The allocation domain is exactly this optimizer update's valid
@@ -1789,17 +1928,29 @@ def _opd_train_step(
             if global_group_scores.numel() == 0:
                 raise ValueError("CMT PPO group contains no valid tokens")
             (
+                global_group_raw_weights,
                 global_group_weights,
                 allocation_inverse_temperature,
-                allocation_kl_achieved,
-            ) = kl_constrained_allocation(
+                allocation_metrics,
+            ) = cmt_allocation(
                 global_group_scores,
                 float(gibbs_epsilon),
+                mode=gibbs_mode,
+                weight_min=gibbs_weight_min,
+                weight_max=gibbs_weight_max,
+                final_epsilon=gibbs_final_epsilon,
+            )
+            ppo_raw_weights = torch.zeros_like(
+                gibbs_scores.index_select(0, indices), dtype=torch.float32
             )
             ppo_weights = torch.zeros_like(
                 gibbs_scores.index_select(0, indices), dtype=torch.float32
             )
+            ppo_raw_weights[ppo_valid] = global_group_raw_weights[group_start:group_end]
             ppo_weights[ppo_valid] = global_group_weights[group_start:group_end]
+            finite_or_raise(
+                "CMT groupwise raw Gibbs weights", ppo_raw_weights[ppo_valid]
+            )
             finite_or_raise("CMT groupwise Gibbs weights", ppo_weights[ppo_valid])
             expected_group_mass = float(global_group_scores.numel())
             actual_group_mass = float(global_group_weights.sum().item())
@@ -1815,6 +1966,17 @@ def _opd_train_step(
             real_indices = indices[active_rows]
             allocated_position_weights.index_copy_(
                 0, real_indices, ppo_weights[active_rows]
+            )
+            allocated_raw_position_weights.index_copy_(
+                0, real_indices, ppo_raw_weights[active_rows]
+            )
+            current_optimizer_step = optimizer_step_start + len(minibatch_metrics) + 1
+            allocated_group_indices.index_fill_(0, real_indices, int(ppo_index))
+            allocated_optimizer_steps.index_fill_(
+                0, real_indices, int(current_optimizer_step)
+            )
+            allocated_processed_mask.index_copy_(
+                0, real_indices, ppo_valid[active_rows]
             )
             gibbs_allocation_count += 1
         else:
@@ -2003,6 +2165,22 @@ def _opd_train_step(
         global_ratio_max = (
             distributed.max_float(local_ratio_max) if global_candidate_count else 1.0
         )
+        global_optimizer_step = optimizer_step_start + len(minibatch_metrics) + 1
+        response_index_composition: dict[str, int] = {}
+        if grouped_ids is not None:
+            local_composition: dict[int, int] = {}
+            for row_index in real_indices.detach().cpu().tolist():
+                response_index = int(local_group_ids[row_index])
+                local_composition[response_index] = (
+                    local_composition.get(response_index, 0) + 1
+                )
+            for rank_composition in distributed.all_gather_objects(local_composition):
+                for response_index, count in rank_composition.items():
+                    key = str(int(response_index))
+                    response_index_composition[key] = response_index_composition.get(
+                        key, 0
+                    ) + int(count)
+        allocation_id = f"rollout-{int(rollout_id):06d}:ppo-{int(ppo_index):04d}"
         metric = {
             "loss": global_loss,
             "weighted_final_loss": global_loss,
@@ -2024,11 +2202,44 @@ def _opd_train_step(
             "allocation_kl_epsilon": (
                 float(gibbs_epsilon) if use_groupwise_gibbs else 0.0
             ),
-            "allocation_kl_achieved": float(allocation_kl_achieved),
+            # Backward-compatible alias. In direct mode this is the KL of the
+            # final bounded weights, not the unbounded diagnostic reference.
+            "allocation_kl_achieved": float(
+                allocation_metrics["allocation_kl_final"]
+            ),
             "allocation_inverse_temperature": float(allocation_inverse_temperature),
+            "rollout_id": int(rollout_id),
+            "optimizer_step": int(global_optimizer_step),
+            "ppo_group_index": int(ppo_index),
+            "group_valid_token_count": int(global_group_scores.numel())
+            if use_groupwise_gibbs
+            else 0,
+            "response_index_composition": response_index_composition,
+            "allocation_id": allocation_id,
+            **allocation_metrics,
+        }
+        metric["allocation_group"] = {
+            key: metric[key]
+            for key in (
+                "allocation_id",
+                "rollout_id",
+                "optimizer_step",
+                "ppo_group_index",
+                "group_valid_token_count",
+                "response_index_composition",
+                "allocation_beta",
+                "allocation_log_c",
+                "allocation_kl_target",
+                "allocation_kl_final",
+                "allocation_mean_weight_error",
+                "fraction_at_weight_min",
+                "fraction_at_weight_max",
+                "normalized_ess",
+                "max_token_probability",
+                "allocation_solver_status",
+            )
         }
         minibatch_metrics.append(metric)
-        global_optimizer_step = optimizer_step_start + len(minibatch_metrics)
         if on_optimizer_step is not None:
             on_optimizer_step(global_optimizer_step, metric)
     if use_groupwise_gibbs and gibbs_allocation_count != len(minibatch_metrics):
@@ -2037,7 +2248,9 @@ def _opd_train_step(
     if grouped_ids is not None and processed_all_groups:
         expected_rows = set(range(local_real_count))
         if grouped_rows_seen != expected_rows:
-            raise AssertionError("Grouped PPO partition did not consume each local row once")
+            raise AssertionError(
+                "Grouped PPO partition did not consume each local row once"
+            )
     total_weight = sum(item["global_weight_mass"] for item in minibatch_metrics)
     if total_weight > 0:
         aggregate_loss = (
@@ -2062,6 +2275,10 @@ def _opd_train_step(
         gibbs_allocations=gibbs_allocation_count,
         gibbs_allocation_time=gibbs_allocation_seconds,
         allocated_position_weights=allocated_position_weights,
+        allocated_raw_position_weights=allocated_raw_position_weights,
+        allocated_group_indices=allocated_group_indices,
+        allocated_optimizer_steps=allocated_optimizer_steps,
+        allocated_processed_mask=allocated_processed_mask,
         minibatches=minibatch_metrics,
     )
     return result
@@ -3128,6 +3345,20 @@ def run_training(
             f"{method.upper()} requires selector.top_k={OPD_LOSS_TOP_K} so the "
             "policy-loss support is exactly Student Top-16"
         )
+    cmt_allocation_mode, cmt_weight_min, cmt_weight_max = validate_cmt_allocation(
+        config["selector"].get("cmt_allocation_mode", "gibbs"),
+        config["selector"].get("cmt_weight_min", 0.5),
+        config["selector"].get("cmt_weight_max", 2.0),
+    )
+    cmt_correction_mode, cmt_correction_quantile = validate_cmt_correction(
+        config["selector"].get("cmt_correction_mode", "none"),
+        config["selector"].get("cmt_correction_quantile", 0.99),
+    )
+    cmt_final_allocation_kl = float(
+        config["selector"].get("cmt_final_allocation_kl", 0.02)
+    )
+    if not math.isfinite(cmt_final_allocation_kl) or cmt_final_allocation_kl < 0.0:
+        raise ValueError("selector.cmt_final_allocation_kl must be finite and >= 0")
     seed = int(experiment.get("seed", 1234))
     seed_everything(seed)
     resume_checkpoint = resolve_resume_checkpoint(
@@ -3344,6 +3575,43 @@ def run_training(
                 distributed_cfg.get("fsdp", {}).get("teacher_cpu_offload", False)
             ),
         }
+        if method == "cmt":
+            metadata["cmt_allocation"] = {
+                "mode": cmt_allocation_mode,
+                "kl_budget": float(config["selector"].get("cmt_allocation_kl", 0.5)),
+                "weight_min": cmt_weight_min,
+                "weight_max": cmt_weight_max,
+                "final_kl_budget": cmt_final_allocation_kl,
+                "normalization_scope": "global_valid_tokens_within_each_ppo_group",
+            }
+            metadata["cmt_correction"] = {
+                "mode": cmt_correction_mode,
+                "quantile": cmt_correction_quantile,
+                "normalization_scope": "global_valid_tokens_within_full_rollout",
+                "raw_aliases": {
+                    "sequential_gain": "sequential_gain_raw",
+                    "learning_value": "legacy/raw score before correction",
+                    "s_CMT": "actual allocation score",
+                },
+            }
+            metadata["cmt_token_audit"] = {
+                "enabled": bool(
+                    config.get("logging", {}).get("cmt_token_audit_enabled", False)
+                ),
+                "interval": int(
+                    config.get("logging", {}).get("cmt_token_audit_interval", 150)
+                ),
+                "top_k": int(
+                    config.get("logging", {}).get("cmt_token_audit_top_k", 50)
+                ),
+                "context_radius": int(
+                    config.get("logging", {}).get("cmt_token_context_radius", 32)
+                ),
+                "gain_heatmap_enabled": bool(
+                    config.get("logging", {}).get("cmt_gain_heatmap_enabled", False)
+                ),
+                "selection_scope": "global_valid_tokens_across_all_ranks",
+            }
         metadata["opd_upstream"] = {
             "repository": "https://github.com/thunlp/OPD",
             "commit": UPSTREAM_OPD_COMMIT,
@@ -3456,6 +3724,19 @@ def run_training(
         ),
         enabled=distributed.is_main
         and bool(config.get("logging", {}).get("token_score_stats_enabled", True)),
+    )
+    logging_cfg = dict(config.get("logging", {}))
+    cmt_audit_logger = CMTTokenAuditLogger(
+        output_dir,
+        tokenizer,
+        enabled=method == "cmt"
+        and bool(logging_cfg.get("cmt_token_audit_enabled", False)),
+        interval=int(logging_cfg.get("cmt_token_audit_interval", 150)),
+        top_k=int(logging_cfg.get("cmt_token_audit_top_k", 50)),
+        context_radius=int(logging_cfg.get("cmt_token_context_radius", 32)),
+        heatmap_enabled=bool(logging_cfg.get("cmt_gain_heatmap_enabled", False)),
+        rank=distributed.rank,
+        world_size=distributed.world_size,
     )
     tensorboard_logger = TensorBoardLogger(
         output_dir,
@@ -3859,6 +4140,7 @@ def run_training(
         global_ta_diagnostics: dict[str, torch.Tensor] = {}
         global_pgt_diagnostics: dict[str, torch.Tensor] = {}
         global_cmt_diagnostics: dict[str, torch.Tensor] = {}
+        cmt_correction_metrics: dict[str, float] = {}
         student_cross_score_time = 0.0
         if method == "iw":
             if distributed.is_main:
@@ -3948,6 +4230,19 @@ def run_training(
                 distributed,
             )
             primary, global_cmt_diagnostics, primary_start, primary_end = cmt_globalized
+            (
+                primary,
+                global_cmt_diagnostics,
+                cmt_correction_metrics,
+            ) = _apply_global_cmt_correction(
+                primary,
+                global_cmt_diagnostics,
+                valid,
+                primary_start,
+                primary_end,
+                mode=cmt_correction_mode,
+                quantile=cmt_correction_quantile,
+            )
             ta_time = pgt_score_time
             bellman_scan_time = cmt_score_time
             selector_time = pgt_score_time + cmt_score_time + cmt_gather_time
@@ -4194,6 +4489,11 @@ def run_training(
                 if method == "cmt"
                 else None
             ),
+            gibbs_mode=cmt_allocation_mode,
+            gibbs_weight_min=cmt_weight_min,
+            gibbs_weight_max=cmt_weight_max,
+            gibbs_final_epsilon=cmt_final_allocation_kl,
+            rollout_id=rollout_index,
             ppo_minibatch_offset=ppo_minibatch_offset,
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
@@ -4201,35 +4501,198 @@ def run_training(
         )
         if method == "cmt":
             local_cmt_weights = train_metrics.pop("allocated_position_weights")
+            local_cmt_raw_weights = train_metrics.pop("allocated_raw_position_weights")
+            local_cmt_group_indices = train_metrics.pop("allocated_group_indices")
+            local_cmt_optimizer_steps = train_metrics.pop("allocated_optimizer_steps")
+            local_cmt_processed = train_metrics.pop("allocated_processed_mask")
             if local_cmt_weights is None:
                 raise AssertionError(
                     "CMT training did not return groupwise Gibbs weights"
                 )
+            if local_cmt_raw_weights is None:
+                raise AssertionError("CMT training did not return raw Gibbs weights")
+            if any(
+                value is None
+                for value in (
+                    local_cmt_group_indices,
+                    local_cmt_optimizer_steps,
+                    local_cmt_processed,
+                )
+            ):
+                raise AssertionError(
+                    "CMT training did not return allocation scope metadata"
+                )
             global_cmt_weights, weight_start, weight_end, _weight_lengths = (
                 distributed.all_gather_variable_1d(local_cmt_weights[valid])
+            )
+            global_cmt_raw_weights, raw_start, raw_end, _raw_lengths = (
+                distributed.all_gather_variable_1d(local_cmt_raw_weights[valid])
+            )
+            global_cmt_group_indices, group_start, group_end, _group_lengths = (
+                distributed.all_gather_variable_1d(local_cmt_group_indices[valid])
+            )
+            global_cmt_optimizer_steps, step_start, step_end, _step_lengths = (
+                distributed.all_gather_variable_1d(local_cmt_optimizer_steps[valid])
+            )
+            global_cmt_processed, processed_start, processed_end, _processed_lengths = (
+                distributed.all_gather_variable_1d(local_cmt_processed[valid])
             )
             if (weight_start, weight_end) != (primary_start, primary_end):
                 raise AssertionError(
                     "CMT score/weight distributed token layouts differ"
                 )
+            if (raw_start, raw_end) != (primary_start, primary_end):
+                raise AssertionError("CMT raw-weight distributed token layouts differ")
+            for metadata_layout in (
+                (group_start, group_end),
+                (step_start, step_end),
+                (processed_start, processed_end),
+            ):
+                if metadata_layout != (primary_start, primary_end):
+                    raise AssertionError("CMT allocation metadata token layouts differ")
+            global_cmt_processed = global_cmt_processed.bool()
+            global_primary_diagnostics["w_raw"] = global_cmt_raw_weights
             global_primary_diagnostics["w"] = global_cmt_weights
+            global_primary_diagnostics["allocation_group_index"] = (
+                global_cmt_group_indices
+            )
+            global_primary_diagnostics["allocation_optimizer_step"] = (
+                global_cmt_optimizer_steps
+            )
+            global_primary_diagnostics["allocation_processed"] = global_cmt_processed
+            global_cmt_diagnostics["w_raw"] = global_cmt_raw_weights
             global_cmt_diagnostics["w"] = global_cmt_weights
+            global_cmt_diagnostics["allocation_group_index"] = global_cmt_group_indices
+            global_cmt_diagnostics["allocation_optimizer_step"] = (
+                global_cmt_optimizer_steps
+            )
+            global_cmt_diagnostics["allocation_processed"] = global_cmt_processed
+            processed_raw = global_cmt_raw_weights[global_cmt_processed]
+            processed_final = global_cmt_weights[global_cmt_processed]
+            if processed_final.numel() == 0:
+                raise AssertionError("CMT completed no token allocation")
+            cmt_allocation_metrics = cmt_weight_metrics(
+                processed_raw,
+                processed_final,
+                weight_min=cmt_weight_min,
+                weight_max=cmt_weight_max,
+            )
+            if cmt_allocation_mode == "gibbs":
+                cmt_allocation_metrics["fraction_at_weight_min"] = 0.0
+                cmt_allocation_metrics["fraction_at_weight_max"] = 0.0
             cmt_diagnostics = dict(primary.diagnostics)
             cmt_diagnostics.update(
+                w_raw=local_cmt_raw_weights,
                 w=local_cmt_weights,
+                allocation_group_index=local_cmt_group_indices,
+                allocation_optimizer_step=local_cmt_optimizer_steps,
+                allocation_processed=local_cmt_processed,
+                allocation_mode=cmt_allocation_mode,
                 allocation_kl_epsilon=float(selector_cfg.get("cmt_allocation_kl", 0.5)),
                 allocation_count=int(train_metrics["gibbs_allocations"]),
             )
             primary = SelectorOutput(local_cmt_weights, cmt_diagnostics)
             token_allocation = local_cmt_weights
             score_key = "w"
+            global_selected = global_cmt_processed
             selector_time += float(train_metrics["gibbs_allocation_time"])
             if distributed.is_main:
+                processed_stats = {
+                    key: (
+                        value[global_cmt_processed]
+                        if torch.is_tensor(value)
+                        and value.shape == global_cmt_processed.shape
+                        else value
+                    )
+                    for key, value in global_primary_diagnostics.items()
+                }
                 token_score_stats_path = score_stats_logger.write(
                     rollout_last_optimizer_step,
                     max_steps,
-                    global_primary_diagnostics,
+                    processed_stats,
                 )
+            audit_paths: list[str] = []
+            motivation_summary_paths: list[str] = []
+            allocation_metrics_by_step = {
+                int(item["optimizer_step"]): item
+                for item in train_metrics["minibatches"]
+            }
+            for audit_step in cmt_audit_logger.audit_steps(
+                rollout_first_optimizer_step,
+                rollout_last_optimizer_step,
+                max_steps,
+            ):
+                audit_mask = (
+                    global_cmt_processed
+                    & global_cmt_optimizer_steps.eq(int(audit_step))
+                    & global_cmt_group_indices.ge(0)
+                )
+                sparse_examples: list[dict[str, Any]] = []
+                group_summaries: list[dict[str, Any]] = []
+                for group_index_tensor in torch.unique(
+                    global_cmt_group_indices[audit_mask]
+                ):
+                    group_index = int(group_index_tensor.item())
+                    group_mask = audit_mask & global_cmt_group_indices.eq(group_index)
+                    group_diagnostics = {
+                        key: value[group_mask]
+                        for key, value in global_primary_diagnostics.items()
+                        if torch.is_tensor(value)
+                        and value.shape == global_cmt_processed.shape
+                    }
+                    motivation, group_sparse = cmt_motivation_summary(
+                        group_diagnostics,
+                        global_cmt_weights[group_mask],
+                        torch.arange(
+                            global_cmt_processed.numel(),
+                            device=global_cmt_processed.device,
+                        )[group_mask],
+                    )
+                    solver_event = allocation_metrics_by_step[int(audit_step)]
+                    group_summary = {
+                        "allocation_id": solver_event["allocation_id"],
+                        "rollout_id": int(solver_event["rollout_id"]),
+                        "optimizer_step": int(solver_event["optimizer_step"]),
+                        "ppo_group_index": int(solver_event["ppo_group_index"]),
+                        "group_valid_token_count": int(
+                            solver_event["group_valid_token_count"]
+                        ),
+                        "response_index_composition": solver_event[
+                            "response_index_composition"
+                        ],
+                        **motivation,
+                    }
+                    group_summaries.append(group_summary)
+                    sparse_examples.extend(group_sparse)
+                summary_path = cmt_audit_logger.write_motivation_summary(
+                    step=audit_step,
+                    rollout_id=rollout_index,
+                    correction=cmt_correction_metrics,
+                    allocation_groups=group_summaries,
+                )
+                if summary_path is not None:
+                    motivation_summary_paths.append(str(summary_path))
+                audit_path = cmt_audit_logger.write(
+                    step=audit_step,
+                    rollout_id=rollout_index,
+                    sample_ids=sample_ids,
+                    dataset_indices=indices,
+                    response_indices=response_indices,
+                    response_ids=rollout.response_ids,
+                    valid_mask=valid,
+                    local_diagnostics=primary.diagnostics,
+                    global_diagnostics=global_primary_diagnostics,
+                    global_start=primary_start,
+                    batch_index_offset=local_start * num_responses,
+                    max_response_length=int(config["rollout"]["max_new_tokens"]),
+                    extra_selections=sparse_examples,
+                )
+                if audit_path is not None:
+                    audit_paths.append(str(audit_path))
+        else:
+            cmt_allocation_metrics = {}
+            audit_paths = []
+            motivation_summary_paths = []
         optimizer_steps_completed = int(train_metrics["optimizer_steps"])
         optimizer_step += optimizer_steps_completed
         step = optimizer_step
@@ -4342,6 +4805,16 @@ def run_training(
             "optimizer_steps_in_rollout": optimizer_steps_completed,
             "trajectories_per_gibbs": (
                 ppo_mini_batch_size if method == "cmt" else None
+            ),
+            "cmt_allocation_mode": cmt_allocation_mode if method == "cmt" else None,
+            "cmt_weight_min": cmt_weight_min if method == "cmt" else None,
+            "cmt_weight_max": cmt_weight_max if method == "cmt" else None,
+            "cmt_correction_mode": cmt_correction_mode if method == "cmt" else None,
+            "cmt_correction_quantile": (
+                cmt_correction_quantile if method == "cmt" else None
+            ),
+            "cmt_final_allocation_kl": (
+                cmt_final_allocation_kl if method == "cmt" else None
             ),
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
@@ -4503,8 +4976,12 @@ def run_training(
             "selector": selector_summary(
                 method,
                 global_primary_diagnostics,
-                torch.ones_like(
-                    global_primary_diagnostics[score_key], dtype=torch.bool
+                (
+                    global_selected
+                    if method == "cmt"
+                    else torch.ones_like(
+                        global_primary_diagnostics[score_key], dtype=torch.bool
+                    )
                 ),
                 global_selected,
             ),
@@ -4514,6 +4991,18 @@ def run_training(
             ),
             "checkpoint": str(checkpoint) if checkpoint else None,
             "rollout_token_sha256": rollout_hash,
+            "cmt_token_audit_paths": audit_paths,
+            "cmt_motivation_summary_paths": motivation_summary_paths,
+            "allocation_groups": (
+                [item["allocation_group"] for item in train_metrics["minibatches"]]
+                if method == "cmt"
+                else []
+            ),
+            "rollout_correction": (
+                dict(cmt_correction_metrics) if method == "cmt" else None
+            ),
+            **cmt_correction_metrics,
+            **cmt_allocation_metrics,
         }
         # The rollout server is already sleeping; release tensors before a
         # possible periodic-evaluation subprocess reserves its KV cache.
@@ -4637,6 +5126,40 @@ def run_training(
                     ),
                 }
             )
+            if method == "cmt":
+                for scope_key in (
+                    "allocation_id",
+                    "rollout_id",
+                    "optimizer_step",
+                    "ppo_group_index",
+                    "group_valid_token_count",
+                    "response_index_composition",
+                ):
+                    event[scope_key] = copy.deepcopy(minibatch_metric[scope_key])
+                for allocation_key in (
+                    "allocation_kl_pre_bound",
+                    "allocation_kl_post_bound",
+                    "weight_raw_max",
+                    "weight_final_min",
+                    "weight_final_max",
+                    "fraction_at_weight_min",
+                    "fraction_at_weight_max",
+                    "normalized_ess",
+                    "max_token_probability",
+                    "allocation_beta",
+                    "allocation_log_c",
+                    "allocation_kl_target",
+                    "allocation_kl_final",
+                    "allocation_mean_weight_error",
+                    "allocation_maximum_feasible_kl",
+                ):
+                    event[allocation_key] = float(minibatch_metric[allocation_key])
+                event["allocation_solver_status"] = minibatch_metric[
+                    "allocation_solver_status"
+                ]
+                event["allocation_group"] = copy.deepcopy(
+                    minibatch_metric["allocation_group"]
+                )
             if event_step in periodic_evaluations:
                 periodic = periodic_evaluations[event_step]
                 event["periodic_evaluation"] = {

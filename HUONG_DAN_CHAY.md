@@ -5,7 +5,7 @@ TA-OPD, CMT-OPD, GRPO và IW-OPD (các script Bellman-RAC/PGT legacy vẫn đư�
 Mọi lệnh đều chạy từ thư mục:
 
 ```bash
-cd /mnt/hdd/nhatminh/OPD/BellmanOPD
+cd /mnt/hdd/nhatminh/OPD/BellmanOPD_analysis
 ```
 
 `RUN_B200.md` chứa phần giải thích hạ tầng và tuning chi tiết hơn; file này tập trung vào các
@@ -16,7 +16,7 @@ lệnh thường dùng có thể copy-paste.
 Nếu cluster đã có PyTorch/vLLM environment chuẩn cho B200, dùng environment đó. Nếu chưa:
 
 ```bash
-cd /mnt/hdd/nhatminh/OPD/BellmanOPD
+cd /mnt/hdd/nhatminh/OPD/BellmanOPD_analysis
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
@@ -790,7 +790,7 @@ step 1, mỗi 50 step và step cuối). Không cần load checkpoint hay chạy 
 các biểu đồ này. Chạy:
 
 ```bash
-cd /mnt/hdd/nhatminh/OPD/BellmanOPD
+cd /mnt/hdd/nhatminh/OPD/BellmanOPD_analysis
 CMT_RUN_NAME="cmt_..." bash scripts/plot_cmt_scores.sh
 ```
 
@@ -970,3 +970,206 @@ temperature, dataset, optimizer hoặc evaluation protocol. CMT training nên gi
   `metrics.jsonl` trong output tương ứng.
 - **CMT cảnh báo top-p**: đây là cảnh báo đúng; `top_p<1` vẫn bounded nhưng estimator không còn
   unbiased cho raw truncated kernel. Không thêm importance correction thủ công.
+
+## 11. CMT bounded Gibbs và token audit (`BellmanOPD_analysis`)
+
+Các chức năng trong mục này chỉ có trong folder `BellmanOPD_analysis`. Chạy từ đúng repo:
+
+```bash
+cd /workspace/storage-shared/nlp/minhpn19/BellmanOPD_analysis
+source ../TA-OPD-B200/.venv/bin/activate   # hoặc environment B200 đang dùng
+```
+
+### 11.1. Chạy CMT cũ, không đổi behavior
+
+Mode mặc định vẫn là `gibbs`; audit và heatmap mặc định tắt. Lệnh sau giữ nguyên allocator cũ:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_gibbs_compmath_seed42" \
+CMT_ALLOCATION_MODE=gibbs \
+TRAIN_DATASET=competition_math \
+  bash scripts/train_cmt_b200.sh
+```
+
+Thiết lập mặc định của launcher CMT hiện là: LR `5e-6`, generation `4096`, vLLM utilization
+`0.60`, max model length `5200`, global prompt batch `64`, `4` responses/prompt, global PPO
+batch `64`, microbatch/GPU `16`, save/eval mỗi `150` optimizer steps và `3` epoch cho
+Competition-MATH (`2` epoch cho DAPO).
+
+### 11.2. Chạy pipeline mới: tanh correction + direct bounded Gibbs
+
+Đây là mode mới theo đúng thiết kế: `kappa` được tính một lần trên toàn bộ valid token của
+rollout (sau global gather), còn mỗi PPO group có một nghiệm bounded Gibbs độc lập:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_tanhq99_direct_w0p5_2p0_kl0p02_compmath_seed42" \
+TRAIN_DATASET=competition_math \
+CMT_CORRECTION_MODE=tanh_q99 \
+CMT_CORRECTION_QUANTILE=0.99 \
+CMT_ALLOCATION_MODE=direct_bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 \
+CMT_WEIGHT_MAX=2.0 \
+CMT_FINAL_ALLOCATION_KL=0.02 \
+  bash scripts/train_cmt_b200.sh
+```
+
+Với cấu hình mặc định, một rollout sinh `64 prompts x 4 responses = 256 trajectories`, rồi
+chia theo response index thành `4` PPO groups, mỗi group `64` trajectory. Mỗi group thực hiện
+đúng một direct bounded Gibbs và một optimizer step. Microbatch `16/GPU` chỉ chia forward /
+backward vì bộ nhớ, không tạo thêm allocation hay optimizer step.
+
+Chạy cùng mode trên DAPO (launcher tự chuyển sang 2 epoch):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_tanhq99_direct_w0p5_2p0_kl0p02_dapo_seed42" \
+TRAIN_DATASET=dapo \
+CMT_CORRECTION_MODE=tanh_q99 \
+CMT_CORRECTION_QUANTILE=0.99 \
+CMT_ALLOCATION_MODE=direct_bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 CMT_WEIGHT_MAX=2.0 \
+CMT_FINAL_ALLOCATION_KL=0.02 \
+  bash scripts/train_cmt_b200.sh
+```
+
+`CMT_ALLOCATION_KL=0.5` chỉ thuộc hai mode legacy. Trong
+`direct_bounded_gibbs`, budget thật của final weight là `CMT_FINAL_ALLOCATION_KL=0.02`;
+`w_raw` chỉ là nghiệm unbounded tham chiếu tại cùng budget `0.02` và không đi vào loss.
+
+### 11.3. Chạy legacy post-hoc bounded Gibbs `[0.5, 2.0]`
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_bounded_w0p5_2p0_compmath_seed42" \
+CMT_ALLOCATION_MODE=bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 \
+CMT_WEIGHT_MAX=2.0 \
+TRAIN_DATASET=competition_math \
+  bash scripts/train_cmt_b200.sh
+```
+
+Allocator vẫn giải Gibbs gốc trên **global valid tokens của từng PPO group**, sau đó mới giải
+`clip(c * w_raw, w_min, w_max)` bằng bisection để mean cuối bằng 1. Không rank nào tự normalize
+shard của mình. Có thể so sánh công bằng bằng cách chỉ đổi ba biến trên và giữ nguyên seed/config.
+
+Chạy DAPO (launcher tự chọn `2` epoch):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_bounded_w0p5_2p0_dapo_seed42" \
+TRAIN_DATASET=dapo \
+CMT_ALLOCATION_MODE=bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 CMT_WEIGHT_MAX=2.0 \
+  bash scripts/train_cmt_b200.sh
+```
+
+### 11.4. Bật motivation summary và sparse token audit cho mode mới
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_tanhq99_direct_audit_compmath_seed42" \
+CMT_CORRECTION_MODE=tanh_q99 \
+CMT_CORRECTION_QUANTILE=0.99 \
+CMT_ALLOCATION_MODE=direct_bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 CMT_WEIGHT_MAX=2.0 \
+CMT_FINAL_ALLOCATION_KL=0.02 \
+CMT_TOKEN_AUDIT_ENABLED=true \
+CMT_TOKEN_AUDIT_INTERVAL=150 \
+CMT_TOKEN_AUDIT_TOP_K=50 \
+CMT_TOKEN_CONTEXT_RADIUS=32 \
+CMT_GAIN_HEATMAP_ENABLED=false \
+  bash scripts/train_cmt_b200.sh
+```
+
+Top-K được xếp hạng **riêng trong đúng allocation group của optimizer step đang audit**. Khi
+nhiều token cùng chạm upper bound, `learning_value_robust` được dùng để tie-break thay vì thứ
+tự tensor. Mỗi rank chỉ ghi shard token thuộc rank đó vào:
+
+```text
+outputs/<RUN_NAME>/cmt_opd/cmt_token_audit/important_tokens/
+  step-000150_rank-00000.jsonl.gz
+  step-000150_rank-00001.jsonl.gz
+  ...
+```
+
+`selection_reasons` cho biết token thuộc nhóm nào; một token thuộc nhiều nhóm vẫn chỉ có một row.
+Các histogram/quantile/sample toàn cục của `w_raw` và `w` nằm trong
+`token_score_stats/step-XXXXXX.json`.
+
+Summary rẻ để kiểm tra same-g/different-future và low-g rescue nằm tại:
+
+```text
+outputs/<RUN_NAME>/cmt_opd/cmt_token_audit/motivation_summaries/
+  step-000150.json
+  step-000300.json
+  ...
+```
+
+Mỗi file giữ rollout-level correction statistics và các summary tách theo allocation group;
+không ghi toàn bộ token. Sparse audit bổ sung tối đa 8 cặp future contrast và 8 rescue token.
+
+### 11.5. Bật thêm gain heatmap
+
+Heatmap cần Matplotlib trong environment. Chỉ khi option này bật thì training mới import nó:
+
+```bash
+python -m pip install matplotlib   # chỉ cần nếu environment chưa có
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_tanhq99_direct_audit_heatmap_compmath_seed42" \
+CMT_CORRECTION_MODE=tanh_q99 \
+CMT_ALLOCATION_MODE=direct_bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 CMT_WEIGHT_MAX=2.0 \
+CMT_FINAL_ALLOCATION_KL=0.02 \
+CMT_TOKEN_AUDIT_ENABLED=true \
+CMT_TOKEN_AUDIT_INTERVAL=150 \
+CMT_TOKEN_AUDIT_TOP_K=50 \
+CMT_TOKEN_CONTEXT_RADIUS=32 \
+CMT_GAIN_HEATMAP_ENABLED=true \
+  bash scripts/train_cmt_b200.sh
+```
+
+Ảnh và metadata được lưu tại:
+
+```text
+outputs/<RUN_NAME>/cmt_opd/cmt_token_audit/heatmaps/
+  step-000150_rank-00000_gain_heatmap.png
+  step-000150_rank-00000_gain_heatmap.json
+```
+
+### 11.6. Resume đúng correction/allocation config
+
+Resume compatibility sẽ từ chối nếu đổi correction mode/quantile, allocation mode, bounds hoặc
+final KL. Vì vậy phải truyền lại đúng toàn bộ config của run ban đầu:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+RUN_NAME="cmt_tanhq99_direct_audit_compmath_seed42" \
+RESUME_FROM_CHECKPOINT="outputs/cmt_tanhq99_direct_audit_compmath_seed42/cmt_opd/checkpoint-000450" \
+CMT_CORRECTION_MODE=tanh_q99 \
+CMT_CORRECTION_QUANTILE=0.99 \
+CMT_ALLOCATION_MODE=direct_bounded_gibbs \
+CMT_WEIGHT_MIN=0.5 CMT_WEIGHT_MAX=2.0 \
+CMT_FINAL_ALLOCATION_KL=0.02 \
+CMT_TOKEN_AUDIT_ENABLED=true \
+CMT_GAIN_HEATMAP_ENABLED=false \
+  bash scripts/train_cmt_b200.sh
+```
+
+Checkpoint legacy thiếu các field mới được hiểu bằng defaults `none`, `gibbs`, `[0.5,2.0]`,
+final KL `0.02`, đúng behavior cũ. Khi rewind, token audit, heatmap và motivation summary sau
+checkpoint cũng được dọn cùng metrics cũ.
+
+### 11.7. Theo dõi TensorBoard
+
+```bash
+tensorboard --logdir "outputs/cmt_tanhq99_direct_audit_compmath_seed42/cmt_opd/tensorboard" \
+  --host 0.0.0.0 --port 6006
+```
+
+Nhóm `cmt/rollout/*` chứa correction kappa/quantiles/saturation. Nhóm
+`cmt/allocation_group/*` chứa beta, log-c, target/final KL, mean-one error, tỷ lệ chạm bounds,
+normalized ESS và max-token probability của đúng optimizer group. Loss luôn dùng final `w`;
+`w_raw` chỉ phục vụ diagnostics trong direct mode.

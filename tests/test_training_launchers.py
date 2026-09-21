@@ -119,6 +119,43 @@ class TrainingLauncherTests(unittest.TestCase):
         )
         self.assertIn("micro-batch only changes gradient accumulation", content)
 
+    def test_cmt_launcher_exposes_bounded_allocation_and_audit_controls(self):
+        content = (REPO_ROOT / "scripts" / "train_cmt_b200.sh").read_text(
+            encoding="utf-8"
+        )
+        for variable in (
+            "CMT_ALLOCATION_MODE",
+            "CMT_WEIGHT_MIN",
+            "CMT_WEIGHT_MAX",
+            "CMT_CORRECTION_MODE",
+            "CMT_CORRECTION_QUANTILE",
+            "CMT_FINAL_ALLOCATION_KL",
+            "CMT_TOKEN_AUDIT_ENABLED",
+            "CMT_TOKEN_AUDIT_INTERVAL",
+            "CMT_TOKEN_AUDIT_TOP_K",
+            "CMT_TOKEN_CONTEXT_RADIUS",
+            "CMT_GAIN_HEATMAP_ENABLED",
+        ):
+            self.assertIn(f"export {variable}=", content)
+        config = load_config(REPO_ROOT / "configs" / "qwen3_b200_cmt.yaml")
+        self.assertEqual(config["selector"]["cmt_allocation_mode"], "gibbs")
+        self.assertEqual(config["selector"]["cmt_weight_min"], 0.5)
+        self.assertEqual(config["selector"]["cmt_weight_max"], 2.0)
+        self.assertEqual(config["selector"]["cmt_correction_mode"], "none")
+        self.assertEqual(config["selector"]["cmt_correction_quantile"], 0.99)
+        self.assertEqual(config["selector"]["cmt_final_allocation_kl"], 0.02)
+        self.assertFalse(config["logging"]["cmt_token_audit_enabled"])
+        common = (REPO_ROOT / "scripts" / "common_b200.sh").read_text(encoding="utf-8")
+        for config_key in (
+            "cmt_correction_mode",
+            "cmt_correction_quantile",
+            "cmt_allocation_mode",
+            "cmt_weight_min",
+            "cmt_weight_max",
+            "cmt_final_allocation_kl",
+        ):
+            self.assertIn(f"selector.{config_key}=", common)
+
     def test_iw_launcher_has_shared_dataset_presets_and_requested_defaults(self):
         content = (REPO_ROOT / "scripts" / "train_iw_b200.sh").read_text(
             encoding="utf-8"

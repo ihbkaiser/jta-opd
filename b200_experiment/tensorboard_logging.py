@@ -91,9 +91,50 @@ CMT_TAGS = {
     "cmt/sequential_gain_mean": ("sequential_gain", "mean"),
     "cmt/learning_value_mean": ("learning_value", "mean"),
     "cmt/learning_value_std": ("learning_value", "std"),
+    "cmt/sequential_gain_raw_mean": ("sequential_gain_raw", "mean"),
+    "cmt/sequential_gain_robust_mean": ("sequential_gain_robust", "mean"),
+    "cmt/learning_value_raw_mean": ("learning_value_raw", "mean"),
+    "cmt/learning_value_robust_mean": ("learning_value_robust", "mean"),
     "cmt/weight_mean": ("w", "mean"),
     "cmt/weight_std": ("w", "std"),
     "cmt/weight_max": ("w", "max"),
+}
+
+CMT_ALLOCATION_TAGS = {
+    "cmt/weight_raw_max": "weight_raw_max",
+    "cmt/weight_final_min": "weight_final_min",
+    "cmt/weight_final_max": "weight_final_max",
+    "cmt/fraction_at_weight_min": "fraction_at_weight_min",
+    "cmt/fraction_at_weight_max": "fraction_at_weight_max",
+    "cmt/allocation_kl_pre_bound": "allocation_kl_pre_bound",
+    "cmt/allocation_kl_post_bound": "allocation_kl_post_bound",
+    "cmt/normalized_ess": "normalized_ess",
+    "cmt/max_token_probability": "max_token_probability",
+    "cmt/allocation_group/allocation_beta": "allocation_beta",
+    "cmt/allocation_group/allocation_log_c": "allocation_log_c",
+    "cmt/allocation_group/allocation_kl_target": "allocation_kl_target",
+    "cmt/allocation_group/allocation_kl_final": "allocation_kl_final",
+    "cmt/allocation_group/allocation_mean_weight_error": (
+        "allocation_mean_weight_error"
+    ),
+    "cmt/allocation_group/fraction_at_weight_min": "fraction_at_weight_min",
+    "cmt/allocation_group/fraction_at_weight_max": "fraction_at_weight_max",
+    "cmt/allocation_group/normalized_ess": "normalized_ess",
+    "cmt/allocation_group/max_token_probability": "max_token_probability",
+}
+
+CMT_CORRECTION_TAGS = {
+    "cmt/rollout/correction_kappa": "correction_kappa",
+    "cmt/rollout/sequential_gain_raw_abs_q95": "sequential_gain_raw_abs_q95",
+    "cmt/rollout/sequential_gain_raw_abs_q99": "sequential_gain_raw_abs_q99",
+    "cmt/rollout/sequential_gain_robust_abs_q95": ("sequential_gain_robust_abs_q95"),
+    "cmt/rollout/sequential_gain_robust_abs_q99": ("sequential_gain_robust_abs_q99"),
+    "cmt/rollout/correction_saturation_rate_1kappa": (
+        "correction_saturation_rate_1kappa"
+    ),
+    "cmt/rollout/correction_saturation_rate_2kappa": (
+        "correction_saturation_rate_2kappa"
+    ),
 }
 
 GRPO_TAGS = {
@@ -135,10 +176,7 @@ def production_tensorboard_metrics(
     if method == "ta":
         selected["ta/selected_token_fraction"] = float(selector["selected_fraction"])
         selected.update(
-            {
-                tag: _selector_value(selector, path)
-                for tag, path in TA_TAGS.items()
-            }
+            {tag: _selector_value(selector, path) for tag, path in TA_TAGS.items()}
         )
     elif method == "rac":
         valid_tokens = max(int(selector["valid_tokens"]), 1)
@@ -146,20 +184,12 @@ def production_tensorboard_metrics(
             selector["effective_sample_size"] / valid_tokens
         )
         selected.update(
-            {
-                tag: _selector_value(selector, path)
-                for tag, path in RAC_TAGS.items()
-            }
+            {tag: _selector_value(selector, path) for tag, path in RAC_TAGS.items()}
         )
     elif method == "pgt":
-        selected["pgt/selected_token_fraction"] = float(
-            selector["selected_fraction"]
-        )
+        selected["pgt/selected_token_fraction"] = float(selector["selected_fraction"])
         selected.update(
-            {
-                tag: _selector_value(selector, path)
-                for tag, path in PGT_TAGS.items()
-            }
+            {tag: _selector_value(selector, path) for tag, path in PGT_TAGS.items()}
         )
     elif method == "cmt":
         valid_tokens = max(int(selector["valid_tokens"]), 1)
@@ -167,9 +197,20 @@ def production_tensorboard_metrics(
             selector["effective_sample_size"] / valid_tokens
         )
         selected.update(
+            {tag: _selector_value(selector, path) for tag, path in CMT_TAGS.items()}
+        )
+        selected.update(
             {
-                tag: _selector_value(selector, path)
-                for tag, path in CMT_TAGS.items()
+                tag: float(metrics[field])
+                for tag, field in CMT_ALLOCATION_TAGS.items()
+                if field in metrics and metrics[field] is not None
+            }
+        )
+        selected.update(
+            {
+                tag: float(metrics[field])
+                for tag, field in CMT_CORRECTION_TAGS.items()
+                if field in metrics and metrics[field] is not None
             }
         )
     elif method == "grpo":

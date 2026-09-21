@@ -55,9 +55,7 @@ def _controlled_config(method: str = "ta") -> dict:
 class ResumeTests(unittest.TestCase):
     @staticmethod
     def _stepped_optimizer():
-        model = torch.nn.Sequential(
-            torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)
-        )
+        model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.Linear(2, 1))
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
         model(torch.ones(1, 3)).sum().backward()
         optimizer.step()
@@ -89,21 +87,15 @@ class ResumeTests(unittest.TestCase):
         # reverse conversion must restore the target optimizer's order before
         # calling Optimizer.load_state_dict().
         full = copy.deepcopy(full)
-        full["param_groups"][0]["params"] = sorted(
-            full["param_groups"][0]["params"]
-        )
-        target_model = torch.nn.Sequential(
-            torch.nn.Linear(3, 2), torch.nn.Linear(2, 1)
-        )
+        full["param_groups"][0]["params"] = sorted(full["param_groups"][0]["params"])
+        target_model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.Linear(2, 1))
         target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=9e-4)
         standard = _full_optimizer_to_standard(full, target_optimizer, target_model)
         target_optimizer.load_state_dict(standard)
         self.assertEqual(
             [group["lr"] for group in target_optimizer.param_groups], [1e-5]
         )
-        self.assertEqual(
-            len(target_optimizer.state), len(source_optimizer.state)
-        )
+        self.assertEqual(len(target_optimizer.state), len(source_optimizer.state))
 
     def test_fsdp_full_checkpoint_restores_into_non_fsdp_optimizer(self):
         source_model, source_optimizer = self._stepped_optimizer()
@@ -134,9 +126,7 @@ class ResumeTests(unittest.TestCase):
             )
             self.assertEqual(state.step, 9)
             self.assertEqual(target_optimizer.param_groups[0]["lr"], 1e-5)
-            self.assertEqual(
-                len(target_optimizer.state), len(source_optimizer.state)
-            )
+            self.assertEqual(len(target_optimizer.state), len(source_optimizer.state))
 
     def test_standard_checkpoint_can_resume_into_fsdp_via_scatter(self):
         model, optimizer = self._stepped_optimizer()
@@ -168,11 +158,12 @@ class ResumeTests(unittest.TestCase):
                     full_state, current_optimizer, current_model
                 )
 
-            with mock.patch(
-                "b200_experiment.resume.is_fsdp_model", return_value=True
-            ), mock.patch(
-                "b200_experiment.resume.scatter_full_optimizer_state_dict",
-                side_effect=fake_scatter,
+            with (
+                mock.patch("b200_experiment.resume.is_fsdp_model", return_value=True),
+                mock.patch(
+                    "b200_experiment.resume.scatter_full_optimizer_state_dict",
+                    side_effect=fake_scatter,
+                ),
             ):
                 state = restore_optimizer(
                     optimizer,
@@ -224,11 +215,14 @@ class ResumeTests(unittest.TestCase):
             target_model = torch.nn.Linear(3, 2)
             target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
 
-            with mock.patch(
-                "b200_experiment.resume.torch.load", return_value=payload
-            ) as load, mock.patch(
-                "b200_experiment.resume.torch.cuda.set_rng_state"
-            ) as set_rng_state:
+            with (
+                mock.patch(
+                    "b200_experiment.resume.torch.load", return_value=payload
+                ) as load,
+                mock.patch(
+                    "b200_experiment.resume.torch.cuda.set_rng_state"
+                ) as set_rng_state,
+            ):
                 state = restore_optimizer(
                     target_optimizer, checkpoint, torch.device("cuda", 0)
                 )
@@ -267,16 +261,19 @@ class ResumeTests(unittest.TestCase):
             target_model = torch.nn.Linear(3, 2)
             target_optimizer = torch.optim.SGD(target_model.parameters(), lr=9e-4)
 
-            with mock.patch(
-                "b200_experiment.resume.torch.load",
-                return_value={
-                    "step": 650,
-                    "optimizer": source_optimizer.state_dict(),
-                    "cuda_rng_state_all": [saved_rng_state],
-                },
-            ), mock.patch(
-                "b200_experiment.resume.torch.cuda.set_rng_state"
-            ) as set_rng_state:
+            with (
+                mock.patch(
+                    "b200_experiment.resume.torch.load",
+                    return_value={
+                        "step": 650,
+                        "optimizer": source_optimizer.state_dict(),
+                        "cuda_rng_state_all": [saved_rng_state],
+                    },
+                ),
+                mock.patch(
+                    "b200_experiment.resume.torch.cuda.set_rng_state"
+                ) as set_rng_state,
+            ):
                 restore_optimizer(target_optimizer, checkpoint, torch.device("cuda", 3))
 
             restored_rng_state = set_rng_state.call_args.args[0]
@@ -318,6 +315,12 @@ class ResumeTests(unittest.TestCase):
                 (stats / f"step-{step:06d}.json").write_text(
                     json.dumps({"step": step}) + "\n", encoding="utf-8"
                 )
+            motivation = root / "cmt_token_audit" / "motivation_summaries"
+            motivation.mkdir(parents=True)
+            for step in (100, 127):
+                (motivation / f"step-{step:06d}.json").write_text(
+                    json.dumps({"step": step}) + "\n", encoding="utf-8"
+                )
             evaluations = root / "training_eval"
             for step in (100, 120):
                 (evaluations / f"step-{step:06d}").mkdir(parents=True)
@@ -352,6 +355,8 @@ class ResumeTests(unittest.TestCase):
                     )
             self.assertTrue((stats / "step-000100.json").is_file())
             self.assertFalse((stats / "step-000127.json").exists())
+            self.assertTrue((motivation / "step-000100.json").is_file())
+            self.assertFalse((motivation / "step-000127.json").exists())
             self.assertTrue((evaluations / "step-000100").is_dir())
             self.assertFalse((evaluations / "step-000120").exists())
             self.assertFalse((root / "checkpoint-000120").exists())
@@ -439,6 +444,72 @@ class ResumeTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "experiment.method"):
                 validate_resume_config(checkpoint, _controlled_config("rac"))
+
+    def test_resume_rejects_switching_cmt_allocation_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            checkpoint = output / "checkpoint-000100"
+            checkpoint.mkdir()
+            source = _controlled_config("cmt")
+            source["selector"].update(
+                cmt_allocation_mode="gibbs",
+                cmt_weight_min=0.5,
+                cmt_weight_max=2.0,
+            )
+            (output / "resolved_config.yaml").write_text(
+                yaml.safe_dump(source), encoding="utf-8"
+            )
+            current = copy.deepcopy(source)
+            current["selector"]["cmt_allocation_mode"] = "bounded_gibbs"
+            with self.assertRaisesRegex(ValueError, "cmt_allocation_mode"):
+                validate_resume_config(checkpoint, current)
+
+    def test_legacy_cmt_resume_uses_gibbs_compatibility_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            checkpoint = output / "checkpoint-000100"
+            checkpoint.mkdir()
+            legacy = _controlled_config("cmt")
+            (output / "resolved_config.yaml").write_text(
+                yaml.safe_dump(legacy), encoding="utf-8"
+            )
+            current = copy.deepcopy(legacy)
+            current["selector"].update(
+                cmt_allocation_mode="gibbs",
+                cmt_weight_min=0.5,
+                cmt_weight_max=2.0,
+            )
+            result = validate_resume_config(checkpoint, current)
+            self.assertEqual(result["mismatches"], {})
+
+    def test_resume_rejects_changed_correction_bounds_or_final_kl(self):
+        source = _controlled_config("cmt")
+        source["selector"].update(
+            cmt_allocation_mode="direct_bounded_gibbs",
+            cmt_weight_min=0.5,
+            cmt_weight_max=2.0,
+            cmt_correction_mode="tanh_q99",
+            cmt_correction_quantile=0.99,
+            cmt_final_allocation_kl=0.02,
+        )
+        for key, changed in (
+            ("cmt_correction_mode", "none"),
+            ("cmt_correction_quantile", 0.95),
+            ("cmt_weight_min", 0.4),
+            ("cmt_weight_max", 3.0),
+            ("cmt_final_allocation_kl", 0.03),
+        ):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                checkpoint = output / "checkpoint-000100"
+                checkpoint.mkdir()
+                (output / "resolved_config.yaml").write_text(
+                    yaml.safe_dump(source), encoding="utf-8"
+                )
+                current = copy.deepcopy(source)
+                current["selector"][key] = changed
+                with self.assertRaisesRegex(ValueError, key):
+                    validate_resume_config(checkpoint, current)
 
     def test_auto_resume_uses_latest_complete_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:

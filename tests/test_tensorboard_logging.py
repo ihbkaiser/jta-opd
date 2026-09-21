@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 
 from b200_experiment.tensorboard_logging import (
     BASE_TAGS,
+    CMT_ALLOCATION_TAGS,
+    CMT_CORRECTION_TAGS,
     RAC_TAGS,
     CMT_TAGS,
     TA_TAGS,
@@ -46,9 +48,36 @@ def _cmt_metrics() -> dict:
         successor_excess={"mean": 0.15},
         H={"mean": 0.2},
         sequential_gain={"mean": 0.3},
+        sequential_gain_raw={"mean": 0.3},
+        sequential_gain_robust={"mean": 0.2},
         learning_value={"mean": 0.7, "std": 0.1},
+        learning_value_raw={"mean": 0.7},
+        learning_value_robust={"mean": 0.6},
         w={"mean": 1.0, "std": 0.2, "max": 2.0},
         gain={"mean": 0.4},
+    )
+    values.update(
+        weight_raw_max=8.0,
+        weight_final_min=0.5,
+        weight_final_max=2.0,
+        fraction_at_weight_min=0.1,
+        fraction_at_weight_max=0.2,
+        allocation_kl_pre_bound=0.5,
+        allocation_kl_post_bound=0.2,
+        normalized_ess=0.8,
+        max_token_probability=0.01,
+        allocation_beta=0.3,
+        allocation_log_c=-0.1,
+        allocation_kl_target=0.02,
+        allocation_kl_final=0.02,
+        allocation_mean_weight_error=1e-12,
+        correction_kappa=0.4,
+        sequential_gain_raw_abs_q95=2.0,
+        sequential_gain_raw_abs_q99=4.0,
+        sequential_gain_robust_abs_q95=0.3,
+        sequential_gain_robust_abs_q99=0.4,
+        correction_saturation_rate_1kappa=0.1,
+        correction_saturation_rate_2kappa=0.05,
     )
     return values
 
@@ -91,7 +120,11 @@ class TensorBoardMetricTests(unittest.TestCase):
         selected = production_tensorboard_metrics(_cmt_metrics(), "cmt")
         self.assertEqual(
             set(selected),
-            set(BASE_TAGS) | set(CMT_TAGS) | {"cmt/effective_token_fraction"},
+            set(BASE_TAGS)
+            | set(CMT_TAGS)
+            | set(CMT_ALLOCATION_TAGS)
+            | set(CMT_CORRECTION_TAGS)
+            | {"cmt/effective_token_fraction"},
         )
         self.assertEqual(selected["cmt/common_mass_mean"], 0.8)
 

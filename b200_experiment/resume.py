@@ -22,6 +22,10 @@ _SELECTOR_CHUNK_PATTERN = re.compile(
 )
 _STEP_JSON_PATTERN = re.compile(r"^step-(\d+)\.json$")
 _STEP_DIRECTORY_PATTERN = re.compile(r"^step-(\d+)$")
+_CMT_AUDIT_TOKEN_PATTERN = re.compile(r"^step-(\d+)_rank-\d+\.jsonl\.gz$")
+_CMT_AUDIT_HEATMAP_PATTERN = re.compile(
+    r"^step-(\d+)_rank-\d+_gain_heatmap\.(?:png|json)$"
+)
 
 
 @dataclass(frozen=True)
@@ -557,9 +561,10 @@ def _stage_jsonl_rewind(
     retained_last_step = None
     removed_rows = 0
     try:
-        with path.open(encoding="utf-8") as source, temporary.open(
-            "x", encoding="utf-8"
-        ) as target:
+        with (
+            path.open(encoding="utf-8") as source,
+            temporary.open("x", encoding="utf-8") as target,
+        ):
             for line_number, line in enumerate(source, start=1):
                 if not line.strip():
                     target.write(line)
@@ -599,9 +604,10 @@ def _stage_csv_rewind(
     retained_last_step = None
     removed_rows = 0
     try:
-        with path.open(newline="", encoding="utf-8") as source, temporary.open(
-            "x", newline="", encoding="utf-8"
-        ) as target:
+        with (
+            path.open(newline="", encoding="utf-8") as source,
+            temporary.open("x", newline="", encoding="utf-8") as target,
+        ):
             reader = csv.DictReader(source)
             if not reader.fieldnames or "step" not in reader.fieldnames:
                 raise ValueError(f"Cannot resume safely: {path} has no step column")
@@ -639,9 +645,10 @@ def _stage_selector_rewind(
     retained_rows = 0
     removed_rows = 0
     try:
-        with gzip.open(path, "rt", encoding="utf-8") as source, gzip.open(
-            temporary, "xt", encoding="utf-8", compresslevel=6
-        ) as target:
+        with (
+            gzip.open(path, "rt", encoding="utf-8") as source,
+            gzip.open(temporary, "xt", encoding="utf-8", compresslevel=6) as target,
+        ):
             for line_number, line in enumerate(source, start=1):
                 if not line.strip():
                     continue
@@ -741,6 +748,27 @@ def validate_append_history(
         )
         deletions.update(
             _step_paths_after(
+                output_dir / "cmt_token_audit" / "important_tokens",
+                _CMT_AUDIT_TOKEN_PATTERN,
+                resume_step,
+            )
+        )
+        deletions.update(
+            _step_paths_after(
+                output_dir / "cmt_token_audit" / "heatmaps",
+                _CMT_AUDIT_HEATMAP_PATTERN,
+                resume_step,
+            )
+        )
+        deletions.update(
+            _step_paths_after(
+                output_dir / "cmt_token_audit" / "motivation_summaries",
+                _STEP_JSON_PATTERN,
+                resume_step,
+            )
+        )
+        deletions.update(
+            _step_paths_after(
                 output_dir / "training_eval", _STEP_DIRECTORY_PATTERN, resume_step
             )
         )
@@ -815,6 +843,25 @@ def _get(config: dict[str, Any], dotted: str):
     return value
 
 
+_RESUME_COMPATIBILITY_DEFAULTS = {
+    # Legacy CMT checkpoints predate explicit allocation policy fields.  Their
+    # behavior is exactly the current default Gibbs mode with these inert
+    # bounds, so interpret missing fields canonically instead of rejecting a
+    # scientifically identical resume.
+    "selector.cmt_allocation_mode": "gibbs",
+    "selector.cmt_weight_min": 0.5,
+    "selector.cmt_weight_max": 2.0,
+    "selector.cmt_correction_mode": "none",
+    "selector.cmt_correction_quantile": 0.99,
+    "selector.cmt_final_allocation_kl": 0.02,
+}
+
+
+def _resume_value(config: dict[str, Any], dotted: str):
+    value = _get(config, dotted)
+    return _RESUME_COMPATIBILITY_DEFAULTS.get(dotted) if value is None else value
+
+
 def validate_resume_config(
     checkpoint: str | Path,
     current: dict[str, Any],
@@ -855,6 +902,12 @@ def validate_resume_config(
         "selector.rac_w_min",
         "selector.rac_beta",
         "selector.cmt_allocation_kl",
+        "selector.cmt_allocation_mode",
+        "selector.cmt_weight_min",
+        "selector.cmt_weight_max",
+        "selector.cmt_correction_mode",
+        "selector.cmt_correction_quantile",
+        "selector.cmt_final_allocation_kl",
         "selector.cmt_gamma",
         "selector.cmt_successor_lambda",
         "selector.cmt_full_vocab_diagnostics",
@@ -867,9 +920,12 @@ def validate_resume_config(
         "training.ppo_dual_clip",
     )
     mismatches = {
-        key: {"checkpoint": _get(source, key), "current": _get(current, key)}
+        key: {
+            "checkpoint": _resume_value(source, key),
+            "current": _resume_value(current, key),
+        }
         for key in keys
-        if _get(source, key) != _get(current, key)
+        if _resume_value(source, key) != _resume_value(current, key)
     }
     if mismatches and not allow_mismatch:
         formatted = ", ".join(

@@ -27,7 +27,10 @@ from b200_experiment.distributed import (
     unique_free_port,
 )
 from b200_experiment.selectors import TASelector
-from b200_experiment.selectors.cmt_selector import kl_constrained_allocation
+from b200_experiment.selectors.cmt_selector import (
+    cmt_allocation,
+    robust_cmt_correction,
+)
 from b200_experiment.trainer import (
     _globalize_ta_output,
     _local_mask_from_global_budget,
@@ -279,7 +282,129 @@ def _gloo_gather_worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+def _bounded_cmt_global_worker(rank: int, rendezvous: str, output_root: str) -> None:
+    """Exercise the production gather-then-bound ordering on two CPU ranks."""
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        context = DistributedContext(rank, rank, 2, torch.device("cpu"))
+        local_scores = (
+            torch.tensor([-4.0, -3.0]) if rank == 0 else torch.tensor([2.0, 8.0])
+        )
+        global_scores, start, end, _ = context.all_gather_variable_1d(local_scores)
+        raw, final, _, _ = cmt_allocation(
+            global_scores,
+            1.0,
+            mode="bounded_gibbs",
+            weight_min=0.5,
+            weight_max=2.0,
+        )
+        torch.save(
+            {
+                "raw": raw,
+                "final": final,
+                "local": final[start:end],
+            },
+            Path(output_root) / f"bounded-rank-{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _robust_direct_cmt_global_worker(
+    rank: int, rendezvous: str, output_root: str
+) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        context = DistributedContext(rank, rank, 2, torch.device("cpu"))
+        local_gain = (
+            torch.tensor([1.0, 2.0]) if rank == 0 else torch.tensor([20.0, 30.0])
+        )
+        local_d = (
+            torch.tensor([-100.0, 0.2]) if rank == 0 else torch.tensor([0.4, 100.0])
+        )
+        global_gain, start, end, _ = context.all_gather_variable_1d(local_gain)
+        global_d, d_start, d_end, _ = context.all_gather_variable_1d(local_d)
+        assert (start, end) == (d_start, d_end)
+        robust, score, kappa, _ = robust_cmt_correction(
+            global_gain, global_d, mode="tanh_q99", quantile=0.99
+        )
+        raw, final, _, metrics = cmt_allocation(
+            score,
+            0.5,
+            mode="direct_bounded_gibbs",
+            weight_min=0.5,
+            weight_max=2.0,
+            final_epsilon=0.02,
+        )
+        torch.save(
+            {
+                "gain": global_gain,
+                "robust": robust,
+                "score": score,
+                "kappa": kappa,
+                "raw": raw,
+                "final": final,
+                "local": final[start:end],
+                "status": metrics["allocation_solver_status"],
+            },
+            Path(output_root) / f"robust-direct-rank-{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
 class DistributedInvariantTests(unittest.TestCase):
+    def test_cmt_correction_and_direct_allocation_are_global(self):
+        if not dist.is_gloo_available():
+            self.skipTest("PyTorch was built without Gloo")
+        with tempfile.TemporaryDirectory() as temporary:
+            rendezvous = str(Path(temporary) / "robust-direct-rendezvous")
+            mp.spawn(
+                _robust_direct_cmt_global_worker,
+                args=(rendezvous, temporary),
+                nprocs=2,
+                join=True,
+            )
+            rank0 = torch.load(Path(temporary) / "robust-direct-rank-0.pt")
+            rank1 = torch.load(Path(temporary) / "robust-direct-rank-1.pt")
+        self.assertEqual(rank0["kappa"], rank1["kappa"])
+        self.assertAlmostEqual(
+            rank0["kappa"], float(torch.quantile(rank0["gain"].double(), 0.99))
+        )
+        self.assertTrue(torch.equal(rank0["robust"], rank1["robust"]))
+        self.assertTrue(torch.equal(rank0["final"], rank1["final"]))
+        self.assertAlmostEqual(float(rank0["final"].mean()), 1.0, places=6)
+        self.assertEqual(rank0["status"], "kl_active")
+
+    def test_bounded_cmt_allocation_is_global_before_rank_scatter(self):
+        if not dist.is_gloo_available():
+            self.skipTest("PyTorch was built without Gloo")
+        with tempfile.TemporaryDirectory() as temporary:
+            rendezvous = str(Path(temporary) / "bounded-cmt-rendezvous")
+            mp.spawn(
+                _bounded_cmt_global_worker,
+                args=(rendezvous, temporary),
+                nprocs=2,
+                join=True,
+            )
+            rank0 = torch.load(Path(temporary) / "bounded-rank-0.pt")
+            rank1 = torch.load(Path(temporary) / "bounded-rank-1.pt")
+        self.assertTrue(torch.equal(rank0["raw"], rank1["raw"]))
+        self.assertTrue(torch.equal(rank0["final"], rank1["final"]))
+        self.assertAlmostEqual(float(rank0["final"].mean()), 1.0, places=6)
+        self.assertFalse(torch.isclose(rank0["local"].mean(), torch.tensor(1.0)))
+        self.assertFalse(torch.isclose(rank1["local"].mean(), torch.tensor(1.0)))
+
     def test_nccl_process_group_is_bound_to_the_local_cuda_device(self):
         with (
             patch.dict(
@@ -647,11 +772,11 @@ class DistributedInvariantTests(unittest.TestCase):
 
             def recorded_allocation(values, epsilon, **kwargs):
                 allocation_inputs.append(values.detach().cpu().clone())
-                return kl_constrained_allocation(values, epsilon, **kwargs)
+                return cmt_allocation(values, epsilon, **kwargs)
 
             optimizer.step = counted_step
             with patch(
-                "b200_experiment.trainer.kl_constrained_allocation",
+                "b200_experiment.trainer.cmt_allocation",
                 side_effect=recorded_allocation,
             ):
                 metrics = _opd_train_step(
@@ -684,6 +809,65 @@ class DistributedInvariantTests(unittest.TestCase):
             )
             for item in metrics["minibatches"]:
                 self.assertAlmostEqual(item["global_weight_mass"], 64.0, places=4)
+
+    def test_direct_bounded_cmt_loss_consumes_final_not_reference_weights(self):
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(8)], dtype=torch.long
+        )
+        valid = torch.tensor([[True, False]] * 8)
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=valid,
+            rollout_log_probs=torch.zeros((8, 2)),
+            prompt_width=2,
+        )
+        response_indices = [response for _prompt in range(4) for response in range(2)]
+        scores = torch.zeros((8, 2))
+        scores[:, 0] = torch.tensor([-10.0, -8.0, -2.0, 0.0, 1.0, 3.0, 8.0, 20.0])
+        consumed_weights: list[torch.Tensor] = []
+
+        def record_loss(losses, weights, mask):
+            consumed_weights.append(weights[mask].detach().cpu().clone())
+            return weighted_token_sums(losses, weights, mask)
+
+        model = _TinyCausalLM()
+        with patch(
+            "b200_experiment.trainer.weighted_token_sums", side_effect=record_loss
+        ):
+            metrics = _opd_train_step(
+                model,
+                torch.optim.SGD(model.parameters(), lr=0.001),
+                rollout,
+                valid.float(),
+                _tiny_reference(model, rollout),
+                _tiny_config(2, 4),
+                torch.device("cpu"),
+                DistributedContext(0, 0, 1, torch.device("cpu")),
+                trajectory_group_ids=response_indices,
+                gibbs_scores=scores,
+                gibbs_epsilon=0.5,
+                gibbs_mode="direct_bounded_gibbs",
+                gibbs_weight_min=0.5,
+                gibbs_weight_max=1.2,
+                gibbs_final_epsilon=0.02,
+            )
+        final = metrics["allocated_position_weights"][valid]
+        raw = metrics["allocated_raw_position_weights"][valid]
+        consumed = torch.cat(consumed_weights)
+        # The two response-major optimizer groups are consumed in group order.
+        expected_consumed = torch.cat((final[0::2], final[1::2]))
+        self.assertTrue(torch.allclose(consumed, expected_consumed))
+        self.assertFalse(torch.allclose(final, raw))
+        self.assertEqual(metrics["optimizer_steps"], 2)
+        self.assertEqual(metrics["gibbs_allocations"], 2)
+        self.assertTrue(
+            all(
+                item["allocation_solver_status"] == "kl_active"
+                for item in metrics["minibatches"]
+            )
+        )
 
     def test_partial_ppo_minibatch_and_optimizer_step_schedule(self):
         # Prompt batches are 4, 4, 2; with n=4 this is 16, 16, 8

@@ -179,6 +179,13 @@ logging:
   token_score_interval: 50
   token_score_histogram_bins: 64
   token_score_raw_sample_size: 2048
+  # Sparse CMT-only audit. Disabled by default, so legacy runs have no extra
+  # CPU transfer, filesystem traffic, or matplotlib dependency.
+  cmt_token_audit_enabled: false
+  cmt_token_audit_interval: 150
+  cmt_token_audit_top_k: 50
+  cmt_token_context_radius: 32
+  cmt_gain_heatmap_enabled: false
   tensorboard:
     enabled: true
     log_dir: tensorboard

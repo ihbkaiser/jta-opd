@@ -66,6 +66,419 @@ def kl_constrained_allocation(
     return probabilities * count, inverse_temperature, achieved_kl
 
 
+def validate_cmt_allocation(
+    mode: str, weight_min: float, weight_max: float
+) -> tuple[str, float, float]:
+    """Validate the two supported CMT allocation policies and their bounds."""
+    resolved_mode = str(mode).strip().lower()
+    if resolved_mode not in {"gibbs", "bounded_gibbs", "direct_bounded_gibbs"}:
+        raise ValueError(
+            "selector.cmt_allocation_mode must be exactly 'gibbs', "
+            "'bounded_gibbs', or 'direct_bounded_gibbs'"
+        )
+    lower, upper = float(weight_min), float(weight_max)
+    if not (math.isfinite(lower) and math.isfinite(upper)):
+        raise ValueError("CMT weight bounds must be finite")
+    if not 0.0 <= lower <= 1.0 <= upper:
+        raise ValueError("CMT weight bounds must satisfy 0 <= min <= 1 <= max")
+    if resolved_mode == "direct_bounded_gibbs" and lower <= 0.0:
+        raise ValueError("Direct bounded Gibbs requires cmt_weight_min > 0")
+    return resolved_mode, lower, upper
+
+
+def validate_cmt_correction(mode: str, quantile: float) -> tuple[str, float]:
+    resolved_mode = str(mode).strip().lower()
+    if resolved_mode not in {"none", "tanh_q99"}:
+        raise ValueError("selector.cmt_correction_mode must be 'none' or 'tanh_q99'")
+    resolved_quantile = float(quantile)
+    if not math.isfinite(resolved_quantile) or not 0.0 < resolved_quantile <= 1.0:
+        raise ValueError("selector.cmt_correction_quantile must be in (0, 1]")
+    return resolved_mode, resolved_quantile
+
+
+@torch.no_grad()
+def robust_cmt_correction(
+    gain: torch.Tensor,
+    sequential_gain_raw: torch.Tensor,
+    *,
+    mode: str = "none",
+    quantile: float = 0.99,
+    numerical_epsilon: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, float]]:
+    """Apply the rollout-global bounded-influence correction to raw CMT D."""
+    resolved_mode, resolved_quantile = validate_cmt_correction(mode, quantile)
+    if gain.ndim != 1 or sequential_gain_raw.shape != gain.shape or gain.numel() == 0:
+        raise ValueError("CMT correction expects aligned non-empty 1-D tensors")
+    gain64 = gain.detach().double()
+    raw64 = sequential_gain_raw.detach().double()
+    if not bool(torch.isfinite(gain64).all() and torch.isfinite(raw64).all()):
+        raise FloatingPointError("CMT correction received non-finite values")
+    epsilon = float(numerical_epsilon)
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("CMT correction numerical epsilon must be positive")
+    kappa = max(float(torch.quantile(gain64, resolved_quantile)), epsilon)
+    robust64 = raw64 if resolved_mode == "none" else kappa * torch.tanh(raw64 / kappa)
+    learning64 = gain64 + robust64
+    if not bool(torch.isfinite(robust64).all() and torch.isfinite(learning64).all()):
+        raise FloatingPointError("CMT correction produced non-finite values")
+    raw_abs = raw64.abs()
+    robust_abs = robust64.abs()
+    metrics = {
+        "correction_kappa": kappa,
+        "sequential_gain_raw_abs_q95": float(torch.quantile(raw_abs, 0.95)),
+        "sequential_gain_raw_abs_q99": float(torch.quantile(raw_abs, 0.99)),
+        "sequential_gain_robust_abs_q95": float(torch.quantile(robust_abs, 0.95)),
+        "sequential_gain_robust_abs_q99": float(torch.quantile(robust_abs, 0.99)),
+        "correction_saturation_rate_1kappa": float((raw_abs >= kappa).double().mean()),
+        "correction_saturation_rate_2kappa": float(
+            (raw_abs >= 2.0 * kappa).double().mean()
+        ),
+    }
+    return (
+        robust64.to(dtype=sequential_gain_raw.dtype),
+        learning64.to(dtype=gain.dtype),
+        kappa,
+        metrics,
+    )
+
+
+def _mean_w_log_w(weights: torch.Tensor) -> float:
+    values = weights.detach().double()
+    positive = values > 0
+    terms = torch.zeros_like(values)
+    terms[positive] = values[positive] * values[positive].log()
+    return float(terms.mean())
+
+
+@torch.no_grad()
+def bounded_mean_one_weights(
+    raw_weights: torch.Tensor,
+    weight_min: float,
+    weight_max: float,
+    *,
+    iterations: int = 96,
+    tolerance: float = 1e-6,
+) -> torch.Tensor:
+    """Compute ``clip(c * raw, min, max)`` whose arithmetic mean is one.
+
+    Scaling is solved before clipping by monotone bisection.  In particular,
+    the result is never divided by its mean after clipping, because that would
+    invalidate the configured bounds.
+    """
+    _, lower, upper = validate_cmt_allocation("bounded_gibbs", weight_min, weight_max)
+    if raw_weights.ndim != 1 or raw_weights.numel() == 0:
+        raise ValueError("Bounded Gibbs expects a non-empty one-dimensional tensor")
+    raw = raw_weights.detach().double()
+    if not bool(torch.isfinite(raw).all()):
+        raise FloatingPointError("Bounded Gibbs received non-finite raw weights")
+    if bool((raw < 0).any()):
+        raise ValueError("Bounded Gibbs raw weights must be non-negative")
+    if not bool((raw > 0).any()):
+        raise ValueError("Bounded Gibbs requires at least one positive raw weight")
+    if lower == upper == 1.0:
+        return torch.ones_like(raw_weights)
+    maximum_reachable_mean = float(
+        torch.where(raw > 0, raw.new_tensor(upper), raw.new_tensor(lower)).mean()
+    )
+    if maximum_reachable_mean < 1.0 - float(tolerance):
+        raise ValueError(
+            "No scale c can make clip(c * raw, min, max) mean one: too many "
+            "raw weights are exactly zero for the configured bounds"
+        )
+
+    def transformed(scale: float) -> torch.Tensor:
+        return (raw * scale).clamp(min=lower, max=upper)
+
+    low, high = 0.0, 1.0
+    while float(transformed(high).mean()) < 1.0:
+        high *= 2.0
+        if not math.isfinite(high):
+            raise FloatingPointError("Could not bracket the bounded Gibbs scale")
+    for _ in range(max(1, int(iterations))):
+        midpoint = 0.5 * (low + high)
+        if float(transformed(midpoint).mean()) < 1.0:
+            low = midpoint
+        else:
+            high = midpoint
+    final64 = transformed(0.5 * (low + high))
+    final = final64.to(dtype=raw_weights.dtype)
+    if not bool(torch.isfinite(final).all()):
+        raise FloatingPointError("Bounded Gibbs produced non-finite weights")
+    mean_error = abs(float(final.double().mean()) - 1.0)
+    if mean_error > float(tolerance):
+        raise AssertionError(
+            f"Bounded Gibbs mean-one constraint failed: error={mean_error:.3e}"
+        )
+    if float(final.min()) < lower - 1e-7 or float(final.max()) > upper + 1e-7:
+        raise AssertionError("Bounded Gibbs violated its configured bounds")
+    return final
+
+
+@torch.no_grad()
+def cmt_weight_metrics(
+    raw_weights: torch.Tensor,
+    final_weights: torch.Tensor,
+    *,
+    weight_min: float,
+    weight_max: float,
+) -> dict[str, float]:
+    """Return allocation diagnostics, using final weights for risk metrics."""
+    if raw_weights.shape != final_weights.shape or raw_weights.numel() == 0:
+        raise ValueError("Raw and final CMT weights must have the same non-empty shape")
+    raw = raw_weights.detach().double()
+    final = final_weights.detach().double()
+    if not bool(torch.isfinite(raw).all() and torch.isfinite(final).all()):
+        raise FloatingPointError("CMT allocation metrics received non-finite weights")
+    total = final.sum()
+    normalized_ess = total.square() / (
+        final.numel() * final.square().sum().clamp_min(1e-30)
+    )
+    atol = 1e-6
+    return {
+        "allocation_kl_pre_bound": _mean_w_log_w(raw),
+        "allocation_kl_post_bound": _mean_w_log_w(final),
+        "weight_raw_max": float(raw.max()),
+        "weight_final_min": float(final.min()),
+        "weight_final_max": float(final.max()),
+        "fraction_at_weight_min": float(
+            torch.isclose(
+                final, final.new_tensor(float(weight_min)), rtol=0.0, atol=atol
+            )
+            .double()
+            .mean()
+        ),
+        "fraction_at_weight_max": float(
+            torch.isclose(
+                final, final.new_tensor(float(weight_max)), rtol=0.0, atol=atol
+            )
+            .double()
+            .mean()
+        ),
+        "normalized_ess": float(normalized_ess),
+        "max_token_probability": float(final.max() / total.clamp_min(1e-30)),
+    }
+
+
+def _box_optimal_weights(
+    scores: torch.Tensor, lower: float, upper: float
+) -> torch.Tensor:
+    """Linear-objective optimum on the mean-one box, with stable score order."""
+    count = scores.numel()
+    weights = torch.full_like(scores, lower, dtype=torch.float64)
+    capacity = upper - lower
+    remaining = float(count) * (1.0 - lower)
+    if remaining <= 0.0 or capacity <= 0.0:
+        return torch.ones_like(scores, dtype=torch.float64)
+    order = torch.argsort(scores, descending=True, stable=True)
+    full = min(int(math.floor(remaining / capacity + 1e-14)), count)
+    if full:
+        weights[order[:full]] = upper
+        remaining -= full * capacity
+    if full < count and remaining > 1e-14:
+        weights[order[full]] = lower + min(remaining, capacity)
+    return weights
+
+
+def _bounded_exponential_for_temperature(
+    normalized_centered_scores: torch.Tensor,
+    temperature: float,
+    lower: float,
+    upper: float,
+    *,
+    iterations: int = 96,
+) -> tuple[torch.Tensor, float]:
+    """Inner KKT solve for log(c) at one non-negative scaled beta."""
+    log_lower, log_upper = math.log(lower), math.log(upper)
+    theta = normalized_centered_scores * float(temperature)
+
+    def weights(log_c: float) -> torch.Tensor:
+        return torch.exp((theta + float(log_c)).clamp(log_lower, log_upper))
+
+    # normalized_centered_scores is in [-2, 0], so these bounds force all
+    # weights to the lower/upper box face without exponentiating large scores.
+    low = log_lower - 2.0 * float(temperature) - 2.0
+    high = log_upper + 2.0 * float(temperature) + 2.0
+    for _ in range(max(1, int(iterations))):
+        midpoint = 0.5 * (low + high)
+        if float(weights(midpoint).mean()) < 1.0:
+            low = midpoint
+        else:
+            high = midpoint
+    log_c = 0.5 * (low + high)
+    return weights(log_c), log_c
+
+
+@torch.no_grad()
+def direct_bounded_gibbs_allocation(
+    values: torch.Tensor,
+    epsilon: float,
+    weight_min: float,
+    weight_max: float,
+    *,
+    outer_iterations: int = 96,
+    inner_iterations: int = 96,
+    tolerance: float = 1e-7,
+) -> tuple[torch.Tensor, float, float, str, float]:
+    """Solve the KL-constrained bounded Gibbs KKT system directly in float64."""
+    _, lower, upper = validate_cmt_allocation(
+        "direct_bounded_gibbs", weight_min, weight_max
+    )
+    target = float(epsilon)
+    if not math.isfinite(target) or target < 0.0:
+        raise ValueError("selector.cmt_final_allocation_kl must be finite and >= 0")
+    if values.ndim != 1 or values.numel() == 0:
+        raise ValueError("Direct bounded Gibbs expects a non-empty 1-D score tensor")
+    scores = values.detach().double()
+    if not bool(torch.isfinite(scores).all()):
+        raise FloatingPointError("Direct bounded Gibbs received non-finite scores")
+    count = scores.numel()
+    uniform = torch.ones_like(scores)
+    if count == 1 or target <= tolerance or bool(scores.eq(scores[0]).all()):
+        return uniform.to(dtype=values.dtype), 0.0, 0.0, "uniform", 0.0
+
+    box_optimal = _box_optimal_weights(scores, lower, upper)
+    maximum_kl = _mean_w_log_w(box_optimal)
+    if target >= maximum_kl - tolerance:
+        # The KL constraint is inactive. The stable score ordering makes the
+        # selected box optimum deterministic even when several scores tie.
+        return (
+            box_optimal.to(dtype=values.dtype),
+            math.inf,
+            0.0,
+            "box_optimal_kl_inactive",
+            maximum_kl,
+        )
+
+    scale = float(scores.abs().max())
+    if not math.isfinite(scale) or scale <= 0.0:
+        return uniform.to(dtype=values.dtype), 0.0, 0.0, "uniform", 0.0
+    normalized = scores / scale
+    normalized_centered = normalized - normalized.max()
+
+    def solve_temperature(temperature: float) -> tuple[torch.Tensor, float, float]:
+        weights, log_c = _bounded_exponential_for_temperature(
+            normalized_centered,
+            temperature,
+            lower,
+            upper,
+            iterations=inner_iterations,
+        )
+        return weights, log_c, _mean_w_log_w(weights)
+
+    low_temperature, high_temperature = 0.0, 1.0
+    high_weights, high_log_c, high_kl = solve_temperature(high_temperature)
+    while high_kl < target and high_temperature < 1e12:
+        high_temperature *= 2.0
+        high_weights, high_log_c, high_kl = solve_temperature(high_temperature)
+    if high_kl < target - tolerance:
+        # Numerical convergence reached the limiting box face before the
+        # requested KL. This is the same inactive-constraint solution.
+        return (
+            box_optimal.to(dtype=values.dtype),
+            high_temperature / scale,
+            high_log_c - (high_temperature / scale) * float(scores.max()),
+            "box_optimal_kl_inactive",
+            maximum_kl,
+        )
+
+    final_weights = uniform
+    final_log_c = 0.0
+    final_kl = 0.0
+    for _ in range(max(1, int(outer_iterations))):
+        midpoint = 0.5 * (low_temperature + high_temperature)
+        candidate, candidate_log_c, candidate_kl = solve_temperature(midpoint)
+        if candidate_kl <= target:
+            low_temperature = midpoint
+            final_weights = candidate
+            final_log_c = candidate_log_c
+            final_kl = candidate_kl
+        else:
+            high_temperature = midpoint
+    final = final_weights.to(dtype=values.dtype)
+    mean_error = abs(float(final.double().mean()) - 1.0)
+    if not bool(torch.isfinite(final).all()):
+        raise FloatingPointError("Direct bounded Gibbs produced non-finite weights")
+    if mean_error > 1e-6:
+        raise AssertionError(
+            f"Direct bounded Gibbs mean-one error exceeds tolerance: {mean_error}"
+        )
+    if float(final.min()) < lower - 1e-6 or float(final.max()) > upper + 1e-6:
+        raise AssertionError("Direct bounded Gibbs violated configured bounds")
+    if final_kl > target + 1e-6:
+        raise AssertionError("Direct bounded Gibbs exceeded its final KL budget")
+    beta = low_temperature / scale
+    # The stable exponent uses beta * (L - max(L)); report log(c) in the
+    # requested uncentered KKT form clip(c * exp(beta * L), lower, upper).
+    reported_log_c = final_log_c - beta * float(scores.max())
+    return final, beta, reported_log_c, "kl_active", maximum_kl
+
+
+@torch.no_grad()
+def cmt_allocation(
+    values: torch.Tensor,
+    epsilon: float,
+    *,
+    mode: str = "gibbs",
+    weight_min: float = 0.5,
+    weight_max: float = 2.0,
+    final_epsilon: float = 0.02,
+) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, float]]:
+    """Allocate one PPO group under a legacy or direct bounded Gibbs policy.
+
+    In direct mode ``raw`` is only the unbounded reference at the same final KL
+    target. ``final`` is solved independently from the bounded KKT system and is
+    the only weight tensor consumed by the training loss.
+    """
+    resolved_mode, lower, upper = validate_cmt_allocation(mode, weight_min, weight_max)
+    allocation_target = (
+        float(final_epsilon)
+        if resolved_mode == "direct_bounded_gibbs"
+        else float(epsilon)
+    )
+    if not math.isfinite(allocation_target) or allocation_target < 0.0:
+        raise ValueError("CMT allocation KL target must be finite and non-negative")
+    raw, raw_inverse_temperature, _raw_solver_kl = kl_constrained_allocation(
+        values, allocation_target
+    )
+    allocation_log_c = 0.0
+    maximum_feasible_kl = float("nan")
+    if resolved_mode == "gibbs":
+        final = raw
+        inverse_temperature = raw_inverse_temperature
+        solver_status = "legacy_gibbs"
+    elif resolved_mode == "bounded_gibbs":
+        final = bounded_mean_one_weights(raw, lower, upper)
+        inverse_temperature = raw_inverse_temperature
+        solver_status = "legacy_posthoc_bounded"
+    else:
+        (
+            final,
+            inverse_temperature,
+            allocation_log_c,
+            solver_status,
+            maximum_feasible_kl,
+        ) = direct_bounded_gibbs_allocation(
+            values,
+            allocation_target,
+            lower,
+            upper,
+        )
+    metrics = cmt_weight_metrics(raw, final, weight_min=lower, weight_max=upper)
+    if resolved_mode == "gibbs":
+        metrics["fraction_at_weight_min"] = 0.0
+        metrics["fraction_at_weight_max"] = 0.0
+    metrics.update(
+        allocation_beta=float(inverse_temperature),
+        allocation_log_c=float(allocation_log_c),
+        allocation_kl_target=allocation_target,
+        allocation_kl_final=metrics["allocation_kl_post_bound"],
+        allocation_mean_weight_error=abs(float(final.double().mean()) - 1.0),
+        allocation_solver_status=solver_status,
+        allocation_maximum_feasible_kl=maximum_feasible_kl,
+    )
+    return raw, final, inverse_temperature, metrics
+
+
 class CMTSelector:
     """Support-matched, local-excess Coupled Marginal Teachability.
 
@@ -223,7 +636,9 @@ class CMTSelector:
         # evaluations.  The action-conditioned future term cannot be summed
         # over U without evaluating those counterfactual successors.
         support_common_mass = torch.minimum(original_p, original_q).sum(dim=-1)
-        conditional_support_common_mass = torch.minimum(support_p, support_q).sum(dim=-1)
+        conditional_support_common_mass = torch.minimum(support_p, support_q).sum(
+            dim=-1
+        )
         common_mass_derivative = torch.where(
             support_mask & original_p.lt(original_q),
             original_p * (support_r - mean_r.unsqueeze(-1)),
@@ -260,11 +675,18 @@ class CMTSelector:
                 torch.zeros_like(masses[:, 1:]),
             )
         successor_excess = successor_return - g * successor_mass
+        successor_value = torch.where(
+            valid,
+            successor_return / (successor_mass + 1e-8),
+            torch.zeros_like(successor_return),
+        )
+        successor_excess_average = torch.where(
+            valid,
+            successor_excess / (successor_mass + 1e-8),
+            torch.zeros_like(successor_excess),
+        )
         sequential_gain = (
-            self.successor_lambda
-            * self.gamma
-            * marginal_flux
-            * successor_excess
+            self.successor_lambda * self.gamma * marginal_flux * successor_excess
         )
         canonical_learning_value = torch.where(
             valid, g + sequential_gain, torch.zeros_like(g)
@@ -325,12 +747,19 @@ class CMTSelector:
             V=cumulative_value,
             H=local_excess,
             successor_excess=successor_excess,
+            successor_return=successor_return,
+            successor_mass=successor_mass,
+            successor_value=successor_value,
+            successor_excess_total=successor_excess,
+            successor_excess_average=successor_excess_average,
             # Compatibility alias retained for older selector JSON readers;
             # this is no longer raw successor R, but the baseline-subtracted
             # successor excess used by the production derivative.
             successor_R=successor_excess,
             sequential_gain=sequential_gain,
+            sequential_gain_raw=sequential_gain,
             learning_value=learning_value,
+            learning_value_raw=canonical_learning_value,
             s_CMT=learning_value,
             score_definition=score_definition,
             ablation_arm=self.ablation_arm,
@@ -357,8 +786,11 @@ class CMTSelector:
             local_excess,
             successor_return,
             successor_mass,
+            successor_value,
             successor_excess,
+            successor_excess_average,
             sequential_gain,
+            canonical_learning_value,
             learning_value,
         ):
             if value.requires_grad or value.grad_fn is not None:

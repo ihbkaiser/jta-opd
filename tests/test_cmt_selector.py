@@ -1,8 +1,15 @@
+import math
+
 import torch
+import pytest
 
 from b200_experiment.selectors.cmt_selector import (
     CMTSelector,
+    bounded_mean_one_weights,
+    cmt_allocation,
+    direct_bounded_gibbs_allocation,
     kl_constrained_allocation,
+    robust_cmt_correction,
 )
 from b200_experiment.selectors.pgt_selector import PGTOutput
 
@@ -164,7 +171,9 @@ def test_truncated_kernel_has_the_raw_common_mass_expectation():
             torch.ones(1, 1, dtype=torch.bool),
         )
         transition = token_result.diagnostics["transition_weight"].item()
-        successor_value = successor[len(production_estimates)].item() if token_id != 99 else 0.0
+        successor_value = (
+            successor[len(production_estimates)].item() if token_id != 99 else 0.0
+        )
         production_estimates.append(transition * successor_value)
     assert torch.allclose(
         (full_p * torch.tensor(production_estimates)).sum(),
@@ -215,11 +224,13 @@ def test_directional_formula_matches_finite_difference_on_support():
     eta = 1e-6
     p_eta = p * torch.exp(eta * r)
     p_eta /= p_eta.sum()
+
     def divergence(x):
         return (x * (x.log() - q.log())).sum()
 
     def access(x):
         return (torch.minimum(x, q) * child).sum()
+
     finite_difference = (
         divergence(p) - divergence(p_eta) + access(p_eta) - access(p)
     ) / eta
@@ -381,3 +392,162 @@ def test_zero_kl_budget_is_uniform():
     assert torch.equal(weights, torch.ones(3))
     assert inverse_temperature == 0.0
     assert achieved == 0.0
+
+
+def test_bounded_uniform_weights_remain_exactly_uniform():
+    raw = torch.ones(17)
+    final = bounded_mean_one_weights(raw, 0.5, 2.0)
+    assert torch.equal(final, raw)
+
+
+def test_bounded_allocation_handles_extreme_outliers_zeros_and_tiny_values():
+    for raw in (
+        torch.tensor([1.0e-12, 0.0, 1.0, 1.0e4]),
+        torch.tensor([1.0e-30, 0.0, 1.0, 1.0e20], dtype=torch.float64),
+    ):
+        final = bounded_mean_one_weights(raw, 0.5, 2.0)
+        assert torch.isfinite(final).all()
+        assert abs(float(final.double().mean()) - 1.0) <= 1e-6
+        assert float(final.min()) >= 0.5
+        assert float(final.max()) <= 2.0
+        order = torch.argsort(raw, stable=True)
+        assert bool((final[order][1:] >= final[order][:-1]).all())
+
+
+def test_bounded_half_to_two_has_normalized_ess_at_least_two_thirds():
+    raw = torch.logspace(-20, 20, 1001)
+    final = bounded_mean_one_weights(raw, 0.5, 2.0)
+    normalized_ess = final.sum().square() / (final.numel() * final.square().sum())
+    assert float(normalized_ess) >= 2.0 / 3.0 - 1e-6
+
+
+def test_gibbs_mode_is_exactly_the_legacy_solver_output():
+    values = torch.tensor([-3.0, -0.5, 0.0, 4.0, 7.0])
+    legacy, legacy_beta, _ = kl_constrained_allocation(values, 0.4)
+    raw, final, beta, metrics = cmt_allocation(values, 0.4, mode="gibbs")
+    assert torch.equal(raw, legacy)
+    assert torch.equal(final, legacy)
+    assert beta == legacy_beta
+    assert metrics["allocation_kl_pre_bound"] == metrics["allocation_kl_post_bound"]
+
+
+def test_bounded_mode_returns_distinct_raw_and_final_weights():
+    values = torch.tensor([-10.0, -1.0, 0.0, 1.0, 10.0])
+    raw, final, _, metrics = cmt_allocation(
+        values,
+        1.0,
+        mode="bounded_gibbs",
+        weight_min=0.5,
+        weight_max=2.0,
+    )
+    assert not torch.equal(raw, final)
+    assert float(raw.max()) > 2.0
+    assert float(final.max()) <= 2.0
+    assert abs(float(final.mean()) - 1.0) <= 1e-6
+    assert metrics["allocation_kl_post_bound"] <= metrics["allocation_kl_pre_bound"]
+
+
+def test_bounded_scaling_is_global_not_independently_normalized_per_rank():
+    raw_global = torch.tensor([0.1, 0.1, 0.1, 3.7])
+    final_global = bounded_mean_one_weights(raw_global, 0.5, 2.0)
+    assert abs(float(final_global.mean()) - 1.0) <= 1e-6
+    # A correct global solve does not force each artificial rank shard to mean 1.
+    assert not torch.isclose(final_global[:2].mean(), torch.tensor(1.0), atol=1e-6)
+    assert not torch.isclose(final_global[2:].mean(), torch.tensor(1.0), atol=1e-6)
+
+
+def test_bounded_allocation_rejects_invalid_bounds_and_infeasible_zero_support():
+    with pytest.raises(ValueError, match="0 <= min <= 1 <= max"):
+        bounded_mean_one_weights(torch.ones(3), 1.1, 2.0)
+    with pytest.raises(ValueError, match="No scale c"):
+        bounded_mean_one_weights(torch.tensor([0.0, 0.0, 0.0, 4.0]), 0.5, 2.0)
+
+
+def test_tanh_correction_zero_sign_bound_and_small_signal_limit():
+    gain = torch.tensor([2.0, 2.0, 2.0, 2.0])
+    raw = torch.tensor([0.0, -100.0, 100.0, 2.0e-5])
+    robust, learning, kappa, _ = robust_cmt_correction(gain, raw, mode="tanh_q99")
+    assert robust[0] == 0
+    assert torch.equal(torch.sign(robust), torch.sign(raw))
+    assert bool((robust.abs() <= kappa + 1e-6).all())
+    assert torch.isclose(robust[-1], raw[-1], rtol=1e-5, atol=1e-9)
+    assert torch.allclose(learning, gain + robust)
+
+
+def test_none_correction_preserves_raw_score_exactly():
+    gain = torch.tensor([0.1, 3.0, 2.0])
+    raw = torch.tensor([-5.0, 0.0, 7.0])
+    robust, learning, _, _ = robust_cmt_correction(gain, raw, mode="none")
+    assert torch.equal(robust, raw)
+    assert torch.equal(learning, gain + raw)
+
+
+def test_direct_bounded_solver_is_finite_mean_one_bounded_and_monotone():
+    values = torch.tensor([-1.0e30, -1.0, 0.0, 0.5, 3.0, 1.0e30], dtype=torch.float64)
+    weights, beta, log_c, status, _ = direct_bounded_gibbs_allocation(
+        values, 0.02, 0.5, 2.0
+    )
+    assert status == "kl_active"
+    assert torch.isfinite(weights).all()
+    assert abs(float(weights.double().mean()) - 1.0) <= 1e-6
+    assert float(weights.min()) >= 0.5 - 1e-6
+    assert float(weights.max()) <= 2.0 + 1e-6
+    assert float((weights.double() * weights.double().log()).mean()) <= 0.02 + 1e-6
+    order = torch.argsort(values, stable=True)
+    assert bool((weights[order][1:] >= weights[order][:-1]).all())
+    reconstructed = torch.exp(
+        (log_c + beta * values.double()).clamp(math.log(0.5), math.log(2.0))
+    )
+    assert torch.allclose(weights.double(), reconstructed, atol=1e-6, rtol=1e-6)
+
+
+def test_direct_bounded_solver_constant_and_zero_kl_are_uniform():
+    constant, *_ = direct_bounded_gibbs_allocation(
+        torch.full((9,), 42.0), 0.02, 0.5, 2.0
+    )
+    zero_kl, *_ = direct_bounded_gibbs_allocation(torch.arange(9.0), 0.0, 0.5, 2.0)
+    assert torch.equal(constant, torch.ones(9))
+    assert torch.equal(zero_kl, torch.ones(9))
+
+
+def test_direct_bounded_solver_large_target_returns_box_optimum():
+    values = torch.arange(7.0)
+    weights, beta, _, status, maximum_kl = direct_bounded_gibbs_allocation(
+        values, 10.0, 0.5, 2.0
+    )
+    assert status == "box_optimal_kl_inactive"
+    assert beta == float("inf")
+    assert abs(float(weights.mean()) - 1.0) <= 1e-6
+    assert float((weights.double() * weights.double().log()).mean()) == pytest.approx(
+        maximum_kl
+    )
+
+
+def test_direct_bounded_solution_is_not_posthoc_clipped_unbounded_gibbs():
+    values = torch.tensor([-5.0, -1.0, -0.2, 0.0, 0.3, 1.0, 9.0])
+    raw, _, _ = kl_constrained_allocation(values, 0.08)
+    posthoc = bounded_mean_one_weights(raw, 0.5, 1.4)
+    direct, *_ = direct_bounded_gibbs_allocation(values, 0.08, 0.5, 1.4)
+    assert not torch.allclose(direct, posthoc, rtol=1e-5, atol=1e-6)
+
+
+def test_direct_mode_keeps_unbounded_reference_diagnostic_only():
+    values = torch.tensor([-3.0, 0.0, 1.0, 8.0])
+    raw, final, _, metrics = cmt_allocation(
+        values,
+        0.5,
+        mode="direct_bounded_gibbs",
+        weight_min=0.5,
+        weight_max=2.0,
+        final_epsilon=0.02,
+    )
+    expected_raw, _, _ = kl_constrained_allocation(values, 0.02)
+    assert torch.equal(raw, expected_raw)
+    assert not torch.equal(raw, final)
+    assert metrics["allocation_kl_target"] == 0.02
+    assert metrics["allocation_solver_status"] == "kl_active"
+
+
+def test_direct_bounded_allocation_rejects_zero_lower_bound():
+    with pytest.raises(ValueError, match="weight_min > 0"):
+        direct_bounded_gibbs_allocation(torch.arange(3.0), 0.02, 0.0, 2.0)

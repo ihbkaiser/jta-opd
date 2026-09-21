@@ -34,6 +34,17 @@ selector:
   # Weights retain full support and are normalized to mean one within each
   # global PPO group (one allocation == one optimizer update).
   cmt_allocation_kl: 0.5
+  # "gibbs" is byte-for-byte the legacy allocation. "bounded_gibbs" first
+  # computes that raw solution, then solves clip(c*w_raw, min, max) with mean 1.
+  cmt_allocation_mode: gibbs
+  cmt_weight_min: 0.5
+  cmt_weight_max: 2.0
+  # Optional rollout-global bounded-influence correction. Defaults preserve
+  # the historical CMT score exactly.
+  cmt_correction_mode: none
+  cmt_correction_quantile: 0.99
+  # Used only by direct_bounded_gibbs; legacy modes keep cmt_allocation_kl.
+  cmt_final_allocation_kl: 0.02
   # gamma=1 is the primary finite-response estimand: no artificial time
   # preference.  Lambda exposes (rather than hides) the relative value assigned
   # to unlocking one unit of downstream local learning opportunity.
