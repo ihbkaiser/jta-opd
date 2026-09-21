@@ -6,6 +6,7 @@ experiment:
 # Requested teacher; student/data/optimizer/three epochs inherit canonical CMT.
 models:
   teacher_path: models/Qwen3-4B
+  student_path: models/Qwen3-1.7B
 
 rollout:
   num_responses: 1

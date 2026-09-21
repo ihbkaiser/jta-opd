@@ -5,6 +5,9 @@
 The per-step locality run uses Qwen3-4B as teacher, Qwen3-1.7B as student,
 Competition-MATH train/test, and three epochs by default:
 
+The default storage-relative model paths are `models/Qwen3-4B` and
+`models/Qwen3-1.7B`; this diagnostic does not use the Base student checkpoint.
+
 ```bash
 bash scripts/train_cmt_locality_b200.sh
 ```

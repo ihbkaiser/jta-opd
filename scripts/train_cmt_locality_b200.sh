@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Locality diagnostics are a CMT-scored, uniformly allocated measurement run.
 export CMT_CONFIG="${CMT_CONFIG:-${SCRIPT_DIR}/../configs/qwen3_b200_cmt_locality.yaml}"
 export TEACHER_MODEL="${TEACHER_MODEL:-${TEACHER_MODEL_PATH:-models/Qwen3-4B}}"
-export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-nlp/tungdd11/stable-on-policy-distillation/OPD/model/Qwen3-1.7B-Base}}"
+export STUDENT_MODEL="${STUDENT_MODEL:-${STUDENT_MODEL_PATH:-models/Qwen3-1.7B}}"
 export TRAIN_DATASET="${TRAIN_DATASET:-competition_math}"
 export NUM_EPOCHS="${NUM_EPOCHS:-${EPOCHS:-3}}"
 export NUM_RESPONSES=1
