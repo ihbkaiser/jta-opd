@@ -26,8 +26,21 @@ def reverse_kl_on_fixed_support(
     if student_log_probs.ndim < 2:
         raise ValueError("Candidate log-probabilities require a support dimension")
     support = support_mask.detach().bool()
-    if bool(support.sum(dim=-1).eq(0).any()):
-        raise ValueError("Every state must retain at least one support candidate")
+    state_valid = (
+        torch.ones(support.shape[:-1], dtype=torch.bool, device=support.device)
+        if valid_mask is None
+        else valid_mask.detach().bool()
+    )
+    if state_valid.shape != support.shape[:-1]:
+        raise ValueError("valid_mask must align with state dimensions")
+    empty = support.sum(dim=-1).eq(0)
+    if bool((empty & state_valid).any()):
+        raise ValueError("Every valid state must retain at least one support candidate")
+    # Padding rows have no support by construction. Give them a temporary
+    # singleton so normalization stays finite, then zero them below.
+    if bool(empty.any()):
+        support = support.clone()
+        support[..., 0] |= empty
     student = _detached_float(student_log_probs).masked_fill(~support, -torch.inf)
     teacher = _detached_float(teacher_log_probs).masked_fill(~support, -torch.inf)
     student = student - torch.logsumexp(student, dim=-1, keepdim=True)
@@ -40,9 +53,7 @@ def reverse_kl_on_fixed_support(
     )
     result = terms.sum(dim=-1)
     if valid_mask is not None:
-        if valid_mask.shape != result.shape:
-            raise ValueError("valid_mask must align with state dimensions")
-        result = torch.where(valid_mask.detach().bool(), result, torch.zeros_like(result))
+        result = torch.where(state_valid, result, torch.zeros_like(result))
     return result.detach()
 
 
