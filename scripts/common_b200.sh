@@ -79,7 +79,7 @@ OPD_CONFIG="${REPO_DIR}/configs/qwen3_b200_opd.yaml"
 TA_CONFIG="${REPO_DIR}/configs/qwen3_b200_ta.yaml"
 RAC_CONFIG="${REPO_DIR}/configs/qwen3_b200_rac.yaml"
 PGT_CONFIG="${REPO_DIR}/configs/qwen3_b200_pgt.yaml"
-CMT_CONFIG="${REPO_DIR}/configs/qwen3_b200_cmt.yaml"
+CMT_CONFIG="${CMT_CONFIG:-${REPO_DIR}/configs/qwen3_b200_cmt.yaml}"
 GRPO_CONFIG="${REPO_DIR}/configs/qwen3_b200_grpo.yaml"
 IW_CONFIG="${REPO_DIR}/configs/qwen3_b200_iw.yaml"
 

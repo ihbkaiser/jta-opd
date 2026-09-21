@@ -1,0 +1,35 @@
+_base_: qwen3_b200_cmt.yaml
+
+experiment:
+  output_dir: outputs/cmt_locality
+
+# Requested teacher; student/data/optimizer/three epochs inherit canonical CMT.
+models:
+  teacher_path: models/Qwen3-4B
+
+rollout:
+  num_responses: 1
+
+analysis:
+  locality_probe:
+    enabled: true
+    training_allocation: uniform
+    g_bins: 10
+    future_horizons: [8, 16, 32]
+    future_gamma: 1.0
+    main_future_horizon: 32
+    conditioning_quantiles: [0.4, 0.6]
+    token_sample_size: 2048
+    matched_pairs_per_step: 8
+    fail_on_prompt_overlap: true
+    other_id:
+      enabled: true
+      benchmark_name: Competition-MATH
+      num_prompts: 32
+      max_new_tokens: 2048
+      seed: 20260921
+      fixed_support: true
+
+logging:
+  token_score_stats_enabled: true
+  token_score_interval: 1

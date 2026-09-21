@@ -1,5 +1,9 @@
 # Pure OPD vs TA-OPD vs CMT vs GRPO trên NVIDIA B200
 
+Per-step CMT locality analysis is available through
+`scripts/train_cmt_locality_b200.sh`; see "CMT locality diagnostic" in
+[`RUN_B200.md`](RUN_B200.md).
+
 Project độc lập này hỗ trợ bốn baseline chính trên cùng student Qwen3-1.7B-Base:
 
 - **OPD thuần**: mọi valid response token có uniform weight `1`.

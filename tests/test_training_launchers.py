@@ -22,6 +22,38 @@ TRAIN_SCRIPTS = (
 
 
 class TrainingLauncherTests(unittest.TestCase):
+    def test_cmt_locality_launcher_and_config_use_requested_protocol(self):
+        config = load_config(
+            REPO_ROOT / "configs" / "qwen3_b200_cmt_locality.yaml"
+        )
+        locality = config["analysis"]["locality_probe"]
+        self.assertEqual(config["models"]["teacher_path"], "models/Qwen3-4B")
+        self.assertIn("Qwen3-1.7B", config["models"]["student_path"])
+        self.assertIn("competition_math", config["data"]["path"])
+        self.assertEqual(config["training"]["epochs"], 3)
+        self.assertEqual(config["rollout"]["num_responses"], 1)
+        self.assertEqual(
+            config["training"]["ppo_mini_batch_size"],
+            config["rollout"]["batch_size"],
+        )
+        self.assertTrue(locality["enabled"])
+        self.assertEqual(locality["training_allocation"], "uniform")
+        self.assertEqual(locality["future_horizons"], [8, 16, 32])
+        self.assertEqual(
+            locality["other_id"]["benchmark_name"], "Competition-MATH"
+        )
+        launcher = REPO_ROOT / "scripts" / "train_cmt_locality_b200.sh"
+        content = launcher.read_text(encoding="utf-8")
+        for variable in (
+            "LOCALITY_PROBE_PROMPTS",
+            "LOCALITY_PROBE_MAX_NEW_TOKENS",
+            "LOCALITY_FUTURE_HORIZONS",
+            "LOCALITY_TOKEN_SAMPLE_SIZE",
+            "LOCALITY_MATCHED_PAIRS",
+        ):
+            self.assertIn(variable, content)
+        self.assertIn("models/Qwen3-4B", content)
+        self.assertIn("Qwen3-1.7B-Base", content)
     def test_opd_then_rac_workflow_has_exact_sequential_stages(self):
         path = REPO_ROOT / "scripts/train_opd_reeval_then_rac_reeval_b200.sh"
         content = path.read_text(encoding="utf-8")

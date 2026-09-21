@@ -1,5 +1,35 @@
 # Full B200 runbook
 
+## CMT locality diagnostic
+
+The per-step locality run uses Qwen3-4B as teacher, Qwen3-1.7B as student,
+Competition-MATH train/test, and three epochs by default:
+
+```bash
+bash scripts/train_cmt_locality_b200.sh
+```
+
+It keeps CMT/PGT scoring but trains every valid response token with weight one.
+`rollout.batch_size` and `training.ppo_mini_batch_size` are both 64 and
+`num_responses=1`, so every optimizer step consumes a fresh on-policy rollout.
+Dense artifacts are written under `<output>/analysis/locality/`; the fixed
+held-out cache is under `<output>/analysis/other_id_probe/`.
+
+Runtime controls are `LOCALITY_PROBE_PROMPTS`,
+`LOCALITY_PROBE_MAX_NEW_TOKENS`, `LOCALITY_FUTURE_HORIZONS`,
+`LOCALITY_TOKEN_SAMPLE_SIZE`, and `LOCALITY_MATCHED_PAIRS`. A two-step smoke
+run is:
+
+```bash
+MAX_STEPS=2 BATCH_SIZE=4 PPO_MINI_BATCH_SIZE=4 \
+LOCALITY_PROBE_PROMPTS=4 LOCALITY_FUTURE_HORIZONS='[8,16]' \
+bash scripts/train_cmt_locality_b200.sh
+```
+
+The launcher rejects train/test prompt overlap by default. Full task evaluation
+continues at the canonical interval; dense OTHER-ID uses fixed step-0
+Competition-MATH test states.
+
 ## Fresh environment
 
 ```bash
