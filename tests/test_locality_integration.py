@@ -9,7 +9,11 @@ from b200_experiment.distributed import DistributedContext
 from b200_experiment.opd_core import topk_reference_from_logits
 from b200_experiment.scoring import RolloutBatch
 from b200_experiment.tensorboard_logging import locality_tensorboard_metrics
-from b200_experiment.trainer import _opd_train_step, locality_uniform_position_weights
+from b200_experiment.trainer import (
+    _StepSideEffectGate,
+    _opd_train_step,
+    locality_uniform_position_weights,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -82,6 +86,21 @@ def test_disabled_locality_returns_no_training_override():
     valid = torch.ones((2, 2), dtype=torch.bool)
 
     assert locality_uniform_position_weights(config, valid) is None
+
+
+def test_locality_step_side_effects_wait_until_analysis_is_durable():
+    events = []
+    gate = _StepSideEffectGate(defer=True)
+
+    gate.submit(7, {"loss": 1.0}, lambda step, _metrics: events.append(step))
+
+    assert events == []
+    assert gate.pending_steps == (7,)
+
+    gate.flush(lambda step, _metrics: events.append(step), expected_count=1)
+
+    assert events == [7]
+    assert gate.pending_steps == ()
 
 
 def test_locality_tensorboard_metrics_include_deciles_other_id_future_and_timing():

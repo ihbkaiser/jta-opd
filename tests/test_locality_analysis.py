@@ -9,9 +9,19 @@ from b200_experiment.locality_analysis import (
     correlation_summary,
     decile_summary,
     finite_horizon_successor_gain,
+    quantile_band_mask,
     realized_self_gain,
     reverse_kl_on_fixed_support,
 )
+
+
+def test_quantile_band_mask_accepts_float32_values_without_dtype_mismatch():
+    values = torch.arange(10.0, dtype=torch.float32)
+
+    mask = quantile_band_mask(values, (0.4, 0.6))
+
+    assert mask.dtype == torch.bool
+    assert torch.nonzero(mask, as_tuple=False).squeeze(-1).tolist() == [4, 5]
 
 
 def test_reverse_kl_matches_hand_calculation_on_masked_fixed_support():

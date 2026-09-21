@@ -86,6 +86,24 @@ def assign_global_quantile_bins(
 
 
 @torch.inference_mode()
+def quantile_band_mask(
+    values: torch.Tensor, bounds: tuple[float, float]
+) -> torch.Tensor:
+    """Select an inclusive quantile band without dtype/device mismatches."""
+    flat = _detached_float(values).reshape(-1)
+    if flat.numel() == 0:
+        raise ValueError("Cannot select a quantile band from an empty tensor")
+    low, high = map(float, bounds)
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError("quantile bounds must satisfy 0 <= low < high <= 1")
+    levels = torch.tensor(
+        [low, high], device=flat.device, dtype=torch.float64
+    )
+    lower, upper = torch.quantile(flat.double(), levels)
+    return (flat.ge(lower) & flat.le(upper)).reshape(values.shape).detach()
+
+
+@torch.inference_mode()
 def finite_horizon_successor_gain(
     realized_gain: torch.Tensor,
     valid_mask: torch.Tensor,
@@ -271,17 +289,11 @@ def conditional_future_summary(
     if int(main_horizon) not in future_gains:
         raise ValueError("main_horizon must be present in future_gains")
 
-    def band_mask(bounds: tuple[float, float]) -> torch.Tensor:
-        lower, upper = torch.quantile(
-            local.double(), torch.tensor(bounds, device=local.device, dtype=torch.float64)
-        )
-        return local.ge(lower) & local.le(upper)
-
     band = (low, high)
-    mask = band_mask(band)
+    mask = quantile_band_mask(local, band)
     if int(mask.sum()) < int(minimum_count) and band == (0.4, 0.6):
         band = (0.35, 0.65)
-        mask = band_mask(band)
+        mask = quantile_band_mask(local, band)
     summary: dict[str, Any] = {
         "conditioning_band": [band[0], band[1]],
         "count": int(mask.sum()),

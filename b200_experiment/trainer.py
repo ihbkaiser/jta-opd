@@ -75,6 +75,7 @@ from .locality_analysis import (
     correlation_summary,
     decile_summary,
     finite_horizon_successor_gain,
+    quantile_band_mask,
     realized_self_gain,
     reverse_kl_on_fixed_support,
 )
@@ -181,6 +182,44 @@ def locality_uniform_position_weights(
     if not bool(settings["enabled"]):
         return None
     return valid_mask.detach().float()
+
+
+class _StepSideEffectGate:
+    """Delay checkpoint/evaluation side effects until analysis is durable."""
+
+    def __init__(self, *, defer: bool) -> None:
+        self._defer = bool(defer)
+        self._pending: list[tuple[int, dict[str, float]]] = []
+
+    @property
+    def pending_steps(self) -> tuple[int, ...]:
+        return tuple(step for step, _metrics in self._pending)
+
+    def submit(
+        self,
+        step: int,
+        metrics: dict[str, float],
+        callback: Callable[[int, dict[str, float]], None],
+    ) -> None:
+        if self._defer:
+            self._pending.append((int(step), dict(metrics)))
+            return
+        callback(int(step), metrics)
+
+    def flush(
+        self,
+        callback: Callable[[int, dict[str, float]], None],
+        *,
+        expected_count: int,
+    ) -> None:
+        if len(self._pending) != int(expected_count):
+            raise AssertionError(
+                f"Expected {expected_count} deferred optimizer steps, "
+                f"found {len(self._pending)}"
+            )
+        pending, self._pending = self._pending, []
+        for step, metrics in pending:
+            callback(step, metrics)
 
 
 def seed_everything(seed: int) -> None:
@@ -4737,8 +4776,13 @@ def run_training(
         evaluation_sources: dict[int, tuple[Path, bool]] = {}
         save_checkpoints = bool(training.get("save_checkpoints", True))
         save_interval = int(training.get("save_interval", 100))
+        step_side_effect_gate = _StepSideEffectGate(
+            defer=bool(locality_settings["enabled"])
+        )
 
-        def after_optimizer_step(current_step: int, _metrics: dict[str, float]) -> None:
+        def complete_optimizer_step(
+            current_step: int, _metrics: dict[str, float]
+        ) -> None:
             should_evaluate = should_run_training_evaluation(
                 current_step, max_steps, training_eval_settings
             )
@@ -4783,6 +4827,11 @@ def run_training(
                 evaluation_sources[current_step] = (evaluation_path, temporary)
             if distributed.is_main:
                 progress.update(1)
+
+        def after_optimizer_step(current_step: int, metrics: dict[str, float]) -> None:
+            step_side_effect_gate.submit(
+                current_step, metrics, complete_optimizer_step
+            )
 
         train_metrics = _opd_train_step(
             training_student,
@@ -4974,10 +5023,9 @@ def run_training(
                     sample_size=int(locality_settings["token_sample_size"]),
                 )
                 band_low, band_high = future_summary["conditioning_band"]
-                thresholds = torch.quantile(
-                    g_cpu.double(), torch.tensor([band_low, band_high])
+                band_mask = quantile_band_mask(
+                    g_cpu, (float(band_low), float(band_high))
                 )
-                band_mask = g_cpu.ge(thresholds[0]) & g_cpu.le(thresholds[1])
                 band_indices = torch.nonzero(band_mask, as_tuple=False).squeeze(-1)
                 main_horizon = int(locality_settings["main_future_horizon"])
                 matched_pairs = build_matched_pairs(
@@ -5003,6 +5051,10 @@ def run_training(
                 locality_g,
                 locality_kl_pre,
             )
+        step_side_effect_gate.flush(
+            complete_optimizer_step,
+            expected_count=1 if bool(locality_settings["enabled"]) else 0,
+        )
         if method == "cmt":
             local_cmt_weights = train_metrics.pop("allocated_position_weights")
             local_cmt_raw_weights = train_metrics.pop("allocated_raw_position_weights")

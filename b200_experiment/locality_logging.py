@@ -75,6 +75,18 @@ class LocalityLogger:
         removed = len(rows) - len(retained)
         if removed:
             _atomic_jsonl(self.metrics_path, retained)
+        for directory_name in ("token_samples", "matched_pairs"):
+            directory = self.root / directory_name
+            if not directory.is_dir():
+                continue
+            for path in directory.glob("step-*.jsonl.gz"):
+                step_text = path.name.removeprefix("step-").removesuffix(
+                    ".jsonl.gz"
+                )
+                if step_text.isdigit() and int(step_text) > int(checkpoint_step):
+                    path.unlink()
+            for temporary in directory.glob("*.tmp"):
+                temporary.unlink()
         return removed
 
     def write_metrics(self, row: dict[str, Any]) -> Path:

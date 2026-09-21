@@ -164,6 +164,13 @@ def test_locality_logger_upserts_steps_and_truncates_future_rows(tmp_path: Path)
     logger.write_metrics({"step": 1, "value": "old"})
     logger.write_metrics({"step": 2, "value": "future"})
     logger.write_metrics({"step": 1, "value": "new"})
+    for step in (1, 2):
+        logger.write_token_samples(
+            step,
+            [{"flat_index": 0, "g_decile": 0}],
+            sample_size=1,
+        )
+        logger.write_matched_pairs(step, [{"pair": step}])
 
     rows = [json.loads(line) for line in logger.metrics_path.read_text().splitlines()]
     assert rows == [{"step": 1, "value": "new"}, {"step": 2, "value": "future"}]
@@ -171,6 +178,10 @@ def test_locality_logger_upserts_steps_and_truncates_future_rows(tmp_path: Path)
     resumed = LocalityLogger(tmp_path, resume_step=1)
     rows = [json.loads(line) for line in resumed.metrics_path.read_text().splitlines()]
     assert rows == [{"step": 1, "value": "new"}]
+    assert (resumed.root / "token_samples" / "step-000001.jsonl.gz").is_file()
+    assert not (resumed.root / "token_samples" / "step-000002.jsonl.gz").exists()
+    assert (resumed.root / "matched_pairs" / "step-000001.jsonl.gz").is_file()
+    assert not (resumed.root / "matched_pairs" / "step-000002.jsonl.gz").exists()
 
 
 def test_locality_logger_serializes_degenerate_statistics_as_null(tmp_path: Path):
