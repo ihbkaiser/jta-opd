@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+plt.switch_backend("Agg")
 
 
 BLUE = "#0072B2"

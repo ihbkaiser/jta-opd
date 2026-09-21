@@ -126,6 +126,7 @@ from .resume import (
     validate_resume_config,
 )
 from .scoring import (
+    RolloutBatch,
     cuda_sync,
     generate_on_policy,
     position_ids_from_mask,

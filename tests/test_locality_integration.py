@@ -1,4 +1,3 @@
-import copy
 from pathlib import Path
 
 import pytest
@@ -9,9 +8,8 @@ from b200_experiment.config import load_config, validate_locality_probe_config
 from b200_experiment.distributed import DistributedContext
 from b200_experiment.opd_core import topk_reference_from_logits
 from b200_experiment.scoring import RolloutBatch
-from b200_experiment.trainer import _opd_train_step, locality_uniform_position_weights
 from b200_experiment.tensorboard_logging import locality_tensorboard_metrics
-
+from b200_experiment.trainer import _opd_train_step, locality_uniform_position_weights
 
 ROOT = Path(__file__).resolve().parents[1]
 

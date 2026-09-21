@@ -3,8 +3,9 @@ from __future__ import annotations
 import gzip
 import json
 import math
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 def _json_safe(value: Any) -> Any:

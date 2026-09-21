@@ -4,9 +4,10 @@ import hashlib
 import json
 import random
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -122,7 +123,7 @@ class FrozenStateProbe:
         scored_support: Any,
         *,
         metadata: list[dict[str, Any]],
-    ) -> "FrozenStateProbe":
+    ) -> FrozenStateProbe:
         required = (
             "candidate_ids",
             "support_mask",
@@ -145,7 +146,7 @@ class FrozenStateProbe:
             metadata=[dict(item) for item in metadata],
         )
 
-    def cpu(self) -> "FrozenStateProbe":
+    def cpu(self) -> FrozenStateProbe:
         return FrozenStateProbe(
             **{name: getattr(self, name).detach().cpu() for name in self.tensor_fields()},
             prompt_width=int(self.prompt_width),
@@ -167,7 +168,7 @@ class FrozenStateProbe:
         return destination
 
     @classmethod
-    def load(cls, path: str | Path) -> "FrozenStateProbe":
+    def load(cls, path: str | Path) -> FrozenStateProbe:
         payload = torch.load(Path(path), map_location="cpu", weights_only=False)
         if int(payload.pop("schema_version", 0)) != 1:
             raise ValueError("Unsupported frozen probe schema")
