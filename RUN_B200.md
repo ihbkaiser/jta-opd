@@ -145,15 +145,17 @@ MAX_STEPS=2 \
 SAVE_INTERVAL=1 \
 ONE_STEP_KL_PROBE_PARENT_STATE_COUNT=8 \
 ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT=2 \
+ONE_STEP_KL_PROBE_INTERVAL=1 \
 bash scripts/train_cmt_b200.sh
 
 wc -l outputs/cmt_kl_probe_smoke/cmt_opd/one_step_kl_probe/one_step_kl_probe.jsonl
 ```
 
 Yêu cầu smoke: JSONL/CSV có đúng hai step duy nhất, mỗi row có successor hash và số state đúng,
-mọi KL/delta/standard-error hữu hạn, và log train vẫn chỉ tăng hai optimizer step thật. Với full
-run, giữ default `64 x 4 = 256` successor states. Probe không generate thêm vLLM rollout nhưng vẫn
-tốn một uniform shadow update, một forward sampling successor và các lượt student/teacher scoring.
+mọi KL/delta/standard-error hữu hạn, và log train vẫn chỉ tăng hai optimizer step thật. Full run mặc
+định probe mỗi 10 optimizer step với `64 x 1 = 64` successor states và score micro-batch 8. Probe
+không generate thêm vLLM rollout nhưng tại mỗi step được probe vẫn tốn một uniform shadow update,
+một forward sampling successor và các lượt student/teacher scoring.
 Không dùng paired gap quan sát được để tune chính run đã khóa này.
 
 `BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` là global, không đổi theo world size. Ví dụ PPO batch 16

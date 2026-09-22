@@ -173,6 +173,22 @@ class TrainingLauncherTests(unittest.TestCase):
             "ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE",
         ):
             self.assertIn(f"export {variable}=", launcher)
+        self.assertIn(
+            'ONE_STEP_KL_PROBE_PARENT_STATE_COUNT:-64}', launcher
+        )
+        self.assertIn(
+            'ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT:-1}', launcher
+        )
+        self.assertIn('ONE_STEP_KL_PROBE_INTERVAL:-10}', launcher)
+        self.assertIn(
+            'ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE:-8}', launcher
+        )
+        config = load_config(REPO_ROOT / "configs" / "qwen3_b200_cmt.yaml")
+        probe = config["one_step_kl_probe"]
+        self.assertEqual(probe["parent_state_count"], 64)
+        self.assertEqual(probe["successors_per_parent"], 1)
+        self.assertEqual(probe["interval_steps"], 10)
+        self.assertEqual(probe["score_micro_batch_size"], 8)
         common = (REPO_ROOT / "scripts" / "common_b200.sh").read_text(encoding="utf-8")
         for config_key in (
             "enabled",

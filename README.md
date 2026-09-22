@@ -242,9 +242,10 @@ giá trị Step-0 đã căn chỉnh khi so sánh OPD với CMT-OPD. Evaluator b�
 
 ## Paired one-step successor-state KL probe cho CMT
 
-Launcher CMT mặc định chọn 64 parent states từ rollout huấn luyện hiện tại ở mỗi optimizer step.
-Student pre-update được rescore tại mỗi parent và sample 4 action từ full-vocabulary policy, tạo
-256 successor states. Tập successor này được khóa cho cả Uniform và CMT; Student Top-16
+Launcher CMT mặc định chạy probe mỗi 10 optimizer step và chọn 64 parent states từ rollout huấn
+luyện hiện tại ở mỗi step được probe. Student pre-update được rescore tại mỗi parent và sample một
+action từ full-vocabulary policy, tạo 64 successor states. Tập successor này được khóa cho cả
+Uniform và CMT; Student Top-16
 pre-update tại từng successor là support chung để chấm teacher và hai model sau update. Probe
 không generate thêm rollout bằng vLLM. `state_age_steps` cho biết parent rollout đã cũ bao nhiêu
 PPO update (`0` ở group đầu, sau đó `1`, `2`, `3` với cấu hình CMT mặc định).
@@ -261,9 +262,10 @@ Uniform OPD là một shadow update trên đúng PPO group/reference/clipping c�
 1 cho mọi valid token. Model, optimizer và RNG được snapshot ra CPU, chạy shadow, rồi restore và
 kiểm tra chính xác trước khi CMT update thật chạy. Shadow không tăng step, không gọi callback và
 không tạo checkpoint. Kết quả nằm trong `one_step_kl_probe/one_step_kl_probe.jsonl` và `.csv`, một
-row duy nhất cho mỗi `optimizer_step`; resume tự rewind row sau checkpoint. Log gồm mean và
+row duy nhất cho mỗi optimizer step được probe; resume tự rewind row sau checkpoint. Log gồm mean và
 successor-level standard error cho `delta_uniform`, `delta_cmt` và `paired_gap`, cùng hash của đúng
-256 successor states. Đây là rollout-batch diagnostic, không phải held-out/test generalization.
+64 successor states. Probe scoring dùng micro-batch 8 mặc định. Đây là rollout-batch diagnostic,
+không phải held-out/test generalization.
 
 Các override chính: `ONE_STEP_KL_PROBE_ENABLED`,
 `ONE_STEP_KL_PROBE_PARENT_STATE_COUNT`, `ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT`,

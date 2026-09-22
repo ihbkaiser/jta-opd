@@ -14,15 +14,15 @@ class OneStepKLProbeConfig:
     enabled: bool = False
     state_source: str = "training_rollout_successors"
     parent_state_count: int = 64
-    successors_per_parent: int = 4
+    successors_per_parent: int = 1
     seed: int = 20260922
-    interval_steps: int = 1
+    interval_steps: int = 10
     top_k: int = OPD_LOSS_TOP_K
     metric: str = "conditional_reverse_kl"
     failure_policy: str = "error"
     artifact_subdir: str = "one_step_kl_probe"
     sampling_temperature: float = 1.0
-    score_micro_batch_size: int = 1
+    score_micro_batch_size: int = 8
 
     @classmethod
     def from_mapping(
@@ -35,15 +35,15 @@ class OneStepKLProbeConfig:
                 values.get("state_source", "training_rollout_successors")
             ),
             parent_state_count=int(values.get("parent_state_count", 64)),
-            successors_per_parent=int(values.get("successors_per_parent", 4)),
+            successors_per_parent=int(values.get("successors_per_parent", 1)),
             seed=int(values.get("seed", 20260922)),
-            interval_steps=int(values.get("interval_steps", 1)),
+            interval_steps=int(values.get("interval_steps", 10)),
             top_k=int(values.get("top_k", OPD_LOSS_TOP_K)),
             metric=str(values.get("metric", "conditional_reverse_kl")),
             failure_policy=str(values.get("failure_policy", "error")),
             artifact_subdir=str(values.get("artifact_subdir", "one_step_kl_probe")),
             sampling_temperature=float(values.get("sampling_temperature", 1.0)),
-            score_micro_batch_size=int(values.get("score_micro_batch_size", 1)),
+            score_micro_batch_size=int(values.get("score_micro_batch_size", 8)),
         )
         config.validate(method=method)
         return config

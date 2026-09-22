@@ -55,17 +55,18 @@ selector:
   cmt_full_vocab_diagnostics: false
 
 # Exact paired diagnostic: each real CMT update is compared with a restorable
-# uniform-OPD shadow update on 64 rollout parent states x 4 frozen successors.
+# uniform-OPD shadow update on 64 rollout parent states x 1 frozen successor.
+# The diagnostic runs every 10 optimizer steps to bound training overhead.
 one_step_kl_probe:
   enabled: true
   state_source: training_rollout_successors
   parent_state_count: 64
-  successors_per_parent: 4
+  successors_per_parent: 1
   seed: 20260922
-  interval_steps: 1
+  interval_steps: 10
   top_k: 16
   metric: conditional_reverse_kl
   failure_policy: error
   artifact_subdir: one_step_kl_probe
   sampling_temperature: 1.0
-  score_micro_batch_size: 1
+  score_micro_batch_size: 8

@@ -21,28 +21,19 @@ def test_probe_config_rejects_enabled_non_cmt_method():
 
 def test_probe_config_resolves_requested_production_defaults():
     resolved = OneStepKLProbeConfig.from_mapping(
-        {
-            "enabled": True,
-            "state_source": "training_rollout_successors",
-            "parent_state_count": 64,
-            "successors_per_parent": 4,
-            "seed": 20260922,
-            "interval_steps": 1,
-            "top_k": 16,
-            "metric": "conditional_reverse_kl",
-            "failure_policy": "error",
-            "artifact_subdir": "one_step_kl_probe",
-        },
+        {"enabled": True},
         method="cmt",
     )
     assert resolved.enabled is True
     assert resolved.parent_state_count == 64
-    assert resolved.successors_per_parent == 4
+    assert resolved.successors_per_parent == 1
     assert resolved.state_source == "training_rollout_successors"
     assert resolved.seed == 20260922
     assert resolved.top_k == 16
-    assert resolved.should_probe(1)
-    assert resolved.should_probe(177)
+    assert resolved.score_micro_batch_size == 8
+    assert not resolved.should_probe(1)
+    assert resolved.should_probe(10)
+    assert resolved.should_probe(180)
 
 
 @pytest.mark.parametrize(
