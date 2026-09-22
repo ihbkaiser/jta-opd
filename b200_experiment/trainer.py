@@ -1896,6 +1896,7 @@ def _opd_train_step_impl(
         micro_indices = list(indices.split(micro_batch))
         micro_active = list(active_rows.split(micro_batch))
         ppo_valid = objective_valid.index_select(0, indices) & active_rows.unsqueeze(1)
+        real_indices = indices[active_rows]
         allocation_inverse_temperature = 0.0
         allocation_metrics = {
             "allocation_kl_pre_bound": 0.0,
@@ -1965,7 +1966,6 @@ def _opd_train_step_impl(
                 raise AssertionError(
                     "CMT Gibbs weights must have mean one within the PPO group"
                 )
-            real_indices = indices[active_rows]
             allocated_position_weights.index_copy_(
                 0, real_indices, ppo_weights[active_rows]
             )

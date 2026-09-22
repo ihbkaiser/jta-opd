@@ -810,6 +810,46 @@ class DistributedInvariantTests(unittest.TestCase):
             for item in metrics["minibatches"]:
                 self.assertAlmostEqual(item["global_weight_mass"], 64.0, places=4)
 
+    def test_grouped_uniform_shadow_does_not_require_gibbs_allocation(self):
+        rows = torch.tensor(
+            [[1 + index % 7, 2, 3, 4] for index in range(8)], dtype=torch.long
+        )
+        valid = torch.tensor([[True, False]] * 8)
+        rollout = RolloutBatch(
+            input_ids=rows,
+            attention_mask=torch.ones_like(rows),
+            response_ids=rows[:, 2:],
+            valid_mask=valid,
+            rollout_log_probs=torch.zeros((8, 2)),
+            prompt_width=2,
+        )
+        response_indices = [response for _prompt in range(4) for response in range(2)]
+        model = _TinyCausalLM()
+
+        metrics = _opd_train_step(
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.001),
+            rollout,
+            valid.float(),
+            _tiny_reference(model, rollout),
+            _tiny_config(2, 4),
+            torch.device("cpu"),
+            DistributedContext(0, 0, 1, torch.device("cpu")),
+            trajectory_group_ids=response_indices,
+            gibbs_scores=None,
+            gibbs_epsilon=None,
+        )
+
+        self.assertEqual(metrics["optimizer_steps"], 2)
+        self.assertEqual(metrics["gibbs_allocations"], 0)
+        self.assertEqual(
+            [
+                item["response_index_composition"]
+                for item in metrics["minibatches"]
+            ],
+            [{"0": 4}, {"1": 4}],
+        )
+
     def test_direct_bounded_cmt_loss_consumes_final_not_reference_weights(self):
         rows = torch.tensor(
             [[1 + index % 7, 2, 3, 4] for index in range(8)], dtype=torch.long
