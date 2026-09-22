@@ -16,19 +16,26 @@ PROBE_FIELDS = (
     "optimizer_step",
     "rollout_id",
     "ppo_group_index",
-    "benchmark",
-    "subset_size",
-    "heldout_example_hash",
-    "heldout_prefix_hash",
-    "valid_prefix_token_count",
+    "state_age_steps",
+    "state_source",
+    "parent_state_count",
+    "successors_per_parent",
+    "successor_state_count",
+    "sampling_distribution",
+    "sampling_seed",
+    "successor_state_hash",
+    "valid_successor_state_count",
     "top_k",
     "metric",
     "kl_before",
     "kl_after_uniform",
     "kl_after_cmt",
     "delta_uniform",
+    "delta_uniform_standard_error",
     "delta_cmt",
+    "delta_cmt_standard_error",
     "paired_gap",
+    "paired_gap_standard_error",
     "uniform_update_loss",
     "cmt_update_loss",
     "probe_time_sec",
@@ -40,8 +47,12 @@ _INTEGER_FIELDS = {
     "optimizer_step",
     "rollout_id",
     "ppo_group_index",
-    "subset_size",
-    "valid_prefix_token_count",
+    "state_age_steps",
+    "parent_state_count",
+    "successors_per_parent",
+    "successor_state_count",
+    "sampling_seed",
+    "valid_successor_state_count",
     "top_k",
 }
 _FLOAT_FIELDS = {
@@ -49,8 +60,11 @@ _FLOAT_FIELDS = {
     "kl_after_uniform",
     "kl_after_cmt",
     "delta_uniform",
+    "delta_uniform_standard_error",
     "delta_cmt",
+    "delta_cmt_standard_error",
     "paired_gap",
+    "paired_gap_standard_error",
     "uniform_update_loss",
     "cmt_update_loss",
     "probe_time_sec",
@@ -88,8 +102,14 @@ class OneStepKLProbeLogger:
                 raise ValueError(f"Probe field {field} must be an integer")
         if row["optimizer_step"] < 1:
             raise ValueError("Probe optimizer_step must be positive")
-        if row["valid_prefix_token_count"] < 1:
-            raise ValueError("Probe valid_prefix_token_count must be positive")
+        if row["valid_successor_state_count"] < 1:
+            raise ValueError("Probe valid_successor_state_count must be positive")
+        if row["state_age_steps"] < 0:
+            raise ValueError("Probe state_age_steps cannot be negative")
+        if row["successor_state_count"] != (
+            row["parent_state_count"] * row["successors_per_parent"]
+        ):
+            raise ValueError("Probe successor state counts are inconsistent")
         for field in _FLOAT_FIELDS:
             try:
                 value = float(row[field])
@@ -98,6 +118,13 @@ class OneStepKLProbeLogger:
             if not math.isfinite(value):
                 raise ValueError(f"Probe field {field} must be finite")
             row[field] = value
+        for field in (
+            "delta_uniform_standard_error",
+            "delta_cmt_standard_error",
+            "paired_gap_standard_error",
+        ):
+            if row[field] < 0.0:
+                raise ValueError(f"Probe field {field} cannot be negative")
 
         expected = paired_improvement(
             row["kl_before"], row["kl_after_uniform"], row["kl_after_cmt"]

@@ -123,15 +123,15 @@ RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
-CMT launcher đồng thời tạo paired one-step KL log trên 64 bài Competition-MATH test cố định. Có
-thể chạy smoke rẻ hơn trước full run:
+CMT launcher đồng thời tạo paired one-step KL log trên 64 parent states của rollout hiện tại, mỗi
+parent có 4 successor sample từ student pre-update. Có thể chạy smoke rẻ hơn trước full run:
 
 ```bash
 RUN_NAME="cmt_kl_probe_smoke" \
 MAX_STEPS=2 \
 SAVE_INTERVAL=1 \
-ONE_STEP_KL_PROBE_SUBSET_SIZE=4 \
-ONE_STEP_KL_PROBE_MAX_NEW_TOKENS=64 \
+ONE_STEP_KL_PROBE_PARENT_STATE_COUNT=8 \
+ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT=2 \
 ONE_STEP_KL_PROBE_INTERVAL=1 \
 bash scripts/train_cmt_b200.sh
 ```
@@ -143,17 +143,18 @@ RUN_NAME="cmt_kl_probe_smoke" \
 RESUME_FROM_CHECKPOINT="outputs/cmt_kl_probe_smoke/cmt_opd/checkpoint-000001" \
 MAX_STEPS=2 \
 SAVE_INTERVAL=1 \
-ONE_STEP_KL_PROBE_SUBSET_SIZE=4 \
-ONE_STEP_KL_PROBE_MAX_NEW_TOKENS=64 \
+ONE_STEP_KL_PROBE_PARENT_STATE_COUNT=8 \
+ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT=2 \
 bash scripts/train_cmt_b200.sh
 
 wc -l outputs/cmt_kl_probe_smoke/cmt_opd/one_step_kl_probe/one_step_kl_probe.jsonl
 ```
 
-Yêu cầu smoke: manifest/prefix hash không đổi sau resume, JSONL/CSV có đúng hai step duy nhất,
-mọi KL/delta hữu hạn, và log train vẫn chỉ tăng hai optimizer step thật. Với full run, giữ default
-64 bài và response 512 token; chi phí cao vì mỗi step chạy thêm uniform shadow update và held-out
-student/teacher scoring. Không dùng paired gap quan sát được để tune chính run đã khóa này.
+Yêu cầu smoke: JSONL/CSV có đúng hai step duy nhất, mỗi row có successor hash và số state đúng,
+mọi KL/delta/standard-error hữu hạn, và log train vẫn chỉ tăng hai optimizer step thật. Với full
+run, giữ default `64 x 4 = 256` successor states. Probe không generate thêm vLLM rollout nhưng vẫn
+tốn một uniform shadow update, một forward sampling successor và các lượt student/teacher scoring.
+Không dùng paired gap quan sát được để tune chính run đã khóa này.
 
 `BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` là global, không đổi theo world size. Ví dụ PPO batch 16
 được chia thành 16/8/4 real trajectories mỗi GPU trên 1/2/4 GPU. Các rank dùng cùng global PPO

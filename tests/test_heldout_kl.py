@@ -62,10 +62,13 @@ def test_evaluator_freezes_preupdate_student_support_and_reuses_it_after_update(
     reference, before = evaluator.build_reference(
         student, teacher, rollout, prefix_hash="fixed-prefix-hash"
     )
-    after = evaluator.score_student(student, reference)
+    evaluation = evaluator.score_student_evaluation(student, reference)
+    after = evaluation.mean
 
     assert reference.prefix_hash == "fixed-prefix-hash"
     assert torch.equal(reference.candidate_ids, candidate_ids)
+    assert reference.pre_kl_values.shape == (2,)
+    assert evaluation.local_values.shape == (2,)
     assert before > after
     assert student.training is True
     assert calls[-1][1] == 0

@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import torch
 
-from b200_experiment.one_step_kl_probe import conditional_reverse_kl
+from b200_experiment.one_step_kl_probe import conditional_reverse_kl_values
 from b200_experiment.scoring import BaseScores, score_original_rollout
 
 
@@ -17,6 +17,14 @@ class FiniteSupportKLReference:
     valid_mask: torch.Tensor
     prefix_hash: str
     global_valid_token_count: int
+    pre_kl_values: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KLEvaluation:
+    mean: float
+    local_values: torch.Tensor
+    global_count: int
 
 
 class FiniteSupportKLEvaluator:
@@ -33,9 +41,9 @@ class FiniteSupportKLEvaluator:
         score_fn: Callable[..., BaseScores] = score_original_rollout,
     ) -> None:
         if int(top_k) <= 0:
-            raise ValueError("Held-out KL top_k must be positive")
+            raise ValueError("Probe KL top_k must be positive")
         if float(temperature) <= 0:
-            raise ValueError("Held-out KL temperature must be positive")
+            raise ValueError("Probe KL temperature must be positive")
         self.distributed = distributed
         self.top_k = int(top_k)
         self.temperature = float(temperature)
@@ -74,15 +82,19 @@ class FiniteSupportKLEvaluator:
         student_log_probs: torch.Tensor,
         teacher_log_probs: torch.Tensor,
         valid_mask: torch.Tensor,
-    ) -> tuple[float, int]:
-        local_total, local_count = conditional_reverse_kl(
+    ) -> KLEvaluation:
+        local_values = conditional_reverse_kl_values(
             student_log_probs, teacher_log_probs, valid_mask
         )
-        global_total = self.distributed.sum_float(float(local_total.item()))
-        global_count = self.distributed.sum_int(local_count)
+        global_total = self.distributed.sum_float(float(local_values.sum().item()))
+        global_count = self.distributed.sum_int(int(local_values.numel()))
         if global_count <= 0:
-            raise ValueError("Held-out KL contains no globally valid prefix tokens")
-        return global_total / global_count, global_count
+            raise ValueError("Probe KL contains no globally valid successor states")
+        return KLEvaluation(
+            mean=global_total / global_count,
+            local_values=local_values,
+            global_count=global_count,
+        )
 
     def build_reference(
         self,
@@ -108,7 +120,7 @@ class FiniteSupportKLEvaluator:
             )
         teacher_log_probs = teacher_scores.candidate_log_probs.detach().clone()
         valid_mask = rollout.valid_mask.detach().clone().bool()
-        before, global_count = self._global_mean(
+        before = self._global_mean(
             student_scores.top_k_log_probs,
             teacher_log_probs,
             valid_mask,
@@ -120,14 +132,15 @@ class FiniteSupportKLEvaluator:
                 teacher_candidate_log_probs=teacher_log_probs,
                 valid_mask=valid_mask,
                 prefix_hash=str(prefix_hash),
-                global_valid_token_count=global_count,
+                global_valid_token_count=before.global_count,
+                pre_kl_values=before.local_values,
             ),
-            before,
+            before.mean,
         )
 
-    def score_student(
+    def score_student_evaluation(
         self, student, reference: FiniteSupportKLReference
-    ) -> float:
+    ) -> KLEvaluation:
         scores = self._score(
             student,
             reference.rollout,
@@ -137,13 +150,18 @@ class FiniteSupportKLEvaluator:
             raise RuntimeError(
                 "Student scorer did not return candidate log-probabilities"
             )
-        value, global_count = self._global_mean(
+        evaluation = self._global_mean(
             scores.candidate_log_probs,
             reference.teacher_candidate_log_probs,
             reference.valid_mask,
         )
-        if global_count != reference.global_valid_token_count:
+        if evaluation.global_count != reference.global_valid_token_count:
             raise RuntimeError(
-                "Held-out KL valid-token population changed after the update"
+                "Probe KL successor-state population changed after the update"
             )
-        return value
+        return evaluation
+
+    def score_student(
+        self, student, reference: FiniteSupportKLReference
+    ) -> float:
+        return self.score_student_evaluation(student, reference).mean

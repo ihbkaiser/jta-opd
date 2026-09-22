@@ -240,13 +240,14 @@ giá trị Step-0 đã căn chỉnh khi so sánh OPD với CMT-OPD. Evaluator b�
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
 <!-- B200_AUTOTUNE_RESULT_END -->
 
-## Paired one-step held-out KL probe cho CMT
+## Paired one-step successor-state KL probe cho CMT
 
-Launcher CMT mặc định bật diagnostic paired trên một subset cố định gồm 64 bài từ
-Competition-MATH test. Prefix/response được student ban đầu sinh đúng một lần, lưu tại
-`one_step_kl_probe/heldout_prefixes.rank-*.pt` cùng `heldout_manifest.json`, rồi giữ nguyên qua mọi
-optimizer step và khi resume. Trước mỗi CMT update, candidate support được khóa thành Student
-Top-16 của trạng thái pre-step và teacher được chấm trên đúng các ID đó.
+Launcher CMT mặc định chọn 64 parent states từ rollout huấn luyện hiện tại ở mỗi optimizer step.
+Student pre-update được rescore tại mỗi parent và sample 4 action từ full-vocabulary policy, tạo
+256 successor states. Tập successor này được khóa cho cả Uniform và CMT; Student Top-16
+pre-update tại từng successor là support chung để chấm teacher và hai model sau update. Probe
+không generate thêm rollout bằng vLLM. `state_age_steps` cho biết parent rollout đã cũ bao nhiêu
+PPO update (`0` ở group đầu, sau đó `1`, `2`, `3` với cấu hình CMT mặc định).
 
 Với conditional reverse KL trên support đã khóa, mỗi step ghi:
 
@@ -260,14 +261,14 @@ Uniform OPD là một shadow update trên đúng PPO group/reference/clipping c�
 1 cho mọi valid token. Model, optimizer và RNG được snapshot ra CPU, chạy shadow, rồi restore và
 kiểm tra chính xác trước khi CMT update thật chạy. Shadow không tăng step, không gọi callback và
 không tạo checkpoint. Kết quả nằm trong `one_step_kl_probe/one_step_kl_probe.jsonl` và `.csv`, một
-row duy nhất cho mỗi `optimizer_step`; resume tự rewind row sau checkpoint nhưng không sinh lại
-held-out prefixes. Diagnostic này tốn thêm một update và nhiều lượt held-out scoring mỗi step; nó
-chỉ dùng để phân tích headroom, không dùng để chọn model hoặc chỉnh hyperparameter trong cùng run.
+row duy nhất cho mỗi `optimizer_step`; resume tự rewind row sau checkpoint. Log gồm mean và
+successor-level standard error cho `delta_uniform`, `delta_cmt` và `paired_gap`, cùng hash của đúng
+256 successor states. Đây là rollout-batch diagnostic, không phải held-out/test generalization.
 
-Các override chính: `ONE_STEP_KL_PROBE_ENABLED`, `ONE_STEP_KL_PROBE_SUBSET_SIZE`,
+Các override chính: `ONE_STEP_KL_PROBE_ENABLED`,
+`ONE_STEP_KL_PROBE_PARENT_STATE_COUNT`, `ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT`,
 `ONE_STEP_KL_PROBE_SEED`, `ONE_STEP_KL_PROBE_INTERVAL`,
-`ONE_STEP_KL_PROBE_MAX_NEW_TOKENS`, `ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE` và
-`ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE`.
+`ONE_STEP_KL_PROBE_SAMPLING_TEMPERATURE` và `ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE`.
 
 ## Output và resume
 

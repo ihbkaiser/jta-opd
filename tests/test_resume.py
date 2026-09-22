@@ -517,7 +517,7 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cmt_allocation_mode"):
                 validate_resume_config(checkpoint, current)
 
-    def test_resume_rejects_changing_fixed_probe_subset(self):
+    def test_resume_rejects_changing_successor_probe_population(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             checkpoint = output / "checkpoint-000100"
@@ -525,17 +525,18 @@ class ResumeTests(unittest.TestCase):
             source = _controlled_config("cmt")
             source["one_step_kl_probe"] = {
                 "enabled": True,
-                "benchmark": "Competition-MATH",
-                "subset_size": 64,
+                "state_source": "training_rollout_successors",
+                "parent_state_count": 64,
+                "successors_per_parent": 4,
                 "seed": 20260922,
             }
             (output / "resolved_config.yaml").write_text(
                 yaml.safe_dump(source), encoding="utf-8"
             )
             current = copy.deepcopy(source)
-            current["one_step_kl_probe"]["subset_size"] = 32
+            current["one_step_kl_probe"]["parent_state_count"] = 32
 
-            with self.assertRaisesRegex(ValueError, "subset_size"):
+            with self.assertRaisesRegex(ValueError, "parent_state_count"):
                 validate_resume_config(checkpoint, current)
 
     def test_legacy_cmt_resume_uses_gibbs_compatibility_defaults(self):

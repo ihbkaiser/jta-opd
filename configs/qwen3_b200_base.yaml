@@ -139,18 +139,16 @@ selector:
 # the shared default disabled preserves every legacy OPD/TA/RAC/PGT run.
 one_step_kl_probe:
   enabled: false
-  benchmark: Competition-MATH
-  subset_size: 64
+  state_source: training_rollout_successors
+  parent_state_count: 64
+  successors_per_parent: 4
   seed: 20260922
   interval_steps: 1
   top_k: 16
   metric: conditional_reverse_kl
   failure_policy: error
   artifact_subdir: one_step_kl_probe
-  max_new_tokens: 512
-  temperature: 1.0
-  top_p: 1.0
-  generation_batch_size: 8
+  sampling_temperature: 1.0
   score_micro_batch_size: 1
 
 token_budget:

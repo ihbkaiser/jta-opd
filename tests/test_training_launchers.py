@@ -165,22 +165,22 @@ class TrainingLauncherTests(unittest.TestCase):
         )
         for variable in (
             "ONE_STEP_KL_PROBE_ENABLED",
-            "ONE_STEP_KL_PROBE_SUBSET_SIZE",
+            "ONE_STEP_KL_PROBE_PARENT_STATE_COUNT",
+            "ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT",
             "ONE_STEP_KL_PROBE_SEED",
             "ONE_STEP_KL_PROBE_INTERVAL",
-            "ONE_STEP_KL_PROBE_MAX_NEW_TOKENS",
-            "ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE",
+            "ONE_STEP_KL_PROBE_SAMPLING_TEMPERATURE",
             "ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE",
         ):
             self.assertIn(f"export {variable}=", launcher)
         common = (REPO_ROOT / "scripts" / "common_b200.sh").read_text(encoding="utf-8")
         for config_key in (
             "enabled",
-            "subset_size",
+            "parent_state_count",
+            "successors_per_parent",
             "seed",
             "interval_steps",
-            "max_new_tokens",
-            "generation_batch_size",
+            "sampling_temperature",
             "score_micro_batch_size",
         ):
             self.assertIn(f"one_step_kl_probe.{config_key}=", common)
