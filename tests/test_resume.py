@@ -394,6 +394,61 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(result["evaluation_last_step"], 100)
             self.assertFalse(result["rewound"])
 
+    def test_resume_rewinds_probe_rows_but_preserves_fixed_heldout_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            probe_root = root / "one_step_kl_probe"
+            probe_root.mkdir()
+            rows = [
+                {"optimizer_step": step, "kl_before": float(step)}
+                for step in (99, 100, 101)
+            ]
+            (probe_root / "one_step_kl_probe.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            with (probe_root / "one_step_kl_probe.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=("optimizer_step", "kl_before")
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            manifest = probe_root / "heldout_manifest.json"
+            prefixes = probe_root / "heldout_prefixes.rank-00000.pt"
+            manifest.write_text('{"fixed": true}\n', encoding="utf-8")
+            prefixes.write_bytes(b"fixed-prefixes")
+
+            result = validate_append_history(root, 100)
+
+            with (probe_root / "one_step_kl_probe.jsonl").open(
+                encoding="utf-8"
+            ) as handle:
+                self.assertEqual(
+                    [json.loads(line)["optimizer_step"] for line in handle],
+                    [99, 100],
+                )
+            with (probe_root / "one_step_kl_probe.csv").open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                self.assertEqual(
+                    [int(row["optimizer_step"]) for row in csv.DictReader(handle)],
+                    [99, 100],
+                )
+            self.assertEqual(manifest.read_text(encoding="utf-8"), '{"fixed": true}\n')
+            self.assertEqual(prefixes.read_bytes(), b"fixed-prefixes")
+            self.assertEqual(
+                result["removed_rows"][
+                    "one_step_kl_probe/one_step_kl_probe.jsonl"
+                ],
+                1,
+            )
+            self.assertEqual(
+                result["removed_rows"]["one_step_kl_probe/one_step_kl_probe.csv"],
+                1,
+            )
+
     def test_resume_rewrites_mixed_selector_chunk_and_deletes_later_chunk(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

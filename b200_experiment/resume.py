@@ -596,7 +596,7 @@ def _stage_jsonl_rewind(
 
 
 def _stage_csv_rewind(
-    path: Path, resume_step: int
+    path: Path, resume_step: int, step_field: str = "step"
 ) -> tuple[Path | None, int | None, int]:
     if not path.is_file():
         return None, None, 0
@@ -609,13 +609,15 @@ def _stage_csv_rewind(
             temporary.open("x", newline="", encoding="utf-8") as target,
         ):
             reader = csv.DictReader(source)
-            if not reader.fieldnames or "step" not in reader.fieldnames:
-                raise ValueError(f"Cannot resume safely: {path} has no step column")
+            if not reader.fieldnames or step_field not in reader.fieldnames:
+                raise ValueError(
+                    f"Cannot resume safely: {path} has no {step_field} column"
+                )
             writer = csv.DictWriter(target, fieldnames=reader.fieldnames)
             writer.writeheader()
             for line_number, row in enumerate(reader, start=2):
                 try:
-                    step = int(row["step"])
+                    step = int(row[step_field])
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError(
                         f"Cannot resume safely: malformed {path} line {line_number}"
@@ -705,19 +707,31 @@ def validate_append_history(
     selector_removed_rows = 0
 
     try:
-        for filename, kind in (
-            ("metrics.jsonl", "jsonl"),
-            ("eval_history.jsonl", "jsonl"),
-            ("train_metrics.csv", "csv"),
-            ("eval_metrics.csv", "csv"),
+        for filename, kind, step_field in (
+            ("metrics.jsonl", "jsonl", "step"),
+            ("eval_history.jsonl", "jsonl", "step"),
+            ("train_metrics.csv", "csv", "step"),
+            ("eval_metrics.csv", "csv", "step"),
+            (
+                "one_step_kl_probe/one_step_kl_probe.jsonl",
+                "jsonl",
+                "optimizer_step",
+            ),
+            (
+                "one_step_kl_probe/one_step_kl_probe.csv",
+                "csv",
+                "optimizer_step",
+            ),
         ):
             path = output_dir / filename
             if kind == "jsonl":
                 temporary, retained_step, removed = _stage_jsonl_rewind(
-                    path, resume_step, "step"
+                    path, resume_step, step_field
                 )
             else:
-                temporary, retained_step, removed = _stage_csv_rewind(path, resume_step)
+                temporary, retained_step, removed = _stage_csv_rewind(
+                    path, resume_step, step_field
+                )
             if filename == "metrics.jsonl":
                 metrics_step = retained_step
             elif filename == "eval_history.jsonl":
