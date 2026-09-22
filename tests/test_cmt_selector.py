@@ -35,6 +35,10 @@ def _support(
     diagnostics = {
         "gain": gain,
         "s_PGT": gain,
+        "gain_support_definition": "student_topk",
+        "transition_support_definition": (
+            "literal_union_student_topk_teacher_topk"
+        ),
         "student_support_mass": torch.full_like(gain, student_mass),
         "teacher_support_mass": torch.full_like(gain, teacher_mass),
         "teacher_tail_mass": torch.full_like(gain, 1.0 - teacher_mass),

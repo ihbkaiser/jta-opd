@@ -10,9 +10,9 @@ Project độc lập này hỗ trợ bốn baseline chính trên cùng student Q
   trên union Student-Top-K và Teacher-Top-K; không dùng Bellman recurrence, critic hoặc
   counterfactual rollout. Đây là local baseline đang chờ one-step/held-out validation.
 - **CMT-OPD (Coupled Marginal Teachability)**: dùng conditional student/teacher distributions trên
-  union Student-Top-K và Teacher-Top-K để tính score, cộng vào local PGT gain một
+  đúng Student-Top-K để tính local `g_t`, cộng vào local gain này một
   *local-baseline excess* successor-opportunity derivative qua **raw truncated** common-mass kernel
-  `min(p,q)` trên union này, ước lượng trên đúng một
+  `min(p,q)` trên union Student/Teacher Top-K, ước lượng trên đúng một
   full-policy student rollout bằng bounded acceptance factor (không inverse coverage), rồi phân bổ
   weight bằng global KL-constrained allocation. CMT
   không claim là causal task value hay teacher-policy value; xem
@@ -137,13 +137,16 @@ trong shared config để audit fairness.
 
 ## Định nghĩa CMT-OPD
 
-CMT dùng union conditional cho local score, tách biệt với Student Top-16 của loss:
+CMT dùng đúng Student Top-K cho local gain, tách biệt với Student Top-16 của loss;
+union chỉ còn phục vụ sequential accessibility:
 
 ```text
-U_t       = TopK(student_t) union TopK(teacher_t)
+S_t       = TopK(student_t)
+p_S,q_S   = conditional p,q on S_t
+r_S       = log q_S - log p_S
+g_t       = Var_{p_S}[r_S]                         # local CMT gain
+U_t       = TopK(student_t) union TopK(teacher_t)  # transition support only
 p_U,q_U   = conditional p,q on U_t
-r_U       = log q_U - log p_U
-g_t       = Var_{p_U}[r_U]                         # local PGT gain
 # sequential accessibility retains original p/q mass on U (no tail lookup)
 # for y_t in U: p_raw=m_p*p_U, q_raw=m_q*q_U; otherwise k_hat_t=0
 k_hat_t   = 1[y_t in U_t] * min(1,(m_q*q_U(y_t))/(m_p*p_U(y_t)))
@@ -171,7 +174,8 @@ cảnh báo và không áp dụng importance correction không hợp lệ.
   vLLM để mọi rank có lịch collective xác định.
 - Common core score student Top-K và teacher-on-student IDs một lần. Với TA/RAC/CMT, student và teacher
   được forward chung theo từng bounded micro-batch. Shared scorer có thể vẫn materialize teacher Top-K
-  để dựng union score của TA/CMT, nhưng các ID teacher-only không tham gia OPD loss. Mọi scoring chỉ
+  để dựng union score của TA và transition support của CMT; CMT `g_t` chỉ dùng Student Top-K,
+  và các ID teacher-only không tham gia OPD loss. Mọi scoring chỉ
   giữ tensor `[B,T,K]` qua toàn rollout; hai full-vocabulary logit
   view BF16 chỉ cùng tồn tại bên trong một scoring micro-batch rồi được giải phóng.
   Default `n=1`: 64 prompt toàn cục tạo đúng 64 trajectory độc lập, tức 32 trajectory/GPU trên hai

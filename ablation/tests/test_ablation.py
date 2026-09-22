@@ -21,6 +21,10 @@ def _input():
     diagnostics = {
         "gain": gain,
         "s_PGT": gain,
+        "gain_support_definition": "student_topk",
+        "transition_support_definition": (
+            "literal_union_student_topk_teacher_topk"
+        ),
         "student_support_mass": torch.full(shape, 0.8),
         "teacher_support_mass": torch.full(shape, 0.7),
         "teacher_tail_mass": torch.full(shape, 0.3),

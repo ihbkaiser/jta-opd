@@ -201,8 +201,9 @@ def build_student_topk_opd_reference(
 ) -> TopKOPDReference:
     """Build the invariant Student-Top-16 policy-loss reference.
 
-    TA/CMT may use a larger student/teacher union to compute selector scores,
-    but that union is intentionally absent from this API. This makes it
+    TA uses a larger union for selection, while CMT uses it only for sequential
+    accessibility (its local g_t is Student Top-K). That union is intentionally
+    absent from this API. This makes it
     impossible for teacher-only Top-K IDs to enter the differentiable OPD
     candidate loss through the production reference builder.
     """

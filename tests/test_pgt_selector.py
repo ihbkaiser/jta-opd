@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from b200_experiment.opd_core import build_student_topk_opd_reference
 from b200_experiment.selectors.cmt_selector import CMTSelector
@@ -68,20 +69,69 @@ def test_teacher_only_topk_values_change_local_teachability():
     assert not torch.allclose(changed.scores, reference.scores)
 
 
-def test_teacher_only_topk_values_change_cmt_teachability():
+def test_cmt_gain_is_exact_student_topk_variance():
     args = list(_inputs())
-    base_support = PGTSelector().compute_scores_from_topk(*args)
+    support = PGTSelector().compute_scores_from_topk(
+        *args, gain_support="student_topk"
+    )
+    student_logp = args[2].float()
+    teacher_on_student = args[3].float()
+    p_log = student_logp - torch.logsumexp(student_logp, dim=-1, keepdim=True)
+    q_log = teacher_on_student - torch.logsumexp(
+        teacher_on_student, dim=-1, keepdim=True
+    )
+    p = p_log.exp()
+    r = q_log - p_log
+    expected = (p * (r - (p * r).sum(-1, keepdim=True)).square()).sum(-1)
+    assert torch.allclose(support.diagnostics["gain"], expected, atol=1e-6)
+    assert support.diagnostics["gain_support_definition"] == "student_topk"
+    assert support.diagnostics["support_geometry"] == (
+        "conditional_student_teacher_distributions_on_student_topk"
+    )
+
+
+def test_teacher_only_topk_values_do_not_change_cmt_local_gain():
+    args = list(_inputs())
+    base_support = PGTSelector().compute_scores_from_topk(
+        *args, gain_support="student_topk"
+    )
     args[4] = args[4].clone()
     args[4][..., -1] += 3.0
-    changed_support = PGTSelector().compute_scores_from_topk(*args)
+    changed_support = PGTSelector().compute_scores_from_topk(
+        *args, gain_support="student_topk"
+    )
     sampled = torch.tensor([[1, 4]])
     valid = torch.tensor([[True, True]])
     base = CMTSelector().compute_scores(base_support, sampled, valid)
     changed = CMTSelector().compute_scores(changed_support, sampled, valid)
-    assert not torch.allclose(
-        changed.diagnostics["gain"], base.diagnostics["gain"]
+    assert torch.allclose(changed.diagnostics["gain"], base.diagnostics["gain"])
+
+
+def test_teacher_on_student_topk_values_change_cmt_local_gain():
+    args = list(_inputs())
+    reference = PGTSelector().compute_scores_from_topk(
+        *args, gain_support="student_topk"
     )
-    assert not torch.allclose(changed.scores, base.scores)
+    args[3] = args[3].clone()
+    args[3][..., -1] += 2.0
+    changed = PGTSelector().compute_scores_from_topk(
+        *args, gain_support="student_topk"
+    )
+    assert not torch.allclose(
+        changed.diagnostics["gain"], reference.diagnostics["gain"]
+    )
+
+
+def test_cmt_rejects_union_defined_local_gain():
+    union_support = PGTSelector().compute_scores_from_topk(*_inputs())
+    with pytest.raises(
+        ValueError, match="exact Student Top-K support"
+    ):
+        CMTSelector().compute_scores(
+            union_support,
+            sampled_token_ids=torch.tensor([[1, 4]]),
+            valid_mask=torch.tensor([[True, True]]),
+        )
 
 
 def test_union_score_is_zero_on_padding():
@@ -123,8 +173,10 @@ def test_union_is_not_passed_to_policy_loss():
     assert output.candidate_ids.shape[-1] == 6
 
 
-def test_cmt_preserves_union_only_as_scoring_support():
-    support = PGTSelector().compute_scores_from_topk(*_inputs())
+def test_cmt_preserves_union_only_as_transition_support():
+    support = PGTSelector().compute_scores_from_topk(
+        *_inputs(), gain_support="student_topk"
+    )
     result = CMTSelector().compute_scores(
         support,
         sampled_token_ids=torch.tensor([[1, 4]]),
@@ -132,3 +184,7 @@ def test_cmt_preserves_union_only_as_scoring_support():
     )
     assert torch.equal(result.candidate_ids, support.candidate_ids)
     assert result.candidate_ids.shape[-1] == 2 * _inputs()[0].shape[-1]
+    assert result.diagnostics["gain_support_definition"] == "student_topk"
+    assert result.diagnostics["transition_support_definition"] == (
+        "literal_union_student_topk_teacher_topk"
+    )

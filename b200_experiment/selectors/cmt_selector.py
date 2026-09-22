@@ -480,12 +480,14 @@ def cmt_allocation(
 
 
 class CMTSelector:
-    """Support-matched, local-excess Coupled Marginal Teachability.
+    """Student-Top-K-local, local-excess Coupled Marginal Teachability.
 
-    The local scoring action space is the student/teacher Top-K union U. Student and
-    teacher probabilities are conditionalized on U by ``PGTSelector`` for the
-    local PGT/CMT geometry. Sequential accessibility instead uses the original
-    probability mass on U, yielding the truncated sub-Markov kernel
+    The local gain action space is exactly the Student Top-K set S. Student and
+    teacher probabilities are conditionalized on S by ``PGTSelector`` and
+    ``g_t = Var_{p_S}[log q_S - log p_S]``. Teacher-only Top-K actions therefore
+    cannot affect ``g_t``. Sequential accessibility is a distinct object: it
+    retains the original probability mass on the student/teacher Top-K union U,
+    yielding the truncated sub-Markov kernel
 
         K_tilde f(s) = sum_{a in U} min(p(a|s), q(a|s)) f(sa).
 
@@ -503,7 +505,7 @@ class CMTSelector:
 
     and the current-action derivative uses the successor contrast
     ``R_{t+1} - g_t M_{t+1}``.  This baseline is the current state's own
-    support-matched local value, so constant-gain suffixes cancel exactly while
+    Student-Top-K local value, so constant-gain suffixes cancel exactly while
     the one-rollout derivative remains unbiased under frozen descendants.
     With ``successor_lambda=1``, ``g_t + D_t`` is the derivative of a single
     frozen-descendant surrogate consisting of local reverse-KL improvement plus
@@ -553,10 +555,10 @@ class CMTSelector:
         """Compute CMT scores from local conditional and raw transition quantities.
 
         ``sampled_token_ids`` are drawn from the full student policy.  Local
-        learning geometry remains conditional on U, while the successor kernel
-        retains the original masses p(a), q(a) on U.  Tokens outside U are
-        intentionally killed rather than reweighted into the conditional
-        simplex.
+        gain geometry is conditional on the Student Top-K set S.  The separate
+        successor kernel retains the original masses p(a), q(a) on the union U.
+        Tokens outside U are intentionally killed rather than reweighted into
+        the conditional simplex.
         """
         expected_shape = valid_mask.shape
         if valid_mask.ndim != 2:
@@ -581,6 +583,10 @@ class CMTSelector:
             support_mask, teacher_cond - student_cond, torch.zeros_like(student_cond)
         )
         mean_r = (support_p * support_r).sum(dim=-1)
+        if pgt_support.diagnostics.get("gain_support_definition") != "student_topk":
+            raise ValueError(
+                "CMT requires g_t computed on the exact Student Top-K support"
+            )
         g = pgt_support.diagnostics["gain"].detach().float().clamp_min(0.0)
         g = torch.where(valid, g, torch.zeros_like(g))
 

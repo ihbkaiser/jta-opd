@@ -3996,6 +3996,7 @@ def run_training(
                 student_scores.candidate_log_probs,
                 valid,
                 token_chunk_size=int(selector_cfg.get("pgt_vocab_chunk_tokens", 2048)),
+                gain_support="student_topk" if method == "cmt" else "union",
             )
         cmt_raw: PGTOutput | None = None
         cmt_score_time = 0.0
@@ -4845,7 +4846,10 @@ def run_training(
                 "ta": "literal_union_student_topk_teacher_topk",
                 "rac": "literal_union_student_topk_teacher_topk",
                 "pgt": "literal_union_student_topk_teacher_topk",
-                "cmt": "literal_union_student_topk_teacher_topk",
+                "cmt": (
+                    "g_student_topk__transition_literal_union_"
+                    "student_topk_teacher_topk"
+                ),
                 "iw": "sampled_response_action",
             }[method],
             "opd_candidate_support": (

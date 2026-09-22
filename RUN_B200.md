@@ -180,7 +180,8 @@ Các launcher hiện mặc định bật cùng một nhóm tối ưu chính xác
 - crop mọi suffix sau EOS và bucket trajectory theo response length ở scoring lẫn backward;
 - scoring inference micro-batch 8 thay vì 1, đồng thời tái sử dụng `logsumexp` khi temperature bằng 1;
 - TA/RAC/PGT/CMT lấy hai chiều student/teacher Top-K trong hai forward thay vì forward student lần thứ ba;
-- CMT dùng conditional student/teacher Top-K union cho local geometry, raw-mass truncated common-mass
+- CMT dùng conditional Student Top-K cho local `g_t`; raw-mass truncated common-mass
+  vẫn dùng student/teacher Top-K union làm transition support
   transition và local-baseline excess scan; full-vocabulary reductions chỉ chạy khi
   `CMT_FULL_VOCAB_DIAGNOSTICS=true`;
 - `top_p=1` là cấu hình exact khuyến nghị cho raw-kernel estimator; launcher không còn hard-fail

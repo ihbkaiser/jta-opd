@@ -237,7 +237,10 @@ class SelectedTokenLogger:
                     "ta": "literal_union_student_topk_teacher_topk",
                     "rac": "literal_union_student_topk_teacher_topk",
                     "pgt": "literal_union_student_topk_teacher_topk",
-                    "cmt": "literal_union_student_topk_teacher_topk",
+                    "cmt": (
+                        "g_student_topk__transition_literal_union_"
+                        "student_topk_teacher_topk"
+                    ),
                 }[method],
                 "chunk_steps": self.chunk_steps,
                 "distributed_world_size": self.world_size,

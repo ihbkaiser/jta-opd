@@ -49,7 +49,24 @@ class PGTSelector:
         valid_mask: torch.Tensor,
         *,
         token_chunk_size: int = 2048,
+        gain_support: str = "union",
     ) -> PGTOutput:
+        """Build the compact selector support and its local gain.
+
+        ``gain_support="union"`` preserves standalone PGT's original
+        student/teacher Top-K-union geometry.  CMT passes
+        ``gain_support="student_topk"``: its local ``g_t`` is then computed
+        only from ``student_top_k_log_probs`` and
+        ``teacher_on_student_log_probs``, each renormalized on the exact
+        Student Top-K IDs.  The materialized union remains available to CMT's
+        distinct truncated common-mass transition kernel.
+        """
+        normalized_gain_support = str(gain_support).strip().lower()
+        if normalized_gain_support not in {"union", "student_topk"}:
+            raise ValueError(
+                "PGT gain_support must be 'union' or 'student_topk'; "
+                f"got {gain_support!r}"
+            )
         tensors = (
             student_top_k_ids,
             teacher_top_k_ids,
@@ -113,13 +130,31 @@ class PGTSelector:
             q_cond = torch.where(
                 unique, tea - q_support_logz, torch.zeros_like(tea)
             )
-            p = torch.where(unique, p_cond.exp(), torch.zeros_like(p_cond))
-            r = torch.where(unique, q_cond - p_cond, torch.zeros_like(stu))
-            mean_r = (p * r).sum(dim=-1, keepdim=True)
-            centered = r - mean_r
-            local_gain = (p * centered.square()).sum(dim=-1)
-            local_euclidean = (p.square() * centered.square()).sum(dim=-1)
-            local_kl = -(p * r).sum(dim=-1)
+            union_p = torch.where(unique, p_cond.exp(), torch.zeros_like(p_cond))
+            union_r = torch.where(
+                unique, q_cond - p_cond, torch.zeros_like(stu)
+            )
+            if normalized_gain_support == "student_topk":
+                # This is the exact CMT local geometry.  Teacher-only Top-K
+                # actions never enter either normalizer or the variance.
+                geometry_p_log = stu_logp.float() - torch.logsumexp(
+                    stu_logp.float(), dim=-1, keepdim=True
+                )
+                geometry_q_log = tea_on_stu.float() - torch.logsumexp(
+                    tea_on_stu.float(), dim=-1, keepdim=True
+                )
+                geometry_p = geometry_p_log.exp()
+                geometry_r = geometry_q_log - geometry_p_log
+            else:
+                geometry_p = union_p
+                geometry_r = union_r
+            mean_r = (geometry_p * geometry_r).sum(dim=-1, keepdim=True)
+            centered = geometry_r - mean_r
+            local_gain = (geometry_p * centered.square()).sum(dim=-1)
+            local_euclidean = (
+                geometry_p.square() * centered.square()
+            ).sum(dim=-1)
+            local_kl = -(geometry_p * geometry_r).sum(dim=-1)
             local_student_mass = torch.where(
                 unique, stu.exp(), torch.zeros_like(stu)
             ).sum(dim=-1)
@@ -149,8 +184,24 @@ class PGTSelector:
             "teacher_tail_mass": (1.0 - teacher_support_mass).clamp_min(0.0).reshape(shape),
             "support_width": support.float().sum(dim=-1).reshape(shape),
             "score_definition": "natural_gradient_energy_var_p_log_teacher_minus_student",
-            "support_definition": "literal_union_student_topk_teacher_topk",
-            "support_geometry": "conditional_student_teacher_distributions_on_union",
+            "support_definition": (
+                "student_topk"
+                if normalized_gain_support == "student_topk"
+                else "literal_union_student_topk_teacher_topk"
+            ),
+            "gain_support_definition": (
+                "student_topk"
+                if normalized_gain_support == "student_topk"
+                else "literal_union_student_topk_teacher_topk"
+            ),
+            "support_geometry": (
+                "conditional_student_teacher_distributions_on_student_topk"
+                if normalized_gain_support == "student_topk"
+                else "conditional_student_teacher_distributions_on_union"
+            ),
+            "transition_support_definition": (
+                "literal_union_student_topk_teacher_topk"
+            ),
         }
         # Keep the score explicitly zero on invalid rollout padding.
         diagnostics["gain"] = torch.where(valid_mask, diagnostics["gain"], torch.zeros_like(diagnostics["gain"]))
