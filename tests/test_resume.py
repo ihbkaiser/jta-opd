@@ -439,9 +439,7 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(manifest.read_text(encoding="utf-8"), '{"fixed": true}\n')
             self.assertEqual(prefixes.read_bytes(), b"fixed-prefixes")
             self.assertEqual(
-                result["removed_rows"][
-                    "one_step_kl_probe/one_step_kl_probe.jsonl"
-                ],
+                result["removed_rows"]["one_step_kl_probe/one_step_kl_probe.jsonl"],
                 1,
             )
             self.assertEqual(
@@ -517,6 +515,27 @@ class ResumeTests(unittest.TestCase):
             current = copy.deepcopy(source)
             current["selector"]["cmt_allocation_mode"] = "bounded_gibbs"
             with self.assertRaisesRegex(ValueError, "cmt_allocation_mode"):
+                validate_resume_config(checkpoint, current)
+
+    def test_resume_rejects_changing_fixed_probe_subset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            checkpoint = output / "checkpoint-000100"
+            checkpoint.mkdir()
+            source = _controlled_config("cmt")
+            source["one_step_kl_probe"] = {
+                "enabled": True,
+                "benchmark": "Competition-MATH",
+                "subset_size": 64,
+                "seed": 20260922,
+            }
+            (output / "resolved_config.yaml").write_text(
+                yaml.safe_dump(source), encoding="utf-8"
+            )
+            current = copy.deepcopy(source)
+            current["one_step_kl_probe"]["subset_size"] = 32
+
+            with self.assertRaisesRegex(ValueError, "subset_size"):
                 validate_resume_config(checkpoint, current)
 
     def test_legacy_cmt_resume_uses_gibbs_compatibility_defaults(self):

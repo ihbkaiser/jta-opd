@@ -159,6 +159,32 @@ class TrainingLauncherTests(unittest.TestCase):
         ):
             self.assertIn(f"selector.{config_key}=", common)
 
+    def test_cmt_launcher_exposes_one_step_kl_probe_controls(self):
+        launcher = (REPO_ROOT / "scripts" / "train_cmt_b200.sh").read_text(
+            encoding="utf-8"
+        )
+        for variable in (
+            "ONE_STEP_KL_PROBE_ENABLED",
+            "ONE_STEP_KL_PROBE_SUBSET_SIZE",
+            "ONE_STEP_KL_PROBE_SEED",
+            "ONE_STEP_KL_PROBE_INTERVAL",
+            "ONE_STEP_KL_PROBE_MAX_NEW_TOKENS",
+            "ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE",
+            "ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE",
+        ):
+            self.assertIn(f"export {variable}=", launcher)
+        common = (REPO_ROOT / "scripts" / "common_b200.sh").read_text(encoding="utf-8")
+        for config_key in (
+            "enabled",
+            "subset_size",
+            "seed",
+            "interval_steps",
+            "max_new_tokens",
+            "generation_batch_size",
+            "score_micro_batch_size",
+        ):
+            self.assertIn(f"one_step_kl_probe.{config_key}=", common)
+
     def test_iw_launcher_has_shared_dataset_presets_and_requested_defaults(self):
         content = (REPO_ROOT / "scripts" / "train_iw_b200.sh").read_text(
             encoding="utf-8"

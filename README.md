@@ -240,6 +240,35 @@ giá trị Step-0 đã căn chỉnh khi so sánh OPD với CMT-OPD. Evaluator b�
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
 <!-- B200_AUTOTUNE_RESULT_END -->
 
+## Paired one-step held-out KL probe cho CMT
+
+Launcher CMT mặc định bật diagnostic paired trên một subset cố định gồm 64 bài từ
+Competition-MATH test. Prefix/response được student ban đầu sinh đúng một lần, lưu tại
+`one_step_kl_probe/heldout_prefixes.rank-*.pt` cùng `heldout_manifest.json`, rồi giữ nguyên qua mọi
+optimizer step và khi resume. Trước mỗi CMT update, candidate support được khóa thành Student
+Top-16 của trạng thái pre-step và teacher được chấm trên đúng các ID đó.
+
+Với conditional reverse KL trên support đã khóa, mỗi step ghi:
+
+```text
+delta_uniform = KL_before - KL_after_uniform
+delta_cmt     = KL_before - KL_after_cmt
+paired_gap    = delta_cmt - delta_uniform
+```
+
+Uniform OPD là một shadow update trên đúng PPO group/reference/clipping của CMT nhưng dùng weight
+1 cho mọi valid token. Model, optimizer và RNG được snapshot ra CPU, chạy shadow, rồi restore và
+kiểm tra chính xác trước khi CMT update thật chạy. Shadow không tăng step, không gọi callback và
+không tạo checkpoint. Kết quả nằm trong `one_step_kl_probe/one_step_kl_probe.jsonl` và `.csv`, một
+row duy nhất cho mỗi `optimizer_step`; resume tự rewind row sau checkpoint nhưng không sinh lại
+held-out prefixes. Diagnostic này tốn thêm một update và nhiều lượt held-out scoring mỗi step; nó
+chỉ dùng để phân tích headroom, không dùng để chọn model hoặc chỉnh hyperparameter trong cùng run.
+
+Các override chính: `ONE_STEP_KL_PROBE_ENABLED`, `ONE_STEP_KL_PROBE_SUBSET_SIZE`,
+`ONE_STEP_KL_PROBE_SEED`, `ONE_STEP_KL_PROBE_INTERVAL`,
+`ONE_STEP_KL_PROBE_MAX_NEW_TOKENS`, `ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE` và
+`ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE`.
+
 ## Output và resume
 
 Fresh launch tự tạo tên:

@@ -106,6 +106,7 @@ from .resume import (
     validate_append_history,
     validate_resume_config,
 )
+from .probe_runtime import prepare_one_step_kl_probe
 from .scoring import (
     cuda_sync,
     generate_on_policy,
@@ -136,6 +137,7 @@ from .selectors import (
 from .selectors.pgt_selector import PGTOutput
 from .selectors.base import SelectorOutput, robust_quantile_normalize, scatter_valid
 from .tensorboard_logging import TensorBoardLogger
+from .training_snapshot import TrainingStateSnapshot
 from .vllm_evaluation import (
     _terminate_process_group,
     merge_vllm_evaluation_shards,
@@ -1685,7 +1687,7 @@ def _global_tensor_stats(
     }
 
 
-def _opd_train_step(
+def _opd_train_step_impl(
     model,
     optimizer,
     rollout,
@@ -2204,9 +2206,7 @@ def _opd_train_step(
             ),
             # Backward-compatible alias. In direct mode this is the KL of the
             # final bounded weights, not the unbounded diagnostic reference.
-            "allocation_kl_achieved": float(
-                allocation_metrics["allocation_kl_final"]
-            ),
+            "allocation_kl_achieved": float(allocation_metrics["allocation_kl_final"]),
             "allocation_inverse_temperature": float(allocation_inverse_temperature),
             "rollout_id": int(rollout_id),
             "optimizer_step": int(global_optimizer_step),
@@ -2282,6 +2282,260 @@ def _opd_train_step(
         minibatches=minibatch_metrics,
     )
     return result
+
+
+def _combine_opd_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        raise ValueError("Cannot combine an empty set of OPD optimizer results")
+    minibatches = [
+        metric for result in results for metric in result.get("minibatches", [])
+    ]
+    if not minibatches:
+        raise ValueError("OPD optimizer results contain no minibatch metrics")
+    total_weight = sum(float(item["global_weight_mass"]) for item in minibatches)
+    aggregate_loss = (
+        sum(
+            float(item["loss"]) * float(item["global_weight_mass"])
+            for item in minibatches
+        )
+        / total_weight
+        if total_weight > 0.0
+        else sum(float(item["loss"]) for item in minibatches) / len(minibatches)
+    )
+    combined = dict(minibatches[-1])
+    combined.update(
+        loss=aggregate_loss,
+        weighted_final_loss=aggregate_loss,
+        training_forward_time=sum(
+            float(item["training_forward_time"]) for item in minibatches
+        ),
+        backward_time=sum(float(item["backward_time"]) for item in minibatches),
+        optimizer_time=sum(float(item["optimizer_time"]) for item in minibatches),
+        global_weight_mass=total_weight,
+        optimizer_steps=len(minibatches),
+        gibbs_allocations=sum(int(result["gibbs_allocations"]) for result in results),
+        gibbs_allocation_time=sum(
+            float(result["gibbs_allocation_time"]) for result in results
+        ),
+        minibatches=minibatches,
+    )
+    processed = results[0].get("allocated_processed_mask")
+    if processed is None:
+        for key in (
+            "allocated_position_weights",
+            "allocated_raw_position_weights",
+            "allocated_group_indices",
+            "allocated_optimizer_steps",
+            "allocated_processed_mask",
+        ):
+            combined[key] = None
+        return combined
+
+    combined_processed = torch.zeros_like(processed, dtype=torch.bool)
+    combined_weights = torch.zeros_like(
+        results[0]["allocated_position_weights"], dtype=torch.float32
+    )
+    combined_raw_weights = torch.zeros_like(
+        results[0]["allocated_raw_position_weights"], dtype=torch.float32
+    )
+    combined_groups = torch.full_like(
+        results[0]["allocated_group_indices"], -1, dtype=torch.long
+    )
+    combined_steps = torch.full_like(
+        results[0]["allocated_optimizer_steps"], -1, dtype=torch.long
+    )
+    for result in results:
+        mask = result["allocated_processed_mask"].bool()
+        if bool((combined_processed & mask).any()):
+            raise AssertionError("Paired probe combined the same CMT token twice")
+        combined_weights[mask] = result["allocated_position_weights"][mask]
+        combined_raw_weights[mask] = result["allocated_raw_position_weights"][mask]
+        combined_groups[mask] = result["allocated_group_indices"][mask]
+        combined_steps[mask] = result["allocated_optimizer_steps"][mask]
+        combined_processed |= mask
+    combined.update(
+        allocated_position_weights=combined_weights,
+        allocated_raw_position_weights=combined_raw_weights,
+        allocated_group_indices=combined_groups,
+        allocated_optimizer_steps=combined_steps,
+        allocated_processed_mask=combined_processed,
+    )
+    return combined
+
+
+def _opd_train_step(
+    model,
+    optimizer,
+    rollout,
+    position_weights,
+    opd_reference: TopKOPDReference,
+    config,
+    device,
+    distributed: DistributedContext,
+    objective_valid_mask: torch.Tensor | None = None,
+    trajectory_active_mask: torch.Tensor | None = None,
+    trajectory_group_ids: list[int] | tuple[int, ...] | torch.Tensor | None = None,
+    gibbs_scores: torch.Tensor | None = None,
+    gibbs_epsilon: float | None = None,
+    gibbs_mode: str = "gibbs",
+    gibbs_weight_min: float = 0.5,
+    gibbs_weight_max: float = 2.0,
+    gibbs_final_epsilon: float = 0.02,
+    rollout_id: int = 0,
+    ppo_minibatch_offset: int = 0,
+    max_optimizer_steps: int | None = None,
+    optimizer_step_start: int = 0,
+    on_optimizer_step: Callable[[int, dict[str, float]], None] | None = None,
+    one_step_probe=None,
+):
+    """Run OPD updates, optionally pairing each real CMT step with a shadow update."""
+    shared = dict(
+        model=model,
+        optimizer=optimizer,
+        rollout=rollout,
+        position_weights=position_weights,
+        opd_reference=opd_reference,
+        config=config,
+        device=device,
+        distributed=distributed,
+        objective_valid_mask=objective_valid_mask,
+        trajectory_active_mask=trajectory_active_mask,
+        trajectory_group_ids=trajectory_group_ids,
+        gibbs_scores=gibbs_scores,
+        gibbs_epsilon=gibbs_epsilon,
+        gibbs_mode=gibbs_mode,
+        gibbs_weight_min=gibbs_weight_min,
+        gibbs_weight_max=gibbs_weight_max,
+        gibbs_final_epsilon=gibbs_final_epsilon,
+        rollout_id=rollout_id,
+        ppo_minibatch_offset=ppo_minibatch_offset,
+        max_optimizer_steps=max_optimizer_steps,
+        optimizer_step_start=optimizer_step_start,
+        on_optimizer_step=on_optimizer_step,
+    )
+    if one_step_probe is None:
+        return _opd_train_step_impl(**shared)
+    if gibbs_scores is None or gibbs_epsilon is None:
+        raise ValueError("The one-step KL probe requires a CMT Gibbs allocation")
+
+    objective_valid = (
+        rollout.valid_mask.bool()
+        if objective_valid_mask is None
+        else objective_valid_mask.to(device=rollout.valid_mask.device, dtype=torch.bool)
+    )
+    trajectory_active = (
+        objective_valid.any(dim=-1)
+        if trajectory_active_mask is None
+        else trajectory_active_mask.to(
+            device=rollout.valid_mask.device, dtype=torch.bool
+        )
+    )
+    local_real_count = int(trajectory_active.sum().item())
+    global_trajectory_count = sum(
+        int(value) for value in distributed.all_gather_objects(local_real_count)
+    )
+    ppo_size = _ppo_mini_batch_size(config["training"], global_trajectory_count)
+    ppo_count = _ppo_minibatch_count(global_trajectory_count, ppo_size)
+    offset = int(ppo_minibatch_offset)
+    limit = ppo_count - offset
+    if max_optimizer_steps is not None:
+        limit = min(limit, max(0, int(max_optimizer_steps)))
+    if limit <= 0:
+        raise ValueError("No PPO mini-batch remains for this optimizer call")
+
+    real_results: list[dict[str, Any]] = []
+    uniform_weights = objective_valid.float()
+    for relative_index, ppo_index in enumerate(range(offset, offset + limit)):
+        optimizer_step = int(optimizer_step_start) + relative_index + 1
+        common_group = dict(shared)
+        common_group.update(
+            ppo_minibatch_offset=ppo_index,
+            max_optimizer_steps=1,
+            optimizer_step_start=optimizer_step - 1,
+            on_optimizer_step=None,
+        )
+        if not one_step_probe.should_probe(optimizer_step):
+            cmt_result = _opd_train_step_impl(**common_group)
+            real_results.append(cmt_result)
+            if on_optimizer_step is not None:
+                on_optimizer_step(optimizer_step, cmt_result["minibatches"][0])
+            continue
+
+        prepared = one_step_probe.prepare_before_step(model, optimizer_step)
+        snapshot = TrainingStateSnapshot.capture(model, optimizer)
+        shadow_started = time.perf_counter()
+        shadow_error: BaseException | None = None
+        uniform_result = None
+        kl_after_uniform = None
+        try:
+            uniform_group = dict(common_group)
+            uniform_group.update(
+                position_weights=uniform_weights,
+                gibbs_scores=None,
+                gibbs_epsilon=None,
+            )
+            uniform_result = _opd_train_step_impl(**uniform_group)
+            kl_after_uniform = one_step_probe.score_student(model, prepared)
+        except BaseException as error:
+            shadow_error = error
+        finally:
+            snapshot.restore(model, optimizer)
+            snapshot.verify_restored(model, optimizer)
+        uniform_branch_seconds = time.perf_counter() - shadow_started
+
+        error_messages = distributed.all_gather_objects(
+            None
+            if shadow_error is None
+            else f"{type(shadow_error).__name__}: {shadow_error}"
+        )
+        if any(message is not None for message in error_messages):
+            message = "One-step uniform shadow update failed: " + "; ".join(
+                str(item) for item in error_messages if item is not None
+            )
+            if getattr(one_step_probe, "failure_policy", "error") == "error":
+                raise RuntimeError(message) from shadow_error
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            cmt_result = _opd_train_step_impl(**common_group)
+            real_results.append(cmt_result)
+            if on_optimizer_step is not None:
+                on_optimizer_step(optimizer_step, cmt_result["minibatches"][0])
+            continue
+
+        cmt_result = _opd_train_step_impl(**common_group)
+        cmt_eval_started = time.perf_counter()
+        post_update_error: BaseException | None = None
+        try:
+            kl_after_cmt = one_step_probe.score_student(model, prepared)
+            one_step_probe.write_pair(
+                prepared,
+                optimizer_step=optimizer_step,
+                rollout_id=int(rollout_id),
+                ppo_group_index=int(ppo_index),
+                kl_after_uniform=float(kl_after_uniform),
+                kl_after_cmt=float(kl_after_cmt),
+                uniform_update_loss=float(uniform_result["loss"]),
+                cmt_update_loss=float(cmt_result["loss"]),
+                uniform_branch_time_sec=float(uniform_branch_seconds),
+                cmt_eval_time_sec=float(time.perf_counter() - cmt_eval_started),
+            )
+        except BaseException as error:
+            post_update_error = error
+        messages = distributed.all_gather_objects(
+            None
+            if post_update_error is None
+            else f"{type(post_update_error).__name__}: {post_update_error}"
+        )
+        if any(message is not None for message in messages):
+            message = "One-step CMT evaluation/logging failed: " + "; ".join(
+                str(item) for item in messages if item is not None
+            )
+            if getattr(one_step_probe, "failure_policy", "error") == "error":
+                raise RuntimeError(message) from post_update_error
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        real_results.append(cmt_result)
+        if on_optimizer_step is not None:
+            on_optimizer_step(optimizer_step, cmt_result["minibatches"][0])
+    return _combine_opd_train_results(real_results)
 
 
 def _save_checkpoint(
@@ -3512,6 +3766,19 @@ def run_training(
             static_graph=bool(distributed_cfg.get("static_graph", True)),
             bucket_cap_mb=float(distributed_cfg.get("bucket_cap_mb", 100)),
         )
+    setup_progress.set_postfix_str("stage=heldout-kl-probe", refresh=True)
+    one_step_probe, one_step_probe_metadata = prepare_one_step_kl_probe(
+        config,
+        method=method,
+        student=training_student,
+        teacher=scoring_teacher,
+        tokenizer=tokenizer,
+        rollout_engine=rollout_engine,
+        output_dir=output_dir,
+        distributed=distributed,
+        device=device,
+        resume=resume_checkpoint is not None,
+    )
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
     optimizer, fused_optimizer = _make_optimizer(
@@ -3576,6 +3843,7 @@ def run_training(
             ),
         }
         if method == "cmt":
+            metadata["one_step_kl_probe"] = one_step_probe_metadata
             metadata["cmt_allocation"] = {
                 "mode": cmt_allocation_mode,
                 "kl_budget": float(config["selector"].get("cmt_allocation_kl", 0.5)),
@@ -4499,6 +4767,7 @@ def run_training(
             max_optimizer_steps=max_steps - optimizer_step,
             optimizer_step_start=optimizer_step,
             on_optimizer_step=after_optimizer_step,
+            one_step_probe=one_step_probe,
         )
         if method == "cmt":
             local_cmt_weights = train_metrics.pop("allocated_position_weights")
@@ -4816,6 +5085,15 @@ def run_training(
             ),
             "cmt_final_allocation_kl": (
                 cmt_final_allocation_kl if method == "cmt" else None
+            ),
+            "one_step_kl_probe_enabled": one_step_probe is not None,
+            "one_step_kl_probe_prefix_hash": (
+                one_step_probe.heldout_prefix_hash
+                if one_step_probe is not None
+                else None
+            ),
+            "one_step_kl_probe_subset_size": (
+                one_step_probe.subset_size if one_step_probe is not None else None
             ),
             "micro_batch_size_per_gpu": micro_batch_size_per_gpu,
             "distributed_world_size": distributed.world_size,
