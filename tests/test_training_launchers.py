@@ -138,10 +138,13 @@ class TrainingLauncherTests(unittest.TestCase):
         ):
             self.assertIn(f"export {variable}=", content)
         config = load_config(REPO_ROOT / "configs" / "qwen3_b200_cmt.yaml")
-        self.assertEqual(config["selector"]["cmt_allocation_mode"], "gibbs")
+        self.assertEqual(
+            config["selector"]["cmt_allocation_mode"],
+            "direct_bounded_gibbs",
+        )
         self.assertEqual(config["selector"]["cmt_weight_min"], 0.5)
         self.assertEqual(config["selector"]["cmt_weight_max"], 2.0)
-        self.assertEqual(config["selector"]["cmt_correction_mode"], "none")
+        self.assertEqual(config["selector"]["cmt_correction_mode"], "tanh_q99")
         self.assertEqual(config["selector"]["cmt_correction_quantile"], 0.99)
         self.assertEqual(config["selector"]["cmt_final_allocation_kl"], 0.02)
         self.assertFalse(config["logging"]["cmt_token_audit_enabled"])

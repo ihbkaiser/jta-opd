@@ -160,7 +160,9 @@ OPD dùng weight uniform trên mọi response token hợp lệ.
 RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
-CMT mặc định dùng `CMT_ALLOCATION_KL=0.5`, `CMT_GAMMA=1.0`,
+CMT mặc định dùng `CMT_ALLOCATION_MODE=direct_bounded_gibbs`,
+`CMT_CORRECTION_MODE=tanh_q99`, `CMT_FINAL_ALLOCATION_KL=0.02`,
+`CMT_GAMMA=1.0`,
 `CMT_SUCCESSOR_LAMBDA=1.0`, Student Top-K cho local `g_t`, union chỉ cho sequential
 accessibility, Student Top-16 cho OPD loss và `top_p=1`.
 Gibbs được chuẩn hoá độc lập trong từng PPO group 64 trajectory (one Gibbs = one update).
@@ -981,14 +983,16 @@ cd /workspace/storage-shared/nlp/minhpn19/BellmanOPD_analysis
 source ../TA-OPD-B200/.venv/bin/activate   # hoặc environment B200 đang dùng
 ```
 
-### 11.1. Chạy CMT cũ, không đổi behavior
+### 11.1. Chạy explicit legacy CMT
 
-Mode mặc định vẫn là `gibbs`; audit và heatmap mặc định tắt. Lệnh sau giữ nguyên allocator cũ:
+Mode mặc định mới là `direct_bounded_gibbs` + `tanh_q99`; audit và heatmap vẫn mặc định
+tắt. Muốn chạy lại allocator cũ phải override rõ cả allocation và correction:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 RUN_NAME="cmt_gibbs_compmath_seed42" \
 CMT_ALLOCATION_MODE=gibbs \
+CMT_CORRECTION_MODE=none \
 TRAIN_DATASET=competition_math \
   bash scripts/train_cmt_b200.sh
 ```
@@ -998,9 +1002,9 @@ Thiết lập mặc định của launcher CMT hiện là: LR `5e-6`, generation
 batch `64`, microbatch/GPU `16`, save/eval mỗi `150` optimizer steps và `3` epoch cho
 Competition-MATH (`2` epoch cho DAPO).
 
-### 11.2. Chạy pipeline mới: tanh correction + direct bounded Gibbs
+### 11.2. Chạy pipeline mặc định: tanh correction + direct bounded Gibbs
 
-Đây là mode mới theo đúng thiết kế: `kappa` được tính một lần trên toàn bộ valid token của
+Đây là mode mặc định theo đúng thiết kế: `kappa` được tính một lần trên toàn bộ valid token của
 rollout (sau global gather), còn mỗi PPO group có một nghiệm bounded Gibbs độc lập:
 
 ```bash
