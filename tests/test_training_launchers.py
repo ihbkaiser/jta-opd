@@ -165,38 +165,44 @@ class TrainingLauncherTests(unittest.TestCase):
         )
         for variable in (
             "ONE_STEP_KL_PROBE_ENABLED",
-            "ONE_STEP_KL_PROBE_PARENT_STATE_COUNT",
-            "ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT",
+            "ONE_STEP_KL_PROBE_BENCHMARK",
+            "ONE_STEP_KL_PROBE_SUBSET_SIZE",
+            "ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM",
+            "ONE_STEP_KL_PROBE_HORIZON",
             "ONE_STEP_KL_PROBE_SEED",
             "ONE_STEP_KL_PROBE_INTERVAL",
             "ONE_STEP_KL_PROBE_SAMPLING_TEMPERATURE",
+            "ONE_STEP_KL_PROBE_SAMPLING_TOP_P",
+            "ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE",
             "ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE",
         ):
             self.assertIn(f"export {variable}=", launcher)
-        self.assertIn(
-            'ONE_STEP_KL_PROBE_PARENT_STATE_COUNT:-64}', launcher
-        )
-        self.assertIn(
-            'ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT:-1}', launcher
-        )
-        self.assertIn('ONE_STEP_KL_PROBE_INTERVAL:-10}', launcher)
-        self.assertIn(
-            'ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE:-8}', launcher
-        )
+        self.assertIn('ONE_STEP_KL_PROBE_SUBSET_SIZE:-64}', launcher)
+        self.assertIn('ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM:-2}', launcher)
+        self.assertIn('ONE_STEP_KL_PROBE_HORIZON:-64}', launcher)
+        self.assertIn('ONE_STEP_KL_PROBE_INTERVAL:-50}', launcher)
+        self.assertIn('ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE:-1}', launcher)
         config = load_config(REPO_ROOT / "configs" / "qwen3_b200_cmt.yaml")
         probe = config["one_step_kl_probe"]
-        self.assertEqual(probe["parent_state_count"], 64)
-        self.assertEqual(probe["successors_per_parent"], 1)
-        self.assertEqual(probe["interval_steps"], 10)
-        self.assertEqual(probe["score_micro_batch_size"], 8)
+        self.assertEqual(probe["benchmark"], "Competition-MATH")
+        self.assertEqual(probe["subset_size"], 64)
+        self.assertEqual(probe["num_rollouts_per_problem"], 2)
+        self.assertEqual(probe["horizon"], 64)
+        self.assertEqual(probe["interval_steps"], 50)
+        self.assertEqual(probe["metric"], "full_vocab_reverse_kl")
+        self.assertEqual(probe["score_micro_batch_size"], 1)
         common = (REPO_ROOT / "scripts" / "common_b200.sh").read_text(encoding="utf-8")
         for config_key in (
             "enabled",
-            "parent_state_count",
-            "successors_per_parent",
+            "benchmark",
+            "subset_size",
+            "num_rollouts_per_problem",
+            "horizon",
             "seed",
             "interval_steps",
             "sampling_temperature",
+            "sampling_top_p",
+            "generation_batch_size",
             "score_micro_batch_size",
         ):
             self.assertIn(f"one_step_kl_probe.{config_key}=", common)

@@ -25,28 +25,37 @@ def test_probe_config_resolves_requested_production_defaults():
         method="cmt",
     )
     assert resolved.enabled is True
-    assert resolved.parent_state_count == 64
-    assert resolved.successors_per_parent == 1
-    assert resolved.state_source == "training_rollout_successors"
-    assert resolved.seed == 20260922
-    assert resolved.top_k == 16
-    assert resolved.score_micro_batch_size == 8
+    assert resolved.benchmark == "Competition-MATH"
+    assert resolved.subset_size == 64
+    assert resolved.num_rollouts_per_problem == 2
+    assert resolved.horizon == 64
+    assert resolved.state_source == "on_policy_heldout_roots"
+    assert resolved.seed == 20260923
+    assert resolved.metric == "full_vocab_reverse_kl"
+    assert resolved.sampling_temperature == 1.0
+    assert resolved.sampling_top_p == 1.0
+    assert resolved.generation_batch_size == 8
+    assert resolved.score_micro_batch_size == 1
     assert not resolved.should_probe(1)
-    assert resolved.should_probe(10)
-    assert resolved.should_probe(180)
+    assert resolved.should_probe(50)
+    assert resolved.should_probe(150)
 
 
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"parent_state_count": 0}, "parent_state_count must be positive"),
-        ({"successors_per_parent": 0}, "successors_per_parent must be positive"),
-        ({"state_source": "heldout"}, "state_source"),
+        ({"subset_size": 0}, "subset_size must be positive"),
+        ({"num_rollouts_per_problem": 0}, "num_rollouts_per_problem"),
+        ({"horizon": 0}, "horizon must be positive"),
+        ({"state_source": "training_rollout_successors"}, "state_source"),
         ({"interval_steps": 0}, "interval_steps must be positive"),
-        ({"top_k": 8}, "top_k=16"),
         ({"failure_policy": "ignore"}, "failure_policy"),
         ({"metric": "forward_kl"}, "metric"),
         ({"sampling_temperature": -1.0}, "sampling_temperature"),
+        ({"sampling_top_p": 0.95}, "sampling_top_p=1.0"),
+        ({"generation_batch_size": 0}, "generation_batch_size"),
+        ({"score_micro_batch_size": 0}, "score_micro_batch_size"),
+        ({"benchmark": ""}, "benchmark"),
     ],
 )
 def test_probe_config_rejects_invalid_values(overrides, message):

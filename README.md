@@ -240,37 +240,41 @@ giá trị Step-0 đã căn chỉnh khi so sánh OPD với CMT-OPD. Evaluator b�
 **Measured target result:** chưa chạy trên máy B200; `scripts/smoke_test_b200.sh` sẽ cập nhật block này.
 <!-- B200_AUTOTUNE_RESULT_END -->
 
-## Paired one-step successor-state KL probe cho CMT
+## Paired on-policy trajectory KL probe cho CMT
 
-Launcher CMT mặc định chạy probe mỗi 10 optimizer step và chọn 64 parent states từ rollout huấn
-luyện hiện tại ở mỗi step được probe. Student pre-update được rescore tại mỗi parent và sample một
-action từ full-vocabulary policy, tạo 64 successor states. Tập successor này được khóa cho cả
-Uniform và CMT; Student Top-16
-pre-update tại từng successor là support chung để chấm teacher và hai model sau update. Probe
-không generate thêm rollout bằng vLLM. `state_age_steps` cho biết parent rollout đã cũ bao nhiêu
-PPO update (`0` ở group đầu, sau đó `1`, `2`, `3` với cấu hình CMT mặc định).
+Launcher CMT mặc định chạy probe mỗi 50 optimizer step trên 64 đề cố định được sample một lần từ
+Competition-MATH test (seed `20260923`). Sau Uniform shadow update và sau CMT update thật, mỗi nhánh
+tự sinh hai continuation dài tối đa 64 token từ cùng các root, với `temperature=1`, `top_p=1` và
+matched random seeds. Vì trajectory là branch-specific, metric bao gồm cả thay đổi action lẫn thay
+đổi state visitation.
 
-Với conditional reverse KL trên support đã khóa, mỗi step ghi:
+Tại mỗi state đã visit, probe tính exact full-vocabulary reverse KL
+`KL(student_branch || teacher)`. Mỗi trajectory được chuẩn hóa bằng horizon cố định 64 (phần sau EOS
+đóng góp 0), rồi average đều qua rollout và problem. Metric chính là:
 
 ```text
-delta_uniform = KL_before - KL_after_uniform
-delta_cmt     = KL_before - KL_after_cmt
-paired_gap    = delta_cmt - delta_uniform
+trajectory_gap = D_H(Uniform, teacher) - D_H(CMT, teacher)
 ```
+
+Gap dương nghĩa là sau đúng một update, nhánh CMT sinh future trajectories gần teacher hơn nhánh
+Uniform theo metric này. Đây là diagnostic độc lập với công thức CMT, nhưng không đồng nghĩa trực
+tiếp với correctness hay final benchmark accuracy.
 
 Uniform OPD là một shadow update trên đúng PPO group/reference/clipping của CMT nhưng dùng weight
 1 cho mọi valid token. Model, optimizer và RNG được snapshot ra CPU, chạy shadow, rồi restore và
 kiểm tra chính xác trước khi CMT update thật chạy. Shadow không tăng step, không gọi callback và
-không tạo checkpoint. Kết quả nằm trong `one_step_kl_probe/one_step_kl_probe.jsonl` và `.csv`, một
-row duy nhất cho mỗi optimizer step được probe; resume tự rewind row sau checkpoint. Log gồm mean và
-successor-level standard error cho `delta_uniform`, `delta_cmt` và `paired_gap`, cùng hash của đúng
-64 successor states. Probe scoring dùng micro-batch 8 mặc định. Đây là rollout-batch diagnostic,
-không phải held-out/test generalization.
+không tạo checkpoint. Kết quả nằm trong `one_step_trajectory_kl_probe/`: file
+`trajectory_kl_probe.{jsonl,csv}` có một row mỗi step và
+`trajectory_kl_per_problem.{jsonl,csv}` có 64 row mỗi step. Manifest và rank-local root tensors khóa
+đúng subset qua resume; cả hai loại log đều được rewind về checkpoint step khi resume.
+
+64 đề này đã được dùng làm diagnostic nên không còn là untouched final test set. Không dùng gap của
+run đang chạy để tune chính run đó; kết luận chính vẫn cần accuracy/outcome và nhiều seed.
 
 Các override chính: `ONE_STEP_KL_PROBE_ENABLED`,
-`ONE_STEP_KL_PROBE_PARENT_STATE_COUNT`, `ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT`,
-`ONE_STEP_KL_PROBE_SEED`, `ONE_STEP_KL_PROBE_INTERVAL`,
-`ONE_STEP_KL_PROBE_SAMPLING_TEMPERATURE` và `ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE`.
+`ONE_STEP_KL_PROBE_SUBSET_SIZE`, `ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM`,
+`ONE_STEP_KL_PROBE_HORIZON`, `ONE_STEP_KL_PROBE_SEED`, `ONE_STEP_KL_PROBE_INTERVAL`,
+`ONE_STEP_KL_PROBE_GENERATION_BATCH_SIZE` và `ONE_STEP_KL_PROBE_SCORE_MICRO_BATCH_SIZE`.
 
 ## Output và resume
 

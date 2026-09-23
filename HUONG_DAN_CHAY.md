@@ -174,6 +174,21 @@ CMT_FULL_VOCAB_DIAGNOSTICS=true RUN_NAME="$CMT_RUN_NAME" \
   bash scripts/train_cmt_b200.sh
 ```
 
+Launcher CMT bật sẵn on-policy trajectory KL probe: 64 đề Competition-MATH test cố định,
+2 rollout/đề/nhánh, horizon 64, chạy mỗi 50 optimizer step. Probe so sánh Uniform shadow với CMT
+thật bằng exact full-vocabulary `KL(student || teacher)`; nó không thay loss hoặc optimizer step của
+luồng train. Artifact nằm trong `one_step_trajectory_kl_probe/`. Muốn smoke nhanh:
+
+```bash
+MAX_STEPS=2 ONE_STEP_KL_PROBE_INTERVAL=1 \
+ONE_STEP_KL_PROBE_SUBSET_SIZE=8 \
+ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM=1 \
+ONE_STEP_KL_PROBE_HORIZON=16 \
+RUN_NAME=cmt_trajectory_probe_smoke bash scripts/train_cmt_b200.sh
+```
+
+Subset test này là diagnostic data, không còn là untouched final test set.
+
 ### TA-OPD
 
 ```bash

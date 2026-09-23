@@ -2509,8 +2509,8 @@ def _opd_train_step(
                 on_optimizer_step(optimizer_step, cmt_result["minibatches"][0])
             continue
 
+        cmt_branch_started = time.perf_counter()
         cmt_result = _opd_train_step_impl(**common_group)
-        cmt_eval_started = time.perf_counter()
         post_update_error: BaseException | None = None
         try:
             kl_after_cmt = one_step_probe.score_student(model, prepared)
@@ -2524,7 +2524,7 @@ def _opd_train_step(
                 uniform_update_loss=float(uniform_result["loss"]),
                 cmt_update_loss=float(cmt_result["loss"]),
                 uniform_branch_time_sec=float(uniform_branch_seconds),
-                cmt_eval_time_sec=float(time.perf_counter() - cmt_eval_started),
+                cmt_eval_time_sec=float(time.perf_counter() - cmt_branch_started),
             )
         except BaseException as error:
             post_update_error = error
@@ -3774,14 +3774,18 @@ def run_training(
             static_graph=bool(distributed_cfg.get("static_graph", True)),
             bucket_cap_mb=float(distributed_cfg.get("bucket_cap_mb", 100)),
         )
-    setup_progress.set_postfix_str("stage=successor-kl-probe", refresh=True)
+    setup_progress.set_postfix_str("stage=trajectory-kl-probe", refresh=True)
     one_step_probe, one_step_probe_metadata = prepare_one_step_kl_probe(
         config,
         method=method,
+        student=training_student,
         teacher=scoring_teacher,
         tokenizer=tokenizer,
+        rollout_engine=rollout_engine,
         output_dir=output_dir,
         distributed=distributed,
+        device=device,
+        resume=resume_checkpoint is not None,
     )
     setup_progress.update(1)
     setup_progress.set_postfix_str("stage=optimizer", refresh=True)
@@ -5091,13 +5095,18 @@ def run_training(
                 cmt_final_allocation_kl if method == "cmt" else None
             ),
             "one_step_kl_probe_enabled": one_step_probe is not None,
-            "one_step_kl_probe_parent_state_count": (
-                one_step_probe.config.parent_state_count
+            "one_step_kl_probe_subset_size": (
+                one_step_probe.config.subset_size
                 if one_step_probe is not None
                 else None
             ),
-            "one_step_kl_probe_successors_per_parent": (
-                one_step_probe.config.successors_per_parent
+            "one_step_kl_probe_rollouts_per_problem": (
+                one_step_probe.config.num_rollouts_per_problem
+                if one_step_probe is not None
+                else None
+            ),
+            "one_step_kl_probe_horizon": (
+                one_step_probe.config.horizon
                 if one_step_probe is not None
                 else None
             ),

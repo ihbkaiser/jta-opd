@@ -54,19 +54,21 @@ selector:
   # matched and does not pay this O(B*T*V) reduction by default.
   cmt_full_vocab_diagnostics: false
 
-# Exact paired diagnostic: each real CMT update is compared with a restorable
-# uniform-OPD shadow update on 64 rollout parent states x 1 frozen successor.
-# The diagnostic runs every 10 optimizer steps to bound training overhead.
+# Paired on-policy future-trajectory diagnostic. Uniform and CMT each generate
+# their own continuations from the same fixed Competition-MATH test roots.
 one_step_kl_probe:
   enabled: true
-  state_source: training_rollout_successors
-  parent_state_count: 64
-  successors_per_parent: 1
-  seed: 20260922
-  interval_steps: 10
-  top_k: 16
-  metric: conditional_reverse_kl
+  state_source: on_policy_heldout_roots
+  benchmark: Competition-MATH
+  subset_size: 64
+  num_rollouts_per_problem: 2
+  horizon: 64
+  seed: 20260923
+  interval_steps: 50
+  metric: full_vocab_reverse_kl
   failure_policy: error
-  artifact_subdir: one_step_kl_probe
+  artifact_subdir: one_step_trajectory_kl_probe
   sampling_temperature: 1.0
-  score_micro_batch_size: 8
+  sampling_top_p: 1.0
+  generation_batch_size: 8
+  score_micro_batch_size: 1

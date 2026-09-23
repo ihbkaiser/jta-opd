@@ -135,21 +135,24 @@ selector:
   # parallel = vectorized O(log T) associative scan; reference is a test/debug fallback.
   rac_scan_backend: parallel
 
-# Paired realized one-step diagnostic. Method-specific configs opt in; keeping
-# the shared default disabled preserves every legacy OPD/TA/RAC/PGT run.
+# Paired on-policy trajectory diagnostic. Method-specific configs opt in;
+# keeping the shared default disabled preserves every non-CMT run.
 one_step_kl_probe:
   enabled: false
-  state_source: training_rollout_successors
-  parent_state_count: 64
-  successors_per_parent: 1
-  seed: 20260922
-  interval_steps: 10
-  top_k: 16
-  metric: conditional_reverse_kl
+  state_source: on_policy_heldout_roots
+  benchmark: Competition-MATH
+  subset_size: 64
+  num_rollouts_per_problem: 2
+  horizon: 64
+  seed: 20260923
+  interval_steps: 50
+  metric: full_vocab_reverse_kl
   failure_policy: error
-  artifact_subdir: one_step_kl_probe
+  artifact_subdir: one_step_trajectory_kl_probe
   sampling_temperature: 1.0
-  score_micro_batch_size: 8
+  sampling_top_p: 1.0
+  generation_batch_size: 8
+  score_micro_batch_size: 1
 
 token_budget:
   rho: 0.10

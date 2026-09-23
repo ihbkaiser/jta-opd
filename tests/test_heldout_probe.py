@@ -6,6 +6,7 @@ import torch
 
 from b200_experiment.heldout_probe import (
     HeldoutPrefixStore,
+    HeldoutRootStore,
     select_heldout_records,
 )
 from b200_experiment.scoring import RolloutBatch
@@ -115,3 +116,43 @@ def test_heldout_store_rejects_manifest_settings_mismatch(tmp_path):
             torch.device("cpu"),
             expected={"benchmark": "Competition-MATH", "generation": {"seed": 8}},
         )
+
+
+def test_heldout_root_store_round_trips_prompts_ids_and_hash(tmp_path):
+    store = HeldoutRootStore(tmp_path, _distributed())
+    prompt_ids = torch.tensor([[0, 4, 5], [6, 7, 8]])
+    attention_mask = torch.tensor([[0, 1, 1], [1, 1, 1]])
+    manifest = store.save(
+        prompt_ids,
+        attention_mask,
+        ["problem-a", "problem-b"],
+        {"benchmark": "Competition-MATH", "subset_seed": 20260923},
+    )
+
+    loaded = store.load(
+        torch.device("cpu"),
+        expected={"benchmark": "Competition-MATH", "subset_seed": 20260923},
+    )
+
+    assert loaded.manifest == manifest
+    assert loaded.problem_ids == ("problem-a", "problem-b")
+    assert torch.equal(loaded.prompt_ids, prompt_ids)
+    assert torch.equal(loaded.attention_mask, attention_mask)
+    assert loaded.root_hash == manifest["root_hash"]
+
+
+def test_heldout_root_store_detects_changed_prompt_bytes(tmp_path):
+    store = HeldoutRootStore(tmp_path, _distributed())
+    store.save(
+        torch.tensor([[1, 2]]),
+        torch.tensor([[1, 1]]),
+        ["problem-a"],
+        {"benchmark": "Competition-MATH"},
+    )
+    tensor_path = tmp_path / "heldout_roots.rank-00000.pt"
+    payload = torch.load(tensor_path, map_location="cpu", weights_only=True)
+    payload["prompt_ids"][0, 0] += 1
+    torch.save(payload, tensor_path)
+
+    with pytest.raises(ValueError, match="held-out root hash mismatch"):
+        store.load(torch.device("cpu"))

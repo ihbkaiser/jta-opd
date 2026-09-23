@@ -123,15 +123,17 @@ RUN_NAME="$RAC_RUN_NAME" bash scripts/train_rac_b200.sh
 RUN_NAME="$CMT_RUN_NAME" bash scripts/train_cmt_b200.sh
 ```
 
-CMT launcher đồng thời tạo paired one-step KL log trên 64 parent states của rollout hiện tại, mỗi
-parent có 4 successor sample từ student pre-update. Có thể chạy smoke rẻ hơn trước full run:
+CMT launcher đồng thời tạo paired on-policy trajectory KL log trên 64 root cố định của
+Competition-MATH test. Mỗi nhánh sinh hai rollout/root, horizon 64, rồi được chấm exact
+full-vocabulary `KL(student || teacher)`. Có thể chạy smoke rẻ hơn trước full run:
 
 ```bash
 RUN_NAME="cmt_kl_probe_smoke" \
 MAX_STEPS=2 \
 SAVE_INTERVAL=1 \
-ONE_STEP_KL_PROBE_PARENT_STATE_COUNT=8 \
-ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT=2 \
+ONE_STEP_KL_PROBE_SUBSET_SIZE=8 \
+ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM=1 \
+ONE_STEP_KL_PROBE_HORIZON=16 \
 ONE_STEP_KL_PROBE_INTERVAL=1 \
 bash scripts/train_cmt_b200.sh
 ```
@@ -143,19 +145,19 @@ RUN_NAME="cmt_kl_probe_smoke" \
 RESUME_FROM_CHECKPOINT="outputs/cmt_kl_probe_smoke/cmt_opd/checkpoint-000001" \
 MAX_STEPS=2 \
 SAVE_INTERVAL=1 \
-ONE_STEP_KL_PROBE_PARENT_STATE_COUNT=8 \
-ONE_STEP_KL_PROBE_SUCCESSORS_PER_PARENT=2 \
+ONE_STEP_KL_PROBE_SUBSET_SIZE=8 \
+ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM=1 \
+ONE_STEP_KL_PROBE_HORIZON=16 \
 ONE_STEP_KL_PROBE_INTERVAL=1 \
 bash scripts/train_cmt_b200.sh
 
-wc -l outputs/cmt_kl_probe_smoke/cmt_opd/one_step_kl_probe/one_step_kl_probe.jsonl
+wc -l outputs/cmt_kl_probe_smoke/cmt_opd/one_step_trajectory_kl_probe/trajectory_kl_probe.jsonl
 ```
 
-Yêu cầu smoke: JSONL/CSV có đúng hai step duy nhất, mỗi row có successor hash và số state đúng,
-mọi KL/delta/standard-error hữu hạn, và log train vẫn chỉ tăng hai optimizer step thật. Full run mặc
-định probe mỗi 10 optimizer step với `64 x 1 = 64` successor states và score micro-batch 8. Probe
-không generate thêm vLLM rollout nhưng tại mỗi step được probe vẫn tốn một uniform shadow update,
-một forward sampling successor và các lượt student/teacher scoring.
+Yêu cầu smoke: step log có đúng hai step duy nhất, per-problem log có 16 row, mọi KL/gap hữu hạn,
+root hash không đổi qua resume, và log train vẫn chỉ tăng hai optimizer step thật. Full run mặc định
+probe mỗi 50 optimizer step với `64 x 2` trajectory/nhánh, horizon 64 và score micro-batch 1. Mỗi
+probe tốn một Uniform shadow update, hai lượt generation và bốn lượt student/teacher scoring.
 Không dùng paired gap quan sát được để tune chính run đã khóa này.
 
 `BATCH_SIZE` và `PPO_MINI_BATCH_SIZE` là global, không đổi theo world size. Ví dụ PPO batch 16

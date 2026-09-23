@@ -208,3 +208,144 @@ class HeldoutPrefixStore:
             manifest=manifest,
             prefix_hash=str(manifest["prefix_hash"]),
         )
+
+
+def _root_digest(payload: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for name in ("prompt_ids", "attention_mask"):
+        tensor = payload.get(name)
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"Held-out root artifact is missing {name}")
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(_canonical_json(list(value.shape)))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    problem_ids = payload.get("problem_ids")
+    if not isinstance(problem_ids, list) or len(problem_ids) != int(
+        payload["prompt_ids"].shape[0]
+    ):
+        raise ValueError("Held-out root problem IDs do not align with prompts")
+    digest.update(_canonical_json([str(value) for value in problem_ids]))
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class HeldoutRootArtifact:
+    prompt_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    problem_ids: tuple[str, ...]
+    manifest: dict[str, Any]
+    root_hash: str
+
+
+class HeldoutRootStore:
+    """Persist the fixed benchmark roots used by every trajectory probe step."""
+
+    def __init__(self, root: str | Path, distributed):
+        self.root = Path(root)
+        self.distributed = distributed
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.root / "heldout_root_manifest.json"
+
+    def rank_tensor_path(self, rank: int | None = None) -> Path:
+        resolved = int(self.distributed.rank if rank is None else rank)
+        return self.root / f"heldout_roots.rank-{resolved:05d}.pt"
+
+    def save(
+        self,
+        prompt_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        problem_ids: list[str] | tuple[str, ...],
+        manifest_fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        if prompt_ids.ndim != 2 or attention_mask.shape != prompt_ids.shape:
+            raise ValueError("Held-out root tensors must be aligned rank-2 tensors")
+        if len(problem_ids) != int(prompt_ids.shape[0]):
+            raise ValueError("Held-out root problem IDs do not align with prompts")
+        self.root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "prompt_ids": prompt_ids.detach().cpu().contiguous(),
+            "attention_mask": attention_mask.detach().cpu().contiguous(),
+            "problem_ids": [str(value) for value in problem_ids],
+        }
+        local_hash = _root_digest(payload)
+        path = self.rank_tensor_path()
+        _atomic_torch_save(path, payload)
+        summary = {
+            "rank": int(self.distributed.rank),
+            "rows": int(prompt_ids.shape[0]),
+            "file": path.name,
+            "sha256": local_hash,
+        }
+        summaries = sorted(
+            self.distributed.all_gather_objects(summary),
+            key=lambda item: int(item["rank"]),
+        )
+        root_hash = hashlib.sha256(_canonical_json(summaries)).hexdigest()
+        manifest = {
+            **manifest_fields,
+            "format_version": 1,
+            "world_size": int(self.distributed.world_size),
+            "rank_artifacts": summaries,
+            "root_hash": root_hash,
+        }
+        if self.distributed.is_main:
+            _atomic_json(self.manifest_path, manifest)
+        self.distributed.barrier()
+        if not self.distributed.is_main:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        return manifest
+
+    def load(
+        self,
+        device: torch.device,
+        *,
+        expected: dict[str, Any] | None = None,
+    ) -> HeldoutRootArtifact:
+        if not self.manifest_path.is_file():
+            raise FileNotFoundError(
+                f"Held-out root manifest does not exist: {self.manifest_path}"
+            )
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        if int(manifest.get("format_version", -1)) != 1:
+            raise ValueError("Unsupported held-out root manifest format")
+        if int(manifest.get("world_size", -1)) != int(self.distributed.world_size):
+            raise ValueError("Held-out root world size does not match this run")
+        if expected:
+            mismatches = {
+                key: (manifest.get(key), value)
+                for key, value in expected.items()
+                if manifest.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "held-out root manifest does not match requested settings: "
+                    f"{mismatches}"
+                )
+        summaries = manifest.get("rank_artifacts")
+        if not isinstance(summaries, list):
+            raise ValueError("Held-out root manifest has no rank artifacts")
+        if hashlib.sha256(_canonical_json(summaries)).hexdigest() != manifest.get(
+            "root_hash"
+        ):
+            raise ValueError("Held-out root manifest aggregate hash mismatch")
+        matches = [
+            item
+            for item in summaries
+            if int(item.get("rank", -1)) == int(self.distributed.rank)
+        ]
+        if len(matches) != 1:
+            raise ValueError("Held-out root manifest has no unique local artifact")
+        payload = _torch_load(self.root / str(matches[0]["file"]))
+        if _root_digest(payload) != matches[0].get("sha256"):
+            raise ValueError("held-out root hash mismatch")
+        return HeldoutRootArtifact(
+            prompt_ids=payload["prompt_ids"].to(device),
+            attention_mask=payload["attention_mask"].to(device),
+            problem_ids=tuple(str(value) for value in payload["problem_ids"]),
+            manifest=manifest,
+            root_hash=str(manifest["root_hash"]),
+        )

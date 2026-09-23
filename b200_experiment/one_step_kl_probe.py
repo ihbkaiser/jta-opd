@@ -6,23 +6,23 @@ from typing import Any, Mapping
 
 import torch
 
-from .opd_core import OPD_LOSS_TOP_K
-
-
 @dataclass(frozen=True)
 class OneStepKLProbeConfig:
     enabled: bool = False
-    state_source: str = "training_rollout_successors"
-    parent_state_count: int = 64
-    successors_per_parent: int = 1
-    seed: int = 20260922
-    interval_steps: int = 10
-    top_k: int = OPD_LOSS_TOP_K
-    metric: str = "conditional_reverse_kl"
+    state_source: str = "on_policy_heldout_roots"
+    benchmark: str = "Competition-MATH"
+    subset_size: int = 64
+    num_rollouts_per_problem: int = 2
+    horizon: int = 64
+    seed: int = 20260923
+    interval_steps: int = 50
+    metric: str = "full_vocab_reverse_kl"
     failure_policy: str = "error"
-    artifact_subdir: str = "one_step_kl_probe"
+    artifact_subdir: str = "one_step_trajectory_kl_probe"
     sampling_temperature: float = 1.0
-    score_micro_batch_size: int = 8
+    sampling_top_p: float = 1.0
+    generation_batch_size: int = 8
+    score_micro_batch_size: int = 1
 
     @classmethod
     def from_mapping(
@@ -32,18 +32,25 @@ class OneStepKLProbeConfig:
         config = cls(
             enabled=bool(values.get("enabled", False)),
             state_source=str(
-                values.get("state_source", "training_rollout_successors")
+                values.get("state_source", "on_policy_heldout_roots")
             ),
-            parent_state_count=int(values.get("parent_state_count", 64)),
-            successors_per_parent=int(values.get("successors_per_parent", 1)),
-            seed=int(values.get("seed", 20260922)),
-            interval_steps=int(values.get("interval_steps", 10)),
-            top_k=int(values.get("top_k", OPD_LOSS_TOP_K)),
-            metric=str(values.get("metric", "conditional_reverse_kl")),
+            benchmark=str(values.get("benchmark", "Competition-MATH")),
+            subset_size=int(values.get("subset_size", 64)),
+            num_rollouts_per_problem=int(
+                values.get("num_rollouts_per_problem", 2)
+            ),
+            horizon=int(values.get("horizon", 64)),
+            seed=int(values.get("seed", 20260923)),
+            interval_steps=int(values.get("interval_steps", 50)),
+            metric=str(values.get("metric", "full_vocab_reverse_kl")),
             failure_policy=str(values.get("failure_policy", "error")),
-            artifact_subdir=str(values.get("artifact_subdir", "one_step_kl_probe")),
+            artifact_subdir=str(
+                values.get("artifact_subdir", "one_step_trajectory_kl_probe")
+            ),
             sampling_temperature=float(values.get("sampling_temperature", 1.0)),
-            score_micro_batch_size=int(values.get("score_micro_batch_size", 8)),
+            sampling_top_p=float(values.get("sampling_top_p", 1.0)),
+            generation_batch_size=int(values.get("generation_batch_size", 8)),
+            score_micro_batch_size=int(values.get("score_micro_batch_size", 1)),
         )
         config.validate(method=method)
         return config
@@ -51,26 +58,26 @@ class OneStepKLProbeConfig:
     def validate(self, *, method: str) -> None:
         if self.enabled and str(method).strip().lower() != "cmt":
             raise ValueError("one_step_kl_probe is only supported for method=cmt")
-        if self.state_source != "training_rollout_successors":
+        if self.state_source != "on_policy_heldout_roots":
             raise ValueError(
                 "one_step_kl_probe.state_source must be "
-                "'training_rollout_successors'"
+                "'on_policy_heldout_roots'"
             )
-        if self.parent_state_count <= 0:
-            raise ValueError("one_step_kl_probe.parent_state_count must be positive")
-        if self.successors_per_parent <= 0:
+        if not self.benchmark.strip():
+            raise ValueError("one_step_kl_probe.benchmark cannot be empty")
+        if self.subset_size <= 0:
+            raise ValueError("one_step_kl_probe.subset_size must be positive")
+        if self.num_rollouts_per_problem <= 0:
             raise ValueError(
-                "one_step_kl_probe.successors_per_parent must be positive"
+                "one_step_kl_probe.num_rollouts_per_problem must be positive"
             )
+        if self.horizon <= 0:
+            raise ValueError("one_step_kl_probe.horizon must be positive")
         if self.interval_steps <= 0:
             raise ValueError("one_step_kl_probe.interval_steps must be positive")
-        if self.top_k != OPD_LOSS_TOP_K:
+        if self.metric != "full_vocab_reverse_kl":
             raise ValueError(
-                f"one_step_kl_probe requires top_k={OPD_LOSS_TOP_K}"
-            )
-        if self.metric != "conditional_reverse_kl":
-            raise ValueError(
-                "one_step_kl_probe.metric must be 'conditional_reverse_kl'"
+                "one_step_kl_probe.metric must be 'full_vocab_reverse_kl'"
             )
         if self.failure_policy not in {"error", "warn"}:
             raise ValueError(
@@ -84,6 +91,12 @@ class OneStepKLProbeConfig:
         ):
             raise ValueError(
                 "one_step_kl_probe.sampling_temperature must be finite and positive"
+            )
+        if self.sampling_top_p != 1.0:
+            raise ValueError("one_step_kl_probe requires sampling_top_p=1.0")
+        if self.generation_batch_size <= 0:
+            raise ValueError(
+                "one_step_kl_probe.generation_batch_size must be positive"
             )
         if self.score_micro_batch_size <= 0:
             raise ValueError(

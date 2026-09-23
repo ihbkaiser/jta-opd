@@ -397,39 +397,56 @@ class ResumeTests(unittest.TestCase):
     def test_resume_rewinds_probe_rows_but_preserves_fixed_heldout_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            probe_root = root / "one_step_kl_probe"
+            probe_root = root / "one_step_trajectory_kl_probe"
             probe_root.mkdir()
             rows = [
-                {"optimizer_step": step, "kl_before": float(step)}
+                {"optimizer_step": step, "trajectory_gap": float(step)}
                 for step in (99, 100, 101)
             ]
-            (probe_root / "one_step_kl_probe.jsonl").write_text(
+            problem_rows = [
+                {"optimizer_step": step, "problem_id": problem_id}
+                for step in (99, 100, 101)
+                for problem_id in ("a", "b")
+            ]
+            (probe_root / "trajectory_kl_probe.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),
                 encoding="utf-8",
             )
-            with (probe_root / "one_step_kl_probe.csv").open(
+            with (probe_root / "trajectory_kl_probe.csv").open(
                 "w", newline="", encoding="utf-8"
             ) as handle:
                 writer = csv.DictWriter(
-                    handle, fieldnames=("optimizer_step", "kl_before")
+                    handle, fieldnames=("optimizer_step", "trajectory_gap")
                 )
                 writer.writeheader()
                 writer.writerows(rows)
-            manifest = probe_root / "heldout_manifest.json"
-            prefixes = probe_root / "heldout_prefixes.rank-00000.pt"
+            (probe_root / "trajectory_kl_per_problem.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in problem_rows),
+                encoding="utf-8",
+            )
+            with (probe_root / "trajectory_kl_per_problem.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=("optimizer_step", "problem_id")
+                )
+                writer.writeheader()
+                writer.writerows(problem_rows)
+            manifest = probe_root / "heldout_root_manifest.json"
+            prefixes = probe_root / "heldout_roots.rank-00000.pt"
             manifest.write_text('{"fixed": true}\n', encoding="utf-8")
-            prefixes.write_bytes(b"fixed-prefixes")
+            prefixes.write_bytes(b"fixed-roots")
 
             result = validate_append_history(root, 100)
 
-            with (probe_root / "one_step_kl_probe.jsonl").open(
+            with (probe_root / "trajectory_kl_probe.jsonl").open(
                 encoding="utf-8"
             ) as handle:
                 self.assertEqual(
                     [json.loads(line)["optimizer_step"] for line in handle],
                     [99, 100],
                 )
-            with (probe_root / "one_step_kl_probe.csv").open(
+            with (probe_root / "trajectory_kl_probe.csv").open(
                 newline="", encoding="utf-8"
             ) as handle:
                 self.assertEqual(
@@ -437,14 +454,18 @@ class ResumeTests(unittest.TestCase):
                     [99, 100],
                 )
             self.assertEqual(manifest.read_text(encoding="utf-8"), '{"fixed": true}\n')
-            self.assertEqual(prefixes.read_bytes(), b"fixed-prefixes")
+            self.assertEqual(prefixes.read_bytes(), b"fixed-roots")
             self.assertEqual(
-                result["removed_rows"]["one_step_kl_probe/one_step_kl_probe.jsonl"],
+                result["removed_rows"]["one_step_trajectory_kl_probe/trajectory_kl_probe.jsonl"],
                 1,
             )
             self.assertEqual(
-                result["removed_rows"]["one_step_kl_probe/one_step_kl_probe.csv"],
+                result["removed_rows"]["one_step_trajectory_kl_probe/trajectory_kl_probe.csv"],
                 1,
+            )
+            self.assertEqual(
+                result["removed_rows"]["one_step_trajectory_kl_probe/trajectory_kl_per_problem.jsonl"],
+                2,
             )
 
     def test_resume_rewrites_mixed_selector_chunk_and_deletes_later_chunk(self):
@@ -517,7 +538,7 @@ class ResumeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "cmt_allocation_mode"):
                 validate_resume_config(checkpoint, current)
 
-    def test_resume_rejects_changing_successor_probe_population(self):
+    def test_resume_rejects_changing_trajectory_probe_population(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             checkpoint = output / "checkpoint-000100"
@@ -525,18 +546,20 @@ class ResumeTests(unittest.TestCase):
             source = _controlled_config("cmt")
             source["one_step_kl_probe"] = {
                 "enabled": True,
-                "state_source": "training_rollout_successors",
-                "parent_state_count": 64,
-                "successors_per_parent": 4,
-                "seed": 20260922,
+                "state_source": "on_policy_heldout_roots",
+                "benchmark": "Competition-MATH",
+                "subset_size": 64,
+                "num_rollouts_per_problem": 2,
+                "horizon": 64,
+                "seed": 20260923,
             }
             (output / "resolved_config.yaml").write_text(
                 yaml.safe_dump(source), encoding="utf-8"
             )
             current = copy.deepcopy(source)
-            current["one_step_kl_probe"]["parent_state_count"] = 32
+            current["one_step_kl_probe"]["subset_size"] = 32
 
-            with self.assertRaisesRegex(ValueError, "parent_state_count"):
+            with self.assertRaisesRegex(ValueError, "subset_size"):
                 validate_resume_config(checkpoint, current)
 
     def test_legacy_cmt_resume_uses_gibbs_compatibility_defaults(self):

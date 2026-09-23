@@ -4,16 +4,14 @@ import sys
 import types
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 try:
     import fcntl  # noqa: F401
 except ModuleNotFoundError:
     sys.modules["fcntl"] = types.SimpleNamespace(
-        LOCK_EX=1,
-        LOCK_UN=2,
-        flock=lambda *_args, **_kwargs: None,
+        LOCK_EX=1, LOCK_UN=2, flock=lambda *_args, **_kwargs: None
     )
 
 from b200_experiment import trainer
@@ -22,6 +20,7 @@ from b200_experiment.probe_runtime import (
     OneStepKLProbeRuntime,
     prepare_one_step_kl_probe,
 )
+from b200_experiment.trajectory_kl import TrajectoryKLEvaluation
 
 
 class _Distributed:
@@ -41,6 +40,10 @@ class _Distributed:
     def sum_float(value):
         return float(value)
 
+    @staticmethod
+    def barrier():
+        return None
+
 
 class _Probe:
     failure_policy = "error"
@@ -49,7 +52,7 @@ class _Probe:
         self.written = []
 
     @staticmethod
-    def should_probe(step):
+    def should_probe(_step):
         return True
 
     def prepare_before_step(self, model, step, **kwargs):
@@ -80,9 +83,7 @@ def _result(kwargs, loss):
         groups = torch.where(valid, torch.zeros_like(valid, dtype=torch.long), -1)
         steps = torch.where(
             valid,
-            torch.full_like(
-                valid, kwargs["optimizer_step_start"] + 1, dtype=torch.long
-            ),
+            torch.full_like(valid, kwargs["optimizer_step_start"] + 1, dtype=torch.long),
             -1,
         )
         processed = valid.clone()
@@ -110,14 +111,10 @@ def test_paired_probe_runs_uniform_shadow_then_restored_real_cmt(monkeypatch):
     calls = []
 
     def fake_impl(**kwargs):
-        before = float(next(kwargs["model"].parameters()).item())
         calls.append(
             {
-                "before": before,
+                "before": float(next(kwargs["model"].parameters()).item()),
                 "gibbs": kwargs["gibbs_scores"] is not None,
-                "weights": kwargs["position_weights"].clone(),
-                "callback": kwargs["on_optimizer_step"],
-                "offset": kwargs["ppo_minibatch_offset"],
             }
         )
         with torch.no_grad():
@@ -151,17 +148,10 @@ def test_paired_probe_runs_uniform_shadow_then_restored_real_cmt(monkeypatch):
     )
 
     assert [call["gibbs"] for call in calls] == [False, True]
-    assert calls[0]["weights"].tolist() == [[1.0]]
     assert calls[0]["before"] == calls[1]["before"] == 4.0
-    assert all(call["callback"] is None for call in calls)
     assert float(model.weight.item()) == 5.0
     assert callback_steps[0][0] == 11
-    assert len(callback_steps) == 1
     assert len(probe.written) == 1
-    assert probe.prepared_kwargs["rollout"] is rollout
-    assert probe.prepared_kwargs["rollout_id"] == 0
-    assert probe.prepared_kwargs["ppo_group_index"] == 0
-    assert probe.prepared_kwargs["state_age_steps"] == 0
     assert probe.written[0][1]["uniform_update_loss"] == 0.2
     assert probe.written[0][1]["cmt_update_loss"] == 0.1
     assert result["optimizer_steps"] == 1
@@ -175,98 +165,76 @@ def test_no_probe_keeps_single_existing_update_call(monkeypatch):
         return {"sentinel": True}
 
     monkeypatch.setattr(trainer, "_opd_train_step_impl", fake_impl)
-    result = trainer._opd_train_step(
-        object(),
-        object(),
-        object(),
-        object(),
-        object(),
-        {"training": {}},
-        torch.device("cpu"),
-        _Distributed(),
-    )
-
-    assert result == {"sentinel": True}
+    assert trainer._opd_train_step(
+        object(), object(), object(), object(), object(),
+        {"training": {}}, torch.device("cpu"), _Distributed()
+    ) == {"sentinel": True}
     assert len(calls) == 1
 
 
-def test_runtime_writes_complete_paired_record():
+def _evaluation(mean, values, lengths, early):
+    return TrajectoryKLEvaluation(
+        mean=mean,
+        problem_ids=("p0", "p1"),
+        per_problem_kl=torch.tensor(values, dtype=torch.float64),
+        per_problem_mean_length=torch.tensor(lengths, dtype=torch.float64),
+        per_problem_early_eos_rate=torch.tensor(early, dtype=torch.float64),
+        valid_state_count=120,
+        trajectory_count=4,
+        mean_length=sum(lengths) / 2,
+        early_eos_rate=sum(early) / 2,
+    )
+
+
+def test_runtime_logs_branch_specific_trajectory_gap():
     class Builder:
-        @staticmethod
-        def build(student, rollout, *, objective_valid_mask, optimizer_step):
-            assert student == "pre"
-            assert rollout == "training-rollout"
-            assert objective_valid_mask.tolist() == [[True]]
-            assert optimizer_step == 4
+        def build(self, student, *, optimizer_step):
             return SimpleNamespace(
-                rollout="successor-rollout",
-                parent_state_count=64,
-                successors_per_parent=4,
-                successor_state_count=256,
-                state_hash="successor-hash",
-                sampling_seed=123,
+                rollout=f"rollout-{student}",
+                problem_ids=("p0", "p1"),
+                sampling_seed=optimizer_step + 100,
+                trajectory_hash=f"hash-{student}",
             )
 
     class Evaluator:
-        @staticmethod
-        def build_reference(student, teacher, rollout, *, prefix_hash):
-            assert student == "pre"
+        def evaluate(self, student, teacher, rollout, *, problem_ids):
             assert teacher == "teacher"
-            assert rollout == "successor-rollout"
-            return SimpleNamespace(
-                global_valid_token_count=2,
-                prefix_hash=prefix_hash,
-                pre_kl_values=torch.tensor([0.9, 1.1]),
-            ), 1.0
-
-        @staticmethod
-        def score_student_evaluation(student, reference):
-            assert reference.prefix_hash == "successor-hash"
-            if student == "uniform":
-                return SimpleNamespace(
-                    mean=0.8,
-                    local_values=torch.tensor([0.7, 0.9]),
-                    global_count=2,
-                )
-            assert student == "cmt"
-            return SimpleNamespace(
-                mean=0.7,
-                local_values=torch.tensor([0.5, 0.9]),
-                global_count=2,
+            assert rollout == f"rollout-{student}"
+            assert problem_ids == ("p0", "p1")
+            return (
+                _evaluation(0.9, [1.0, 0.8], [64, 60], [0, 0.5])
+                if student == "uniform"
+                else _evaluation(0.7, [0.6, 0.8], [64, 64], [0, 0])
             )
 
     class Logger:
         def __init__(self):
-            self.rows = []
+            self.calls = []
 
-        def upsert(self, row):
-            self.rows.append(row)
+        def upsert(self, row, details):
+            self.calls.append((row, details))
 
     logger = Logger()
     runtime = OneStepKLProbeRuntime(
-        OneStepKLProbeConfig(enabled=True, top_k=16),
+        OneStepKLProbeConfig(enabled=True, subset_size=2),
         evaluator=Evaluator(),
         builder=Builder(),
         logger=logger,
         teacher="teacher",
         run_id="run-1",
         distributed=_Distributed(),
+        benchmark="Competition-MATH",
+        heldout_example_hash="examples",
+        heldout_root_hash="roots",
     )
-
     prepared = runtime.prepare_before_step(
-        "pre",
-        4,
-        rollout="training-rollout",
-        objective_valid_mask=torch.tensor([[True]]),
-        rollout_id=1,
-        ppo_group_index=2,
-        state_age_steps=2,
+        "pre", 50, rollout_id=1, ppo_group_index=2
     )
     uniform = runtime.score_student("uniform", prepared)
     cmt = runtime.score_student("cmt", prepared)
     runtime.write_pair(
         prepared,
-        optimizer_step=4,
+        optimizer_step=50,
         rollout_id=1,
         ppo_group_index=2,
         kl_after_uniform=uniform,
@@ -277,23 +245,11 @@ def test_runtime_writes_complete_paired_record():
         cmt_eval_time_sec=0.3,
     )
 
-    row = logger.rows[0]
-    assert row["delta_uniform"] == pytest.approx(0.2)
-    assert row["delta_cmt"] == pytest.approx(0.3)
-    assert row["paired_gap"] == pytest.approx(0.1)
-    assert row["successor_state_count"] == 256
-    assert row["valid_successor_state_count"] == 2
-    assert row["state_age_steps"] == 2
-    assert row["successor_state_hash"] == "successor-hash"
-    assert row["delta_cmt_standard_error"] == pytest.approx(0.1)
-
-
-class _SetupDistributed(_Distributed):
-    is_main = True
-
-    @staticmethod
-    def barrier():
-        return None
+    row, details = logger.calls[0]
+    assert row["trajectory_gap"] == pytest.approx(0.2)
+    assert row["uniform_trajectory_kl"] == pytest.approx(0.9)
+    assert row["cmt_trajectory_kl"] == pytest.approx(0.7)
+    assert [item["trajectory_gap"] for item in details] == pytest.approx([0.4, 0.0])
 
 
 class _Tokenizer:
@@ -323,44 +279,64 @@ def _probe_config(enabled=True):
         "models": {"student_path": "student", "teacher_path": "teacher"},
         "data": {"chat_template_kwargs": {}},
         "selector": {"score_chunk_steps": 32},
+        "evaluation": {
+            "benchmarks": {"Competition-MATH": {"path": "test.parquet"}}
+        },
         "one_step_kl_probe": {
             "enabled": enabled,
-            "state_source": "training_rollout_successors",
-            "parent_state_count": 64,
-            "successors_per_parent": 4,
+            "benchmark": "Competition-MATH",
+            "subset_size": 2,
+            "num_rollouts_per_problem": 2,
+            "horizon": 64,
             "seed": 11,
-            "interval_steps": 1,
-            "top_k": 16,
+            "interval_steps": 50,
+            "metric": "full_vocab_reverse_kl",
             "sampling_temperature": 1.0,
+            "sampling_top_p": 1.0,
+            "generation_batch_size": 1,
             "score_micro_batch_size": 1,
         },
     }
 
 
-def test_probe_setup_uses_training_successors_without_benchmark_or_generation():
+def test_probe_setup_persists_fixed_competition_math_roots(tmp_path):
+    records = [
+        {"id": "a", "problem": "one two"},
+        {"id": "b", "problem": "three four five"},
+    ]
     runtime, metadata = prepare_one_step_kl_probe(
         _probe_config(),
         method="cmt",
+        student=torch.nn.Linear(1, 1),
         teacher=torch.nn.Linear(1, 1),
         tokenizer=_Tokenizer(),
-        output_dir="unused",
-        distributed=_SetupDistributed(),
+        rollout_engine=None,
+        output_dir=tmp_path,
+        distributed=_Distributed(),
+        device=torch.device("cpu"),
+        resume=False,
+        benchmark_loader=lambda *_args: (records, {"file": "test.parquet"}),
     )
 
     assert runtime is not None
-    assert metadata["state_source"] == "training_rollout_successors"
-    assert metadata["parent_state_count"] == 64
-    assert metadata["successors_per_parent"] == 4
+    assert metadata["benchmark"] == "Competition-MATH"
+    assert metadata["subset_size"] == 2
+    assert metadata["metric"] == "full_vocab_reverse_kl"
+    assert (tmp_path / "one_step_trajectory_kl_probe" / "heldout_root_manifest.json").is_file()
 
 
-def test_disabled_probe_does_not_create_runtime():
+def test_disabled_probe_does_not_create_runtime(tmp_path):
     runtime, metadata = prepare_one_step_kl_probe(
         _probe_config(enabled=False),
         method="cmt",
+        student=torch.nn.Linear(1, 1),
         teacher=torch.nn.Linear(1, 1),
         tokenizer=_Tokenizer(),
-        output_dir="unused",
-        distributed=_SetupDistributed(),
+        rollout_engine=None,
+        output_dir=tmp_path,
+        distributed=_Distributed(),
+        device=torch.device("cpu"),
+        resume=False,
     )
     assert runtime is None
     assert metadata is None

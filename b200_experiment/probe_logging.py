@@ -6,75 +6,52 @@ import math
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
-
-from b200_experiment.one_step_kl_probe import paired_improvement
+from typing import Any, Mapping, Sequence
 
 
 PROBE_FIELDS = (
-    "run_id",
-    "optimizer_step",
-    "rollout_id",
-    "ppo_group_index",
-    "state_age_steps",
-    "state_source",
-    "parent_state_count",
-    "successors_per_parent",
-    "successor_state_count",
-    "sampling_distribution",
-    "sampling_seed",
-    "successor_state_hash",
-    "valid_successor_state_count",
-    "top_k",
-    "metric",
-    "kl_before",
-    "kl_after_uniform",
-    "kl_after_cmt",
-    "delta_uniform",
-    "delta_uniform_standard_error",
-    "delta_cmt",
-    "delta_cmt_standard_error",
-    "paired_gap",
-    "paired_gap_standard_error",
-    "uniform_update_loss",
-    "cmt_update_loss",
-    "probe_time_sec",
-    "uniform_branch_time_sec",
-    "cmt_eval_time_sec",
+    "run_id", "optimizer_step", "rollout_id", "ppo_group_index",
+    "benchmark", "subset_size", "num_rollouts_per_problem", "horizon",
+    "sampling_temperature", "sampling_top_p", "sampling_seed",
+    "heldout_example_hash", "heldout_root_hash", "uniform_trajectory_hash",
+    "cmt_trajectory_hash", "metric", "uniform_trajectory_kl",
+    "cmt_trajectory_kl", "trajectory_gap", "uniform_valid_state_count",
+    "cmt_valid_state_count", "uniform_mean_length", "cmt_mean_length",
+    "uniform_early_eos_rate", "cmt_early_eos_rate", "uniform_update_loss",
+    "cmt_update_loss", "probe_time_sec", "uniform_branch_time_sec",
+    "cmt_branch_time_sec",
 )
 
-_INTEGER_FIELDS = {
-    "optimizer_step",
-    "rollout_id",
-    "ppo_group_index",
-    "state_age_steps",
-    "parent_state_count",
-    "successors_per_parent",
-    "successor_state_count",
-    "sampling_seed",
-    "valid_successor_state_count",
-    "top_k",
+PROBLEM_FIELDS = (
+    "run_id", "optimizer_step", "problem_id", "uniform_trajectory_kl",
+    "cmt_trajectory_kl", "trajectory_gap", "uniform_mean_length",
+    "cmt_mean_length", "uniform_early_eos_rate", "cmt_early_eos_rate",
+)
+
+_PROBE_INTS = {
+    "optimizer_step", "rollout_id", "ppo_group_index", "subset_size",
+    "num_rollouts_per_problem", "horizon", "sampling_seed",
+    "uniform_valid_state_count", "cmt_valid_state_count",
 }
-_FLOAT_FIELDS = {
-    "kl_before",
-    "kl_after_uniform",
-    "kl_after_cmt",
-    "delta_uniform",
-    "delta_uniform_standard_error",
-    "delta_cmt",
-    "delta_cmt_standard_error",
-    "paired_gap",
-    "paired_gap_standard_error",
-    "uniform_update_loss",
-    "cmt_update_loss",
-    "probe_time_sec",
-    "uniform_branch_time_sec",
-    "cmt_eval_time_sec",
+_PROBE_FLOATS = set(PROBE_FIELDS) - _PROBE_INTS - {
+    "run_id", "benchmark", "heldout_example_hash", "heldout_root_hash",
+    "uniform_trajectory_hash", "cmt_trajectory_hash", "metric",
 }
+_PROBLEM_FLOATS = set(PROBLEM_FIELDS) - {
+    "run_id", "optimizer_step", "problem_id"
+}
+
+
+def _validate_gap(row: Mapping[str, Any]) -> None:
+    expected = float(row["uniform_trajectory_kl"]) - float(row["cmt_trajectory_kl"])
+    if not math.isclose(float(row["trajectory_gap"]), expected, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError(
+            f"trajectory_gap={row['trajectory_gap']} is inconsistent with {expected}"
+        )
 
 
 class OneStepKLProbeLogger:
-    """Write a paired probe record atomically and idempotently per optimizer step."""
+    """Atomically log step-level and per-problem trajectory KL outcomes."""
 
     def __init__(
         self,
@@ -82,113 +59,131 @@ class OneStepKLProbeLogger:
         *,
         enabled: bool = True,
         is_main: bool = True,
-        artifact_subdir: str = "one_step_kl_probe",
+        artifact_subdir: str = "one_step_trajectory_kl_probe",
     ) -> None:
         self.enabled = bool(enabled)
         self.is_main = bool(is_main)
         self.root = Path(output_dir) / artifact_subdir
-        self.jsonl_path = self.root / "one_step_kl_probe.jsonl"
-        self.csv_path = self.root / "one_step_kl_probe.csv"
+        self.jsonl_path = self.root / "trajectory_kl_probe.jsonl"
+        self.csv_path = self.root / "trajectory_kl_probe.csv"
+        self.problem_jsonl_path = self.root / "trajectory_kl_per_problem.jsonl"
+        self.problem_csv_path = self.root / "trajectory_kl_per_problem.csv"
 
     @staticmethod
-    def _validate(record: Mapping[str, Any]) -> dict[str, Any]:
+    def _validate_probe(record: Mapping[str, Any]) -> dict[str, Any]:
         missing = [field for field in PROBE_FIELDS if field not in record]
         if missing:
             raise ValueError(f"Probe record is missing required fields: {missing}")
         row = {field: record[field] for field in PROBE_FIELDS}
-        for field in _INTEGER_FIELDS:
-            value = row[field]
-            if isinstance(value, bool) or not isinstance(value, int):
+        for field in _PROBE_INTS:
+            if isinstance(row[field], bool) or not isinstance(row[field], int):
                 raise ValueError(f"Probe field {field} must be an integer")
-        if row["optimizer_step"] < 1:
-            raise ValueError("Probe optimizer_step must be positive")
-        if row["valid_successor_state_count"] < 1:
-            raise ValueError("Probe valid_successor_state_count must be positive")
-        if row["state_age_steps"] < 0:
-            raise ValueError("Probe state_age_steps cannot be negative")
-        if row["successor_state_count"] != (
-            row["parent_state_count"] * row["successors_per_parent"]
-        ):
-            raise ValueError("Probe successor state counts are inconsistent")
-        for field in _FLOAT_FIELDS:
-            try:
-                value = float(row[field])
-            except (TypeError, ValueError) as error:
-                raise ValueError(f"Probe field {field} must be numeric") from error
+        if row["optimizer_step"] < 1 or row["subset_size"] < 1:
+            raise ValueError("Probe step and subset size must be positive")
+        for field in _PROBE_FLOATS:
+            value = float(row[field])
             if not math.isfinite(value):
                 raise ValueError(f"Probe field {field} must be finite")
             row[field] = value
-        for field in (
-            "delta_uniform_standard_error",
-            "delta_cmt_standard_error",
-            "paired_gap_standard_error",
-        ):
-            if row[field] < 0.0:
-                raise ValueError(f"Probe field {field} cannot be negative")
-
-        expected = paired_improvement(
-            row["kl_before"], row["kl_after_uniform"], row["kl_after_cmt"]
-        )
-        for field, value in expected.items():
-            if not math.isclose(row[field], value, rel_tol=1e-12, abs_tol=1e-12):
-                raise ValueError(
-                    f"Probe field {field}={row[field]} is inconsistent with {value}"
-                )
+        _validate_gap(row)
         return row
 
-    def _read_existing(self) -> dict[int, dict[str, Any]]:
-        rows: dict[int, dict[str, Any]] = {}
-        if not self.jsonl_path.is_file():
-            return rows
-        with self.jsonl_path.open(encoding="utf-8") as handle:
+    @staticmethod
+    def _validate_problem(record: Mapping[str, Any]) -> dict[str, Any]:
+        missing = [field for field in PROBLEM_FIELDS if field not in record]
+        if missing:
+            raise ValueError(f"Problem record is missing required fields: {missing}")
+        row = {field: record[field] for field in PROBLEM_FIELDS}
+        if isinstance(row["optimizer_step"], bool) or not isinstance(
+            row["optimizer_step"], int
+        ):
+            raise ValueError("Problem optimizer_step must be an integer")
+        for field in _PROBLEM_FLOATS:
+            value = float(row[field])
+            if not math.isfinite(value):
+                raise ValueError(f"Problem field {field} must be finite")
+            row[field] = value
+        _validate_gap(row)
+        return row
+
+    @staticmethod
+    def _read(path: Path, validator) -> list[dict[str, Any]]:
+        if not path.is_file():
+            return []
+        rows = []
+        with path.open(encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
                 try:
-                    row = self._validate(json.loads(line))
+                    rows.append(validator(json.loads(line)))
                 except (json.JSONDecodeError, ValueError) as error:
-                    raise ValueError(
-                        f"Malformed probe log {self.jsonl_path} line {line_number}"
-                    ) from error
-                step = row["optimizer_step"]
-                if step in rows:
-                    raise ValueError(
-                        f"Duplicate optimizer_step {step} in {self.jsonl_path}"
-                    )
-                rows[step] = row
+                    raise ValueError(f"Malformed probe log {path} line {line_number}") from error
         return rows
 
     @staticmethod
     def _temporary(path: Path) -> Path:
         return path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
 
-    def upsert(self, record: Mapping[str, Any]) -> tuple[Path, Path] | None:
+    @staticmethod
+    def _write_pair(
+        jsonl_path: Path,
+        csv_path: Path,
+        fields: tuple[str, ...],
+        rows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        json_tmp = OneStepKLProbeLogger._temporary(jsonl_path)
+        csv_tmp = OneStepKLProbeLogger._temporary(csv_path)
+        try:
+            with json_tmp.open("x", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            with csv_tmp.open("x", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+                handle.flush()
+                os.fsync(handle.fileno())
+            json_tmp.replace(jsonl_path)
+            csv_tmp.replace(csv_path)
+        except BaseException:
+            json_tmp.unlink(missing_ok=True)
+            csv_tmp.unlink(missing_ok=True)
+            raise
+
+    def upsert(
+        self,
+        record: Mapping[str, Any],
+        problem_records: Sequence[Mapping[str, Any]],
+    ) -> tuple[Path, Path] | None:
         if not self.enabled or not self.is_main:
             return None
-        row = self._validate(record)
+        row = self._validate_probe(record)
+        details = [self._validate_problem(item) for item in problem_records]
+        if len(details) != row["subset_size"]:
+            raise ValueError("Per-problem rows do not match probe subset_size")
+        if any(item["optimizer_step"] != row["optimizer_step"] for item in details):
+            raise ValueError("Per-problem rows do not match probe optimizer_step")
         self.root.mkdir(parents=True, exist_ok=True)
-        rows = self._read_existing()
-        rows[row["optimizer_step"]] = row
-        ordered = [rows[step] for step in sorted(rows)]
-
-        jsonl_temporary = self._temporary(self.jsonl_path)
-        csv_temporary = self._temporary(self.csv_path)
-        try:
-            with jsonl_temporary.open("x", encoding="utf-8") as handle:
-                for item in ordered:
-                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            with csv_temporary.open("x", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=PROBE_FIELDS)
-                writer.writeheader()
-                writer.writerows(ordered)
-                handle.flush()
-                os.fsync(handle.fileno())
-            jsonl_temporary.replace(self.jsonl_path)
-            csv_temporary.replace(self.csv_path)
-        except BaseException:
-            jsonl_temporary.unlink(missing_ok=True)
-            csv_temporary.unlink(missing_ok=True)
-            raise
+        main = {
+            item["optimizer_step"]: item
+            for item in self._read(self.jsonl_path, self._validate_probe)
+        }
+        main[row["optimizer_step"]] = row
+        detail_rows = [
+            item
+            for item in self._read(self.problem_jsonl_path, self._validate_problem)
+            if item["optimizer_step"] != row["optimizer_step"]
+        ] + details
+        ordered_main = [main[step] for step in sorted(main)]
+        detail_rows.sort(key=lambda item: (item["optimizer_step"], item["problem_id"]))
+        self._write_pair(self.jsonl_path, self.csv_path, PROBE_FIELDS, ordered_main)
+        self._write_pair(
+            self.problem_jsonl_path,
+            self.problem_csv_path,
+            PROBLEM_FIELDS,
+            detail_rows,
+        )
         return self.jsonl_path, self.csv_path
