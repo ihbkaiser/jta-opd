@@ -207,6 +207,20 @@ class TrainingLauncherTests(unittest.TestCase):
         ):
             self.assertIn(f"one_step_kl_probe.{config_key}=", common)
 
+    def test_every_step_trajectory_probe_launcher_uses_pilot_defaults(self):
+        launcher = (
+            REPO_ROOT / "scripts" / "train_cmt_trajectory_probe_every_step.sh"
+        ).read_text(encoding="utf-8")
+        expected = {
+            "ONE_STEP_KL_PROBE_INTERVAL": "1",
+            "ONE_STEP_KL_PROBE_SUBSET_SIZE": "32",
+            "ONE_STEP_KL_PROBE_NUM_ROLLOUTS_PER_PROBLEM": "1",
+            "ONE_STEP_KL_PROBE_HORIZON": "32",
+        }
+        for variable, default in expected.items():
+            self.assertIn(f'export {variable}="${{{variable}:-{default}}}"', launcher)
+        self.assertIn('exec bash "${SCRIPT_DIR}/train_cmt_b200.sh" "$@"', launcher)
+
     def test_iw_launcher_has_shared_dataset_presets_and_requested_defaults(self):
         content = (REPO_ROOT / "scripts" / "train_iw_b200.sh").read_text(
             encoding="utf-8"
